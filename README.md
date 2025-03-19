@@ -1,9 +1,20 @@
 # SlideChat: A Large Vision-Language Assistant for Whole-Slide Pathology Image Understanding (CVPR2025)
 
-[🍎 **Homepage**](https://uni-medical.github.io/SlideChat.github.io/) | [🤗 **Dataset**](https://huggingface.co/datasets/General-Medical-AI/SlideBench) | [📖**Paper**](https://arxiv.org/pdf/2410.11761v1) 
+[🍎 **Homepage**](https://uni-medical.github.io/SlideChat.github.io/) | [🤗 **Model and Dataset**](https://huggingface.co/datasets/General-Medical-AI) | [📖**Paper**](https://arxiv.org/pdf/2410.11761v1) 
 
-# Getting Start
+Despite the progress made by multimodal large language models (MLLMs) in computational pathology, they remain limited by a predominant focus on patchlevel analysis, missing essential contextual information at the whole-slide level. The lack of large-scale instruction datasets and the gigapixel scale of whole slide images (WSIs) pose significant developmental challenges. In this paper, we present SlideChat, the first vision-language assistant capable of understanding gigapixel whole-slide images, exhibiting excellent multimodal conversational capability and response complex instruction across diverse pathology scenarios. To support its development, we created SlideInstruction, the largest instructionfollowing dataset for WSIs consisting of 4.2K WSI captions and 176K VQA pairs with multiple categories. Furthermore, we propose SlideBench, a multimodal benchmark that incorporates captioning and VQA tasks to assess SlideChat’s capabilities in varied clinical settings such as microscopy, diagnosis. Compared to both general and specialized MLLMs, SlideChat exhibits exceptional capabilities, achieving state-of-the-art performance on 18 of 22 tasks. 
 
+<p align="center">
+    <img src="img/Fig1_slidechat_illustration.png" width="80%"> <br>
+</p>
+
+## Release
+We release SlideChat, SlideInstruction and SlideBench as open-source resources to facilitate research and development in computational pathology.
+- **SlideChat**: The first large vision-language assistant for whole-slide pathology image analysis, capable of generating comprehensive descriptions and contextually relevant responses.
+- **SlideInstruction**: The largest comprehensive WSI instruction-following dataset, derived from pathology reports..
+- **SlideBench**: A WSI multimodal benchmark including SlideBench-Caption, SlideBench-VQA (TCGA), and SlideBench-VQA (BCNB).  Before its final open-sourcing, SlideBench underwent a second round of expert review and filtering in collaboration with pathologists to ensure data quality.
+
+# Usage
 
 This project is built upon [**Xtuner**](https://github.com/InternLM/xtuner). To get started:
 
