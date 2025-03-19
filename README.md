@@ -1,4 +1,4 @@
-# <img src="./img/icon.jpg" width="25" height="25"> SlideChat: A Large Vision-Language Assistant for Whole-Slide Pathology Image Understanding (CVPR25)
+# SlideChat: A Large Vision-Language Assistant for Whole-Slide Pathology Image Understanding (CVPR2025)
 
 [🍎 **Homepage**](https://uni-medical.github.io/SlideChat.github.io/) | [🤗 **Dataset**](https://huggingface.co/datasets/General-Medical-AI/SlideBench) | [📖**Paper**](https://arxiv.org/pdf/2410.11761v1) 
 
