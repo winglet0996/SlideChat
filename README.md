@@ -37,48 +37,58 @@ SlideChat serializes each input WSI into a sequence of patches, converting each 
     <img src="img/Fig2_slidechat_method.png" width="80%"> <br>
 </p>
 
+Config files are in `configs/`.
 ```bash
 xtuner train \
  <your config file path>  \
   --deepspeed <deepspeed config file path> \
   --work-dir <workdir path>
 
-# For example
+# stage1 example
 xtuner train \
  configs/slidechat/stage_1.py \
   --deepspeed configs/deepspeed/deepspeed_zero2.json \
   --work-dir work_dirs/stage1
+
+# stage2 example
+xtuner train \
+ configs/slidechat/stage_2.py \
+  --deepspeed configs/deepspeed/deepspeed_zero2.json \
+  --work-dir work_dirs/stage2
 ```
 
+
+For a detailed explanation of the configuration file, please refer [**here**](https://xtuner.readthedocs.io/zh-cn/latest/training/modify_settings.html).
+- `llm_name_or_path`: The parameter `llm_name_or_path` corresponds to the Hugging Face LLM path, such as `internlm/internlm2-chat-7b` or `Qwen/Qwen2.5-7B-Instruct` and so on.
+- `data_path`: Training data (.json) path.
+- `evaluation_images`: Evaluation data path.
+
+LLAVAModel Hyperparameters:
+- `freeze_llm`: Freeze the parameters of the LLM.
+- `freeze_visual_encoder`: Freeze the parameters of the visual encoder.
+- `pretrained_pth`: If it is the stage 2 training , it refers to the checkpoint file from stage 1 training; otherwise, it is set to `None`.
+- `train_stage`: `train_stage` indicates the training phase, either Stage `'1'` or Stage `'2'`.
+  
 
 ## Inference
 
 ```bash
 xtuner test <your config file path> \
 --checkpoint <your checkpoint path> \
---test_image_csv  my_test_Conversation_2.csv \
---test_output_csv output_my_test_Conversation_3.csv \
+--test_slide_csv  <your test file> \
+--test_output_csv <result file> \
+--local_rank 0
+
+# example
+xtuner test configs/slidechat/stage_2.py \
+--checkpoint stage2_pth \
+--test_slide_csv  SlideBench-VQA(TCGA).csv \
+--test_output_csv output_my_test.csv \
 --local_rank 0
 ```
 
-# Config file
-Config files are in `configs/`.
-## Explanation of the config file.
-For a detailed explanation of the configuration file, please refer [**here**](https://xtuner.readthedocs.io/zh-cn/latest/training/modify_settings.html).
-
-- `llm_name_or_path`: The parameter `llm_name_or_path` corresponds to the Hugging Face LLM path, such as `internlm/internlm2-chat-7b` or `Qwen/Qwen2.5-0.5B-Instruct` and so on.
-- `data_path` and `image_path_list`: Training data path(refer our config file).
-- `evaluation_images`: Evaluation data path.
-
-# LLAVAModel
-## Hyperparameters
-- `freeze_llm`: Freeze the parameters of the LLM.
-- `freeze_visual_encoder`: Freeze the parameters of the visual encoder.
-- `pretrained_pth`: If it is the stage 2 training , it refers to the checkpoint file from stage 1 training; otherwise, it is set to `None`.
-- `train_stage`: `train_stage` indicates the training phase, either Stage `'1'` or Stage `'2'`.
-
 ## Contact
-
+- Ying Chen: cying2023@stu.xmu.edu.cn
 - Yuanfeng Ji: yfj@stanford.edu
 - Junjun He: hejunjun@pjlab.org.cn
 
