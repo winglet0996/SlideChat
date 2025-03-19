@@ -1,4 +1,4 @@
-# <img src="./img/icon.png" width="70" height="63"> SlideChat
+# <img src="./img/icon.jpg" width="70" height="63"> SlideChat
 
 [🍎 **Homepage**](https://uni-medical.github.io/SlideChat.github.io/) | [🤗 **Dataset**](https://huggingface.co/datasets/General-Medical-AI/SlideBench) | [📖**Paper**](https://arxiv.org/pdf/2410.11761v1) 
 
