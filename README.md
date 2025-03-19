@@ -9,7 +9,7 @@ Despite the progress made by multimodal large language models (MLLMs) in computa
 </p>
 
 ## Release
-We release SlideChat, SlideInstruction and SlideBench as open-source resources to facilitate research and development in computational pathology.
+We release **SlideChat**, **SlideInstruction**, and **SlideBench** as open-source resources, hoping to facilitate research and development in computational pathology.
 - **SlideChat**: The first large vision-language assistant for whole-slide pathology image analysis, capable of generating comprehensive descriptions and contextually relevant responses.
 - **SlideInstruction**: The largest comprehensive WSI instruction-following dataset, derived from pathology reports..
 - **SlideBench**: A WSI multimodal benchmark including SlideBench-Caption, SlideBench-VQA (TCGA), and SlideBench-VQA (BCNB).  Before its final open-sourcing, SlideBench underwent a second round of expert review and filtering in collaboration with pathologists to ensure data quality.
@@ -24,7 +24,17 @@ cd SlideChat
 pip install -e .
 ```
 
-## Train SlideChat:
+## Pre-requisites:
+We share our dataset but WSIs still need to be preprocessed due to their large resolution. For a quick start, we provide several WSI features after processing in the repository. You can now download our code and directly run the code.
+
+Downloading TCGA Slides
+To download diagnostic WSIs (formatted as .svs files), please refer to the NIH Genomic Data Commons Data Portal. WSIs for each cancer type can be downloaded using the GDC Data Transfer Tool.
+
+Processing Whole Slide Images
+To process WSIs, first, the tissue regions in each biopsy slide are segmented using Otsu's Segmentation on a downsampled WSI using OpenSlide. The 256 x 256 patches without spatial overlapping are extracted from the segmented tissue regions at the desired magnification. Consequently, a pretrained backbone is used to encode raw image patches into feature vectors, which we then save as .pt files for each WSI. We achieve the pre-processing of WSIs by using CLAM
+
+
+## Train:
 ```bash
 xtuner train \
  <your config file path>  \
