@@ -8,14 +8,19 @@
     <img src="img/Fig1_slidechat_illustration.png" width="80%"> <br>
 </p>
 
+## Update
+
+- **🚀[2025-03-18]: We have released SlideInstruction, SlideBench and SlideChat!**
+- **🚀[2025-02-27]: Accepted by CVPR2025!🌟**
 
 ## Release
+
 We release **SlideChat**, **SlideInstruction**, and **SlideBench** as open-source resources, hoping to facilitate research and development in computational pathology.
 - **SlideChat**: The first large vision-language assistant for whole-slide pathology image analysis, capable of generating comprehensive descriptions and contextually relevant responses.
 - **SlideInstruction**: The largest comprehensive WSI instruction-following dataset, derived from pathology reports..
 - **SlideBench**: A WSI multimodal benchmark including SlideBench-Caption, SlideBench-VQA (TCGA), and SlideBench-VQA (BCNB).  Before its final open-sourcing, SlideBench underwent a second round of expert review and filtering in collaboration with pathologists to ensure data quality.
 
-# Usage
+## Usage
 
 This project is built upon [**Xtuner**](https://github.com/InternLM/xtuner). To get started:
 
