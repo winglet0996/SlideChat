@@ -11,7 +11,7 @@
             },
             {
                 "from": "gpt",
-                "value": "Presence of vascular invasion in breast cancer patients indicates that cancer cells have invaded blood vessels or lymphatics, which can facilitate the spread of these cells to other parts of the body. This makes it a significant adverse prognostic factor. Vascular invasion is associated with a higher likelihood of distant metastasis, as the invaded vessels can act as pathways for cancer cells to disseminate and potentially form secondary tumors in other organs. As a result, patients with vascular invasion often have a higher risk of recurrence and a poorer overall prognosis compared to those without. This highlights the importance of thorough pathological assessment to guide treatment decisions and plan appropriate management strategies, such as more aggressive systemic therapy or closer follow-up, to mitigate the risk of cancer progression and improve patient outcomes."
+                "value": "Presence of vascular invasion in breast cancer patients indicates that cancer cells have invaded blood vessels or lymphatics, which can facilitate the spread of these cells to other parts of the body. This makes it a significant adverse prognostic factor. Vascular invasion is associated with a higher likelihood of distant metastasis, as the invaded vessels can act as pathways for cancer cells to disseminate and potentially form secondary tumors in other organs. As a result, patients with vascular invasion often have a higher risk of recurrence and a poorer overall prognosis compared to those without. "
             }
         ]
     },
@@ -27,7 +27,7 @@
             },
             {
                 "from": "gpt",
-                "value": "Infiltrating ductal carcinoma is identified in this case, characterized by its classification as a Nottingham grade II carcinoma, indicating moderate differentiation of the tumor cells. The pathology reveals a mass measuring 1.3 x 1.3 x 1.2 cm. The grading is determined by assessing three components: tubule formation, nuclear pleomorphism, and mitotic count, which collectively resulted in a Nottingham score of 7 out of 9. \n\nIn this instance, the tumor exhibits a tubule formation score of 3/3, nuclear pleomorphism score of 3/3, and a mitotic count score of 1/3, which guided the overall grading. Importantly, angiolymphatic invasion is absent, suggesting no current evidence of the carcinoma invading the lymphatic vessels or bloodstream. \n\nFurther reassuring, all surgical resection margins are clear of the tumor, with a minimum margin of 0.7 cm from the inferior edge, reducing the likelihood of residual disease. The presence of ductal carcinoma in situ, which accounts for less than 5% of the tumor, is noted, reflecting a non-invasive component. Additionally, two sentinel lymph nodes were excised from the right axilla and tested negative for metastatic carcinoma, suggesting no lymphatic spread. The use of immunohistochemical stains confirmed these findings, enhancing the diagnostic accuracy. \n\nConsequently, this pathology report provides a detailed picture of an infiltrating ductal carcinoma with no metastatic involvement, at a moderate grade without lymphovascular invasion, aligning with the diagnosis given."
+                "value": "Infiltrating ductal carcinoma is identified in this case, characterized by its classification as a Nottingham grade II carcinoma, indicating moderate differentiation of the tumor cells. "
             }
         ]
     },
@@ -43,7 +43,7 @@
             },
             {
                 "from": "gpt",
-                "value": "The non-tumorous breast tissue demonstrated fibrocystic changes, which are characterized by the presence of cysts, fibrosis, and an increase in the glandular tissue of the breast. One notable feature in this tissue was apocrine metaplasia, where the epithelial cells lining the cysts take on characteristics similar to apocrine sweat glands. This type of metaplasia is benign and represents a non-cancerous alteration where breast ductal epithelial cells transition to an apocrine phenotype. Additionally, these cyst formations are common in fibrocystic breast condition and may contribute to the palpable changes in breast texture often reported by patients. Importantly, these findings are benign and do not indicate malignancy or an increased risk of breast cancer."
+                "value": "The non-tumorous breast tissue demonstrated fibrocystic changes, which are characterized by the presence of cysts, fibrosis, and an increase in the glandular tissue of the breast. One notable feature in this tissue was apocrine metaplasia, where the epithelial cells lining the cysts take on characteristics similar to apocrine sweat glands. "
             }
         ]
     }
