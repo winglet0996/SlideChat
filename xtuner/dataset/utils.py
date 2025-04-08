@@ -539,19 +539,6 @@ def load_image(image_file):
         response = requests.get(image_file)
         image = Image.open(BytesIO(response.content)).convert('RGB')
     elif image_file.endswith('.csv'):
-        # image = pd.read_csv(image_file)
-        # total_rows = image.shape[0]
-        # if total_rows >= 576:
-        #     indices = np.linspace(0, total_rows - 1, 576, dtype=int)
-        #     sampled_df = image.iloc[indices]
-        # else:
-        #     indices = np.linspace(0, total_rows - 1, 576, dtype=int)
-        #     sampled_df = image.iloc[indices]
-        #     extra_indices = np.random.choice(total_rows, 576 - total_rows, replace=True)
-        #     sampled_df = pd.concat([sampled_df, image.iloc[extra_indices]])
-        # sampled_df = sampled_df.iloc[:576]
-        # image = sampled_df.to_numpy().reshape(1, 576, 512)
-
         image = pd.read_csv(image_file)
         image = image.iloc[:, :512]
 
@@ -560,11 +547,6 @@ def load_image(image_file):
             indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
             sampled_df = image.iloc[indices]
             image = sampled_df.iloc[:10240]
-        # else:
-        #     indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
-        #     sampled_df = image.iloc[indices]
-        #     extra_indices = np.random.choice(total_rows, 10240 - total_rows, replace=True)
-        #     sampled_df = pd.concat([sampled_df, image.iloc[extra_indices]])
         
 
         image = image.to_numpy().reshape(1, image.shape[0], 512)
