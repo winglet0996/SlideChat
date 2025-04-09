@@ -70,7 +70,6 @@ For a detailed explanation of the configuration file, please refer [**here**](ht
 
 LLAVAModel Hyperparameters:
 - `freeze_llm`: Freeze the parameters of the LLM.
-- `freeze_visual_encoder`: Freeze the parameters of the visual encoder.
 - `pretrained_pth`: If it is the stage 2 training , it refers to the checkpoint file from stage 1 training; otherwise, it is set to `None`.
 - `train_stage`: `train_stage` indicates the training phase, either Stage `'1'` or Stage `'2'`.
   
