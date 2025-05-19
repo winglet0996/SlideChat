@@ -58,7 +58,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', '--local-rank', type=int, default=2)
+    parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
 
     last_checkpoint_file = os.path.join(args.work_dir, 'last_checkpoint')

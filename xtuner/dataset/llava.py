@@ -16,6 +16,7 @@ from .huggingface import process_hf_dataset
 from .utils import expand2square
 
 import pandas as pd
+import h5py
 import numpy as np
 
 def load_jsonl(json_file):
@@ -115,10 +116,11 @@ class LLaVADataset(Dataset):
                 image_list = [image_list]
             images = []
             for image_file in image_list:
-                if image_file.endswith('.csv'):
+                if image_file.endswith('.h5'):
 
-                    image = pd.read_csv(image_file)
-                    image = image.iloc[:, :512]
+                    with h5py.File(image_file, 'r') as f:
+                        image = f['features'][:]
+                        # coords = f['coords'][:]
 
                     total_rows = image.shape[0]
                     if total_rows >= self.sample_num:

@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# xtuner/configs/llava/internlm2_chat_7b_clip_vit_large_p14_336/pretrain/llava_internlm2_chat_7b_clip_vit_large_p14_336_e1_gpu8_pretrain.py
 import torch
 from mmengine.dataset import DefaultSampler
 from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
@@ -21,9 +22,9 @@ from xtuner.utils import PROMPT_TEMPLATE
 #                          PART 1  Settings                           #
 #######################################################################
 # Model
-llm_name_or_path = 'Qwen/Qwen2.5-7B-Instruct'
+llm_name_or_path = 'Qwen/Qwen3-8B'
 # Data
-data_path = 'SlideInstruct_train_stage1_caption.json'
+data_path = '/home/winglet/pathology/vqa/SlideChat/dataset/PathoVerse_train_stage1_caption.json'
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -36,9 +37,9 @@ sample_type='wsi' # 'wsi'or'image'
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 8
-dataloader_num_workers = 32
-max_epochs = 5
+accumulative_counts = 1
+dataloader_num_workers = 2
+max_epochs = 1
 optim_type = AdamW
 lr = 1e-3
 betas = (0.9, 0.999)
@@ -53,7 +54,7 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 # Evaluate the generation performance during the training
 evaluation_freq = 1000
 SYSTEM = ''
-evaluation_images = './BLCA/TCGA-GV-A40G-01Z-00-DX1.csv'
+evaluation_images = '/mnt/f/TCGA_KEEP_features1024/TCGA-GBM/TCGA-08-0347-01Z-00-DX1.CA3BDEAA-1F85-43A9-99D8-9FB7ED6BCDBD.h5'
 evaluation_inputs = ['Generate an overview summarizing the principal findings from the pathology examination of the whole slide image.']
 
 #######################################################################
@@ -65,6 +66,7 @@ tokenizer = dict(
     trust_remote_code=True,
     padding_side='right')
 
+# removed image_processor
 
 model = dict(
     type=LLaVAModel,
@@ -84,7 +86,8 @@ model = dict(
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type='nf4'))
-        )
+        # removed visual_encoder
+    )
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
@@ -96,8 +99,7 @@ llava_dataset = dict(
     image_path_list=image_path_list,
     tokenizer=tokenizer,
     dataset_map_fn=llava_map_fn,
-    template_map_fn=dict(
-        type=template_map_fn_factory, template=prompt_template),
+    template_map_fn=dict(type=template_map_fn_factory, template=prompt_template),
     max_length=max_length,
     per_image_length=per_image_length,
     pad_image_to_square=False)
@@ -128,18 +130,18 @@ optim_wrapper = dict(
 # learning policy
 # More information: https://github.com/open-mmlab/mmengine/blob/main/docs/en/tutorials/param_scheduler.md  # noqa: E501
 param_scheduler = [
-    # dict(
-    #     type=LinearLR,
-    #     start_factor=1e-5,
-    #     by_epoch=True,
-    #     begin=0,
-    #     end=warmup_ratio * max_epochs,
-    #     convert_to_iter_based=True),
+    dict(
+        type=LinearLR,
+        start_factor=1e-5,
+        by_epoch=True,
+        begin=0,
+        end=warmup_ratio * max_epochs,
+        convert_to_iter_based=True),
     dict(
         type=CosineAnnealingLR,
         eta_min=0.0,
         by_epoch=True,
-        begin=0,
+        begin=warmup_ratio * max_epochs,
         end=max_epochs,
         convert_to_iter_based=True)
 ]

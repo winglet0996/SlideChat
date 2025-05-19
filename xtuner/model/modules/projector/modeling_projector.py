@@ -39,10 +39,6 @@ class ProjectorModel(PreTrainedModel):
 
         self.model.register_forward_hook(make_inputs_require_grad)
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, ProjectorModel):
-            module.gradient_checkpointing = value
-
     def forward(self, x):
         if self.gradient_checkpointing and self.training:
             layer_outputs = torch.utils.checkpoint.checkpoint(self.model, x)

@@ -92,7 +92,8 @@ def make_longnet_from_name(config_name: str,
                            dilated_ratio: str='[1, 2, 4, 8, 16]',
                            segment_length: str='[1024, 2048, 4096, 8192, 16384]',
                            drop_path_rate: int=0.1,
-                           dropout: float=0.1):
+                           dropout: float=0.1,
+                           checkpoint_activations: bool=True):
     '''
     make LongNet model from config name
 
@@ -124,7 +125,7 @@ def make_longnet_from_name(config_name: str,
     print('dilated_ratio: ', dilated_ratio)
     print('segment_length: ', segment_length)
 
-    longnet_args = EncoderConfig(**longnet_args)
+    longnet_args = EncoderConfig(**longnet_args, checkpoint_activations=checkpoint_activations)
     model = LongNetEncoder(longnet_args)
     print('Number of trainable LongNet parameters: ', sum(p.numel() for p in model.parameters() if p.requires_grad))
     return model
