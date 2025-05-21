@@ -22,16 +22,16 @@ from xtuner.utils import PROMPT_TEMPLATE
 #                          PART 1  Settings                           #
 #######################################################################
 # Model
-llm_name_or_path = 'Qwen/Qwen3-8B'
+llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
 # Data
-data_path = '/home/winglet/pathology/vqa/SlideChat/dataset/PathoVerse_train_stage1_caption.json'
+data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption.json'
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
-max_length = 51200
-per_image_length = None
+max_length = 32768
+per_image_length = 1024
 sample_type='wsi' # 'wsi'or'image'
 
 
@@ -54,7 +54,7 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 # Evaluate the generation performance during the training
 evaluation_freq = 1000
 SYSTEM = ''
-evaluation_images = '/mnt/f/TCGA_KEEP_features1024/TCGA-GBM/TCGA-08-0347-01Z-00-DX1.CA3BDEAA-1F85-43A9-99D8-9FB7ED6BCDBD.h5'
+evaluation_images = '/mnt/petrelfs/zhouxiao/KEEP_features/TCGA_768/TCGA-HNSC/TCGA-DQ-7595-01Z-00-DX1.4ECDC6A3-4103-4CB7-94C9-C53D2A25FD3C.h5'
 evaluation_inputs = ['Generate an overview summarizing the principal findings from the pathology examination of the whole slide image.']
 
 #######################################################################
@@ -77,15 +77,16 @@ model = dict(
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
         torch_dtype=torch.float16,
-        quantization_config=dict(
-            type=BitsAndBytesConfig,
-            load_in_4bit=True,
-            load_in_8bit=False,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type='nf4'))
+        # quantization_config=dict(
+        #     type=BitsAndBytesConfig,
+        #     load_in_4bit=True,
+        #     load_in_8bit=False,
+        #     llm_int8_threshold=6.0,
+        #     llm_int8_has_fp16_weight=False,
+        #     bnb_4bit_compute_dtype=torch.float16,
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_quant_type='nf4')
+            )
         # removed visual_encoder
     )
 

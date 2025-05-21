@@ -91,7 +91,7 @@ class LLaVAModel(BaseModel):
 
         self.encoder_name = "LongNet_{}_layers_{}_dim".format(2, hidden_size)
         self.LongNet_encoder = make_longnet_from_name(self.encoder_name, checkpoint_activations=use_activation_checkpointing) # , drop_path_rate=0.3, dropout=0.3, segment_length=1024
-        
+        self.LongNet_encoder = self.LongNet_encoder.to(self.llm.dtype)
         self.llm.config.use_cache = False
         dispatch_modules(self.llm)
 
@@ -330,14 +330,14 @@ class LLaVAModel(BaseModel):
         # data_dict['pixel_values']=[[pixel_values of img1], [pixel_values of img2], ...]
         if 'pixel_values' in data:
             feat_to_proj = data['pixel_values'].to(self.llm.dtype) # torch.Size([1, img_num, 768])
-            print(f'feat_to_proj shape: {feat_to_proj.shape}')
+            print(f'@@@@@@@@@@@@@@@@@@feat_to_proj shape: {feat_to_proj.shape}')
             if self.enable_long_net:
                 long_net_output = self.LongNet_encoder(src_tokens=None, token_embeddings=feat_to_proj.permute(1, 0, 2))["encoder_out"] # shape: [img_num, 576, 3072]
-                print(f'long_net_output shape: {long_net_output.shape}')
+                print(f'@@@@@@@@@@@@@@@@@@long_net_output shape: {long_net_output.shape}')
                 feat_to_proj = long_net_output.permute(1, 0, 2) # shape: [576, img_num, 3072]
 
             pixel_values = self.projector(feat_to_proj.to(self.llm.dtype))
-            print(f'pixel_values shape: {pixel_values.shape}')
+            print(f'@@@@@@@@@@@@@@@@@@pixel_values shape: {pixel_values.shape}')
 
             data['pixel_values'] = pixel_values # shape: [1, 576, 4096]
             data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)

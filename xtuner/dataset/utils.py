@@ -8,6 +8,8 @@ from itertools import chain
 import numpy as np
 import requests
 from PIL import Image
+import h5py
+import pandas as pd
 
 from xtuner.utils import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX
 
@@ -551,14 +553,37 @@ def load_image(image_file):
 
         image = image.to_numpy().reshape(1, image.shape[0], 512)
 
+    elif image_file.endswith('.h5'):
+        with h5py.File(image_file, 'r') as f:
+            image = f['features'][:]
+            # coords = f['coords'][:]
+            
+        total_rows = image.shape[0]
+        if total_rows >= 10240:
+            indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
+            image = image[indices]
 
+        image = image.reshape(1, image.shape[0], 768)
     else:
         image = Image.open(image_file).convert('RGB')
     return image
 
 def load_wsi_feature(wsi_file):
-    wsi_feats = pd.read_csv(wsi_file)
-    wsi_feats = wsi_feats.to_numpy()
+    if wsi_file.endswith('.csv'):
+        wsi_feats = pd.read_csv(wsi_file)
+        # total_rows = wsi_feats.shape[0]
+        # if total_rows >= 10240:
+        #     indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
+        #     wsi_feats = wsi_feats.iloc[indices]
+        wsi_feats = wsi_feats.to_numpy()
+    elif wsi_file.endswith('.h5'):
+        with h5py.File(wsi_file, 'r') as f:
+            wsi_feats = f['features'][:]
+            # coords = f['coords'][:]
+        # total_rows = wsi_feats.shape[0]
+        # if total_rows >= 10240:
+        #     indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
+        #     wsi_feats = wsi_feats[indices]
     return wsi_feats
 
 def decode_base64_to_image(base64_string):

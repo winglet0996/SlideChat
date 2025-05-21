@@ -125,10 +125,7 @@ class LLaVADataset(Dataset):
                     total_rows = image.shape[0]
                     if total_rows >= self.sample_num:
                         indices = np.linspace(0, total_rows - 1, self.sample_num, dtype=int)
-                        sampled_df = image.iloc[indices]
-                        image = sampled_df.iloc[:self.sample_num]
-                    
-                    image = image.to_numpy()
+                        image = image[indices]
                     image = torch.from_numpy(image)
                 images.append(image)
             data_dict['pixel_values'] = images

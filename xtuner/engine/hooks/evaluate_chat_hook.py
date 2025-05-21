@@ -138,7 +138,11 @@ class EvaluateChatHook(Hook):
                 input_ids = torch.tensor(input_ids).to(device)
  
                 print('#'*30)
-                print('evaluate wsi feat: ', image.shape)
+                print('evaluate wsi feat: ', image.shape) # [1, 4347, 768]
+                print('evaluate input_ids: ', input_ids.shape) # [28]
+                print('image.dtype: ', image.dtype) # torch.float32
+                print('image.to(model.llm.dtype).dtype: ', image.to(model.llm.dtype).dtype)
+                print('model.llm.dtype: ', model.llm.dtype) # torch.float16
                 image = model.LongNet_encoder(src_tokens=None, token_embeddings=image.to(model.llm.dtype).permute(1, 0, 2))["encoder_out"] # shape: (576, img_num, 1024)
                 image = image.permute(1, 0, 2) # shape: [1, 576, 512]
 
