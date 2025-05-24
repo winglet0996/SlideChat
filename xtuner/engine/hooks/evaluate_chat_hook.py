@@ -146,7 +146,7 @@ class EvaluateChatHook(Hook):
                 image = model.LongNet_encoder(src_tokens=None, token_embeddings=image.to(model.llm.dtype).permute(1, 0, 2))["encoder_out"] # shape: (576, img_num, 1024)
                 image = image.permute(1, 0, 2) # shape: [1, 576, 512]
 
-                pixel_values = model.projector(image.to(model.llm.dtype))
+                pixel_values = model.projector(image.to(model.llm.dtype)) # [1, 4347, 4096]
                 print('evaluate pixel_values: ', pixel_values.shape)
                 mm_inputs = prepare_inputs_labels_for_multimodal(
                     llm=model.llm,

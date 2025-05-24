@@ -329,17 +329,15 @@ class LLaVAModel(BaseModel):
         
         # data_dict['pixel_values']=[[pixel_values of img1], [pixel_values of img2], ...]
         if 'pixel_values' in data:
-            feat_to_proj = data['pixel_values'].to(self.llm.dtype) # torch.Size([1, img_num, 768])
-            print(f'@@@@@@@@@@@@@@@@@@feat_to_proj shape: {feat_to_proj.shape}')
+            feat_to_proj = data['pixel_values'].to(self.llm.dtype) # shape: [1, patch_num, 768], max_patch_num=10240
             if self.enable_long_net:
-                long_net_output = self.LongNet_encoder(src_tokens=None, token_embeddings=feat_to_proj.permute(1, 0, 2))["encoder_out"] # shape: [img_num, 576, 3072]
-                print(f'@@@@@@@@@@@@@@@@@@long_net_output shape: {long_net_output.shape}')
-                feat_to_proj = long_net_output.permute(1, 0, 2) # shape: [576, img_num, 3072]
+                long_net_output = self.LongNet_encoder(src_tokens=None, token_embeddings=feat_to_proj.permute(1, 0, 2))["encoder_out"] # shape: [patch_num, 1, 768]
+                feat_to_proj = long_net_output.permute(1, 0, 2) # shape: [1, patch_num, 768]
 
             pixel_values = self.projector(feat_to_proj.to(self.llm.dtype))
-            print(f'@@@@@@@@@@@@@@@@@@pixel_values shape: {pixel_values.shape}')
 
-            data['pixel_values'] = pixel_values # shape: [1, 576, 4096]
+            data['pixel_values'] = pixel_values # shape:  [1, patch_num, 4096]
+            print('pixel_values_projected', pixel_values.shape)
             data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
         if mode == 'loss':

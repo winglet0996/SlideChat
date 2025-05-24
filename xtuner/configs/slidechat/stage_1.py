@@ -37,8 +37,8 @@ sample_type='wsi' # 'wsi'or'image'
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 1
-dataloader_num_workers = 2
+accumulative_counts = 8
+dataloader_num_workers = 4
 max_epochs = 1
 optim_type = AdamW
 lr = 1e-3
