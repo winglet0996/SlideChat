@@ -40,7 +40,7 @@ def encode_fn(example,
               max_length,
               input_ids_with_output=True,
               with_image_token=False,
-              per_image_length=0):
+              per_image_length=None):
     """We only support the following three scenarios:
 
     1. Incremental pretraining dataset.
@@ -131,14 +131,10 @@ def encode_fn(example,
     # if len(input_ids) > max_length:
     #     input_ids = input_ids[:max_length]
     #     labels = labels[:max_length]
+    per_image_length = example.get('image_len', per_image_length)
     input_ids = input_ids[:max_length - n_images * per_image_length]
     labels = labels[:max_length - n_images * per_image_length]
-    print('*'*50)
-    print(f'after_input_ids:{input_ids}')
-    print(f'after_labels:{labels}')
-    print(tokenizer.decode(input_ids))
-    print(tokenizer.decode(labels))
-    exit(0)
+    
     return {'input_ids': input_ids, 'labels': labels}
 
 

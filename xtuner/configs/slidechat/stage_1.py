@@ -9,7 +9,7 @@ from torch.optim import AdamW
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
- 
+from peft import LoraConfig
 from xtuner.dataset import LLaVADataset
 from xtuner.dataset.collate_fns import default_collate_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
@@ -24,21 +24,21 @@ from xtuner.utils import PROMPT_TEMPLATE
 # Model
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
 # Data
-data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption.json'
+data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_new.json'
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
 max_length = 32768
-per_image_length = 1024
+per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 8
-dataloader_num_workers = 4
+accumulative_counts = 16
+dataloader_num_workers = 0
 max_epochs = 1
 optim_type = AdamW
 lr = 1e-3
@@ -70,7 +70,7 @@ tokenizer = dict(
 
 model = dict(
     type=LLaVAModel,
-    freeze_llm=True,
+    freeze_llm=False,
     train_stage='1',
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
@@ -86,7 +86,14 @@ model = dict(
         #     bnb_4bit_compute_dtype=torch.float16,
         #     bnb_4bit_use_double_quant=True,
         #     bnb_4bit_quant_type='nf4')
-            )
+        lora=dict(
+        type=LoraConfig,
+        r=64,
+        lora_alpha=16,
+        lora_dropout=0.1,
+        bias='none',
+        task_type='CAUSAL_LM')
+        )
         # removed visual_encoder
     )
 

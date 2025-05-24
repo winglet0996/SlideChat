@@ -79,7 +79,7 @@ def tokenize_dataset(dataset, tokenizer, max_length, with_image_token,
             tokenizer=tokenizer,
             max_length=max_length,
             with_image_token=with_image_token,
-            per_image_length=per_image_length,
+            # per_image_length=per_image_length,
             input_ids_with_output=input_ids_with_output),
         remove_columns=list(dataset.column_names)
         if remove_unused_columns else None,
