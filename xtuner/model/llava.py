@@ -60,8 +60,8 @@ class LLaVAModel(BaseModel):
                  visual_encoder_lora=None,
                  use_activation_checkpointing=True,
                  max_position_embeddings=None,
-                 hidden_size=768,
-                 train_stage='2',
+                 hidden_size=None,
+                 train_stage=None,
                  enable_long_net=True):
         super().__init__()
         
@@ -337,7 +337,7 @@ class LLaVAModel(BaseModel):
             pixel_values = self.projector(feat_to_proj.to(self.llm.dtype))
 
             data['pixel_values'] = pixel_values # shape:  [1, patch_num, 4096]
-            print('pixel_values_projected', pixel_values.shape)
+            # print('pixel_values_projected', pixel_values.shape)
             data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
         if mode == 'loss':

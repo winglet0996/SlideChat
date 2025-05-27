@@ -5,6 +5,8 @@ from mmengine.dataset import DefaultSampler
 from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
                             LoggerHook, ParamSchedulerHook)
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
+from mmengine.visualization import Visualizer, WandbVisBackend
+
 from torch.optim import AdamW
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
@@ -70,8 +72,8 @@ tokenizer = dict(
 
 model = dict(
     type=LLaVAModel,
-    freeze_llm=False,
     train_stage='1',
+    hidden_size=768,
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
@@ -86,15 +88,14 @@ model = dict(
         #     bnb_4bit_compute_dtype=torch.float16,
         #     bnb_4bit_use_double_quant=True,
         #     bnb_4bit_quant_type='nf4')
-        lora=dict(
-        type=LoraConfig,
-        r=64,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        bias='none',
-        task_type='CAUSAL_LM')
-        )
-        # removed visual_encoder
+        ),
+        llm_lora=dict(
+            type=LoraConfig,
+            r=64,
+            lora_alpha=16,
+            lora_dropout=0.1,
+            bias='none',
+            task_type='CAUSAL_LM')
     )
 
 #######################################################################
@@ -202,7 +203,7 @@ env_cfg = dict(
 )
 
 # set visualizer
-visualizer = None
+visualizer = dict(type=Visualizer, vis_backends=[dict(type=WandbVisBackend)])
 
 # set log level
 log_level = 'INFO'
