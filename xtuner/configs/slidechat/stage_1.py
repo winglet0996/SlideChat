@@ -26,7 +26,7 @@ from xtuner.utils import PROMPT_TEMPLATE
 # Model
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
 # Data
-data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_new.json'
+data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_train.json'
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -66,7 +66,8 @@ tokenizer = dict(
     type=AutoTokenizer.from_pretrained,
     pretrained_model_name_or_path=llm_name_or_path,
     trust_remote_code=True,
-    padding_side='right')
+    padding_side='right'
+    )
 
 # removed image_processor
 
@@ -141,7 +142,7 @@ optim_wrapper = dict(
 param_scheduler = [
     dict(
         type=LinearLR,
-        start_factor=1e-5,
+        start_factor=1e-4,
         by_epoch=True,
         begin=0,
         end=warmup_ratio * max_epochs,
@@ -203,7 +204,18 @@ env_cfg = dict(
 )
 
 # set visualizer
-visualizer = dict(type=Visualizer, vis_backends=[dict(type=WandbVisBackend)])
+visualizer = None
+# visualizer = dict(
+#     type=Visualizer,
+#     vis_backends=[
+#         dict(type=WandbVisBackend,
+#              init_kwargs=dict(
+#                  project='SlideChat',
+#                  name='stage_1'
+#              )
+#         )
+#     ]
+# )
 
 # set log level
 log_level = 'INFO'
