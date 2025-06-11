@@ -19,20 +19,21 @@ from xtuner.engine.hooks import DatasetInfoHook, EvaluateChatHook, HFCheckpointH
 from xtuner.engine.runner import TrainLoop
 from xtuner.model import LLaVAModel
 from xtuner.utils import PROMPT_TEMPLATE
-
+from xtuner.configs.slidechat.eval_samples import evaluation_images, evaluation_inputs, evaluation_targets
 #######################################################################
 #                          PART 1  Settings                           #
 #######################################################################
 # Model
-llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
+llm_name_or_path = '/home/winglet/models/Qwen3-0.6B/'
 # Data
-data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_train.json'
+data_path = '/home/winglet/pathology/vqa/dataset_pp/PathoVerse_train_stage1_caption.json'
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
 max_length = 32768
+max_patch_num = 10240
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
 
@@ -56,8 +57,6 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 # Evaluate the generation performance during the training
 evaluation_freq = 1000
 SYSTEM = ''
-evaluation_images = '/mnt/petrelfs/zhouxiao/KEEP_features/TCGA_768/TCGA-HNSC/TCGA-DQ-7595-01Z-00-DX1.4ECDC6A3-4103-4CB7-94C9-C53D2A25FD3C.h5'
-evaluation_inputs = ['Generate an overview summarizing the principal findings from the pathology examination of the whole slide image.']
 
 #######################################################################
 #            PART 2  Model & Tokenizer & Image Processor              #
@@ -111,6 +110,7 @@ llava_dataset = dict(
     dataset_map_fn=llava_map_fn,
     template_map_fn=dict(type=template_map_fn_factory, template=prompt_template),
     max_length=max_length,
+    max_patch_num=max_patch_num,
     per_image_length=per_image_length,
     pad_image_to_square=False)
 
@@ -171,8 +171,11 @@ custom_hooks = [
         every_n_iters=evaluation_freq,
         evaluation_inputs=evaluation_inputs,
         evaluation_images=evaluation_images,
+        evaluation_targets=evaluation_targets,
         system=SYSTEM,
-        prompt_template=prompt_template)
+        max_new_tokens=max_length,
+        prompt_template=prompt_template,
+        max_patch_num=max_patch_num)
 ]
 
 # configure default hooks

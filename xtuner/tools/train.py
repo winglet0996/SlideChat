@@ -29,8 +29,8 @@ from xtuner.tools.utils import (auto_dtype_of_deepspeed_config,
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM')
-    parser.add_argument('config', help='config file name or path.')
-    parser.add_argument('--work-dir', help='the dir to save logs and models')
+    parser.add_argument('--config', default=None, help='config file name or path.')
+    parser.add_argument('--work-dir', default=None, help='the dir to save logs and models')
     parser.add_argument(
         '--deepspeed',
         type=str,
@@ -42,7 +42,7 @@ def parse_args():
         default=None,
         help='specify checkpoint path to be resumed from.')
     parser.add_argument(
-        '--seed', type=int, default=None, help='Random seed for the training')
+        '--seed', type=int, default=42, help='Random seed for the training')
     parser.add_argument(
         '--cfg-options',
         nargs='+',
@@ -60,6 +60,10 @@ def parse_args():
         help='job launcher')
     parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
+    
+    args.config = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/slidechat/stage_1.py'
+    # args.deepspeed = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
+    args.work_dir = '/home/winglet/pathology/vqa/train_s1'
 
     last_checkpoint_file = os.path.join(args.work_dir, 'last_checkpoint')
     # Ensure the directory exists

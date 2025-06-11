@@ -65,7 +65,7 @@ def add_template_to_dataset(dataset, template_map_fn, map_num_proc):
 
 
 def tokenize_dataset(dataset, tokenizer, max_length, with_image_token,
-                     per_image_length,
+                     per_image_length, max_patch_num,
                      input_ids_with_output, remove_unused_columns,
                      map_num_proc):
     assert (tokenizer is not None) and (max_length is not None), \
@@ -79,8 +79,9 @@ def tokenize_dataset(dataset, tokenizer, max_length, with_image_token,
             tokenizer=tokenizer,
             max_length=max_length,
             with_image_token=with_image_token,
-            # per_image_length=per_image_length,
-            input_ids_with_output=input_ids_with_output),
+            per_image_length=per_image_length,
+            input_ids_with_output=input_ids_with_output,
+            max_patch_num=max_patch_num),
         remove_columns=list(dataset.column_names)
         if remove_unused_columns else None,
         num_proc=map_num_proc)
@@ -115,7 +116,8 @@ def process(dataset,
             input_ids_with_output=True,
             with_image_token=False,
             per_image_length=None,
-            map_num_proc=32):
+            max_patch_num=None,
+            map_num_proc=None):
     """Post-process the dataset loaded from the Hugging Face Hub, or a local
     dataset.
 
@@ -218,6 +220,7 @@ def process(dataset,
             max_length=max_length,
             with_image_token=with_image_token,
             per_image_length=per_image_length,
+            max_patch_num=max_patch_num,
             input_ids_with_output=input_ids_with_output,
             remove_unused_columns=remove_unused_columns,
             map_num_proc=map_num_proc)
@@ -226,8 +229,14 @@ def process(dataset,
     if input_ids_with_output:
         assert {'input_ids', 'labels'}.issubset(dataset.column_names)
         # remove data that does not have the valid labels.
+        def has_valid_label(example):
+            if not any(label >= 0 for label in example['labels']):
+                print(f"Invalid example: {example}")
+                return False
+            return True
+
         dataset = dataset.filter(
-            lambda example: any(label >= 0 for label in example['labels']),
+            has_valid_label,
             num_proc=map_num_proc)
 
     # pack to max length
@@ -264,7 +273,8 @@ def process_hf_dataset(dataset,
                        input_ids_with_output=True,
                        with_image_token=False,
                        per_image_length=None,
-                       map_num_proc=32):
+                       max_patch_num=None,
+                       map_num_proc=1):
     """Post-process the dataset loaded from the Hugging Face Hub, or a local
     dataset.
 
@@ -324,6 +334,7 @@ def process_hf_dataset(dataset,
         input_ids_with_output=input_ids_with_output,
         with_image_token=with_image_token,
         per_image_length=per_image_length,
+        max_patch_num=max_patch_num,
         map_num_proc=map_num_proc)
     if not (dist.is_available() and dist.is_initialized()):
         return process(**kwargs)

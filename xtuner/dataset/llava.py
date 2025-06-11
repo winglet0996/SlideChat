@@ -40,12 +40,12 @@ class LLaVADataset(Dataset):
                  max_dataset_length=None,
                  dataset_map_fn=None,
                  template_map_fn=None,
-                 max_length=2048,
+                 max_length=None,
                  pad_image_to_square=False,
-                 sample_num=10240):
+                 max_patch_num=None):
         super().__init__()
 
-        self.sample_num = sample_num
+        self.max_patch_num = max_patch_num
         self.per_image_length = per_image_length
         assert offline_processed_text_folder or (data_path and tokenizer)
         if offline_processed_text_folder and data_path:
@@ -82,7 +82,8 @@ class LLaVADataset(Dataset):
                 remove_unused_columns=False,
                 pack_to_max_length=False,
                 with_image_token=True,
-                per_image_length=self.per_image_length)
+                per_image_length=self.per_image_length,
+                max_patch_num=self.max_patch_num)
 
         self.image_folder = image_folder
         self.image_path_list = image_path_list
@@ -123,8 +124,8 @@ class LLaVADataset(Dataset):
                         # coords = f['coords'][:]
 
                     total_rows = image.shape[0]
-                    if total_rows >= self.sample_num:
-                        indices = np.linspace(0, total_rows - 1, self.sample_num, dtype=int)
+                    if total_rows >= self.max_patch_num:
+                        indices = np.linspace(0, total_rows - 1, self.max_patch_num, dtype=int)
                         image = image[indices]
                     image = torch.from_numpy(image)
                 images.append(image)

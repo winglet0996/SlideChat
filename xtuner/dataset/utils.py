@@ -38,6 +38,7 @@ def get_bos_eos_token_ids(tokenizer):
 def encode_fn(example,
               tokenizer,
               max_length,
+              max_patch_num,
               input_ids_with_output=True,
               with_image_token=False,
               per_image_length=None):
@@ -132,6 +133,7 @@ def encode_fn(example,
     #     input_ids = input_ids[:max_length]
     #     labels = labels[:max_length]
     per_image_length = example.get('image_len', per_image_length)
+    per_image_length = min(per_image_length, max_patch_num)
     input_ids = input_ids[:max_length - n_images * per_image_length]
     labels = labels[:max_length - n_images * per_image_length]
     
@@ -265,7 +267,7 @@ def expand2square(pil_img, background_color):
         return result
 
 
-def load_image(image_file):
+def load_image(image_file, max_patch_num):
     if image_file.startswith('http://') or image_file.startswith('https://'):
         response = requests.get(image_file)
         image = Image.open(BytesIO(response.content)).convert('RGB')
@@ -274,10 +276,10 @@ def load_image(image_file):
         image = image.iloc[:, :512]
 
         total_rows = image.shape[0]
-        if total_rows >= 10240:
-            indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
+        if total_rows >= max_patch_num:
+            indices = np.linspace(0, total_rows - 1, max_patch_num, dtype=int)
             sampled_df = image.iloc[indices]
-            image = sampled_df.iloc[:10240]
+            image = sampled_df.iloc[:max_patch_num]
         
 
         image = image.to_numpy().reshape(1, image.shape[0], 512)
@@ -288,13 +290,14 @@ def load_image(image_file):
             # coords = f['coords'][:]
             
         total_rows = image.shape[0]
-        if total_rows >= 10240:
-            indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
+        if total_rows >= max_patch_num:
+            indices = np.linspace(0, total_rows - 1, max_patch_num, dtype=int)
             image = image[indices]
 
         image = image.reshape(1, image.shape[0], 768)
     else:
         image = Image.open(image_file).convert('RGB')
+    print('Loaded image shape:', image.shape)
     return image
 
 def load_wsi_feature(wsi_file):
