@@ -36,7 +36,7 @@ test_output_path = work_dir + 'test_results'
 print_n_samples_in_test = None
 image_path_list = None
 
-prompt_template = PROMPT_TEMPLATE.qwen_chat_no_think
+prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
 max_length = 32768

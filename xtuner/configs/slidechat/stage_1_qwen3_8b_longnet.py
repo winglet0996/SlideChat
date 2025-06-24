@@ -26,16 +26,17 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-llm_name_or_path = '/home/winglet/models/Qwen3-0.6B'
+llm_name_or_path = '/home/winglet/models/Qwen3-8B'
 train_data_path = '/home/winglet/pathology/vqa/dataset_pp/PathoVerse_train_stage1_caption.json'
 test_data_path = '/home/winglet/pathology/vqa/dataset_pp/PathoVerse_train_stage1_caption_test.json'
-test_output_path = '/home/winglet/pathology/vqa/train_s1/test_results'
 # ckpt_path = '/home/winglet/pathology/vqa/train_s1/iter_1.pth'
 ckpt_path = None
-
+work_dir = '/home/winglet/pathology/vqa/train_s1/'
+test_output_path = work_dir + 'test_results'
+print_n_samples_in_test = None
 image_path_list = None
 
-prompt_template = PROMPT_TEMPLATE.qwen_chat_no_think
+prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
 max_length = 32768
@@ -206,6 +207,7 @@ test_cfg = dict(type="TestLoop")
 test_evaluator = dict(
     type=PathologyMetric,
     tokenizer=tokenizer,
+    print_first_n_samples=print_n_samples_in_test,
     output_dir=test_output_path,
     prefix="test"
 )
