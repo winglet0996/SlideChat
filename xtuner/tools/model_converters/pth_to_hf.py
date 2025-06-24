@@ -20,10 +20,10 @@ from xtuner.registry import BUILDER
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Convert the pth model to HuggingFace model')
-    parser.add_argument('config', help='config file name or path.')
-    parser.add_argument('pth_model', help='pth model file')
+    parser.add_argument('--config', help='config file name or path.')
+    parser.add_argument('--pth_model', help='pth model file')
     parser.add_argument(
-        'save_dir', help='the directory to save HuggingFace model')
+        '--save_dir', help='the directory to save HuggingFace model')
     parser.add_argument(
         '--fp32',
         action='store_true',
@@ -54,6 +54,9 @@ def parse_args():
         'Note that the quotation marks are necessary and that no white space '
         'is allowed.')
     args = parser.parse_args()
+    args.config = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/slidechat/stage_1_qwen3_8b.py'
+    args.pth_model = '/home/winglet/pathology/vqa/train_s1/iter_1.pth'
+    args.save_dir = '/home/winglet/pathology/vqa/train_s1/iter_2_hf'
     return args
 
 

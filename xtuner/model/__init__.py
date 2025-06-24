@@ -1,7 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from .internvl import InternVL_V1_5
-from .llava import LLaVAModel
-from .llava_attn import LLaVAModel_Attn
-from .sft import SupervisedFinetune
+from .llava_longnet import LLaVAModel_longnet
+from .llava_conv_longnet import LLaVAModel_conv_longnet
 
-__all__ = ['SupervisedFinetune', 'LLaVAModel', 'InternVL_V1_5', 'LLaVAModel_Attn']
+__all__ = ['LLaVAModel_longnet',
+           'LLaVAModel_conv_longnet'
+           ]
+

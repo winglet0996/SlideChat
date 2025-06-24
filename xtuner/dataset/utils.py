@@ -9,7 +9,8 @@ import numpy as np
 import requests
 from PIL import Image
 import h5py
-import pandas as pd
+import torch
+from torchvision import transforms
 
 from xtuner.utils import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX
 
@@ -129,14 +130,15 @@ def encode_fn(example,
                 input_ids += sep_encode
                 labels += [IGNORE_INDEX] * len(sep_encode)
 
-    # if len(input_ids) > max_length:
-    #     input_ids = input_ids[:max_length]
-    #     labels = labels[:max_length]
-    per_image_length = example.get('image_len', per_image_length)
-    per_image_length = min(per_image_length, max_patch_num)
-    input_ids = input_ids[:max_length - n_images * per_image_length]
-    labels = labels[:max_length - n_images * per_image_length]
-    
+    if max_patch_num is not None and max_patch_num > 0:
+        per_image_length = example.get('image_len', per_image_length)
+        per_image_length = min(per_image_length, max_patch_num)
+        input_ids = input_ids[:max_length - n_images * per_image_length]
+        labels = labels[:max_length - n_images * per_image_length]
+    else:
+        per_image_length = max_length//2 # hard code for conv patch compression
+        input_ids = input_ids[:max_length - n_images * per_image_length]
+        labels = labels[:max_length - n_images * per_image_length]
     return {'input_ids': input_ids, 'labels': labels}
 
 
@@ -252,7 +254,6 @@ class Packer:
 
         return result
 
-
 def expand2square(pil_img, background_color):
     width, height = pil_img.size
     if width == height:
@@ -267,58 +268,127 @@ def expand2square(pil_img, background_color):
         return result
 
 
-def load_image(image_file, max_patch_num):
-    if image_file.startswith('http://') or image_file.startswith('https://'):
+def load_image(image_file):
+    if image_file.startswith("http://") or image_file.startswith("https://"):
         response = requests.get(image_file)
-        image = Image.open(BytesIO(response.content)).convert('RGB')
-    elif image_file.endswith('.csv'):
-        image = pd.read_csv(image_file)
-        image = image.iloc[:, :512]
-
-        total_rows = image.shape[0]
-        if total_rows >= max_patch_num:
-            indices = np.linspace(0, total_rows - 1, max_patch_num, dtype=int)
-            sampled_df = image.iloc[indices]
-            image = sampled_df.iloc[:max_patch_num]
-        
-
-        image = image.to_numpy().reshape(1, image.shape[0], 512)
-
-    elif image_file.endswith('.h5'):
-        with h5py.File(image_file, 'r') as f:
-            image = f['features'][:]
-            # coords = f['coords'][:]
-            
-        total_rows = image.shape[0]
-        if total_rows >= max_patch_num:
-            indices = np.linspace(0, total_rows - 1, max_patch_num, dtype=int)
-            image = image[indices]
-
-        image = image.reshape(1, image.shape[0], 768)
+        image = Image.open(BytesIO(response.content)).convert("RGB")
     else:
-        image = Image.open(image_file).convert('RGB')
-    print('Loaded image shape:', image.shape)
+        image = Image.open(image_file).convert("RGB")
     return image
 
-def load_wsi_feature(wsi_file):
-    if wsi_file.endswith('.csv'):
-        wsi_feats = pd.read_csv(wsi_file)
-        # total_rows = wsi_feats.shape[0]
-        # if total_rows >= 10240:
-        #     indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
-        #     wsi_feats = wsi_feats.iloc[indices]
-        wsi_feats = wsi_feats.to_numpy()
-    elif wsi_file.endswith('.h5'):
-        with h5py.File(wsi_file, 'r') as f:
-            wsi_feats = f['features'][:]
-            # coords = f['coords'][:]
-        # total_rows = wsi_feats.shape[0]
-        # if total_rows >= 10240:
-        #     indices = np.linspace(0, total_rows - 1, 10240, dtype=int)
-        #     wsi_feats = wsi_feats[indices]
-    return wsi_feats
 
 def decode_base64_to_image(base64_string):
     image_data = base64.b64decode(base64_string)
     image = Image.open(io.BytesIO(image_data))
     return image
+
+class PadToGrid:
+    """
+    Pads sparse features into a dense grid and generates a corresponding mask.
+    The mask indicates valid (1) vs. padded (0) areas, which is required
+    by downstream modules like Partial Convolution (PConv).
+    """
+    def __init__(self, pad_value=0.0):
+        self.pad_value = pad_value
+
+    def __call__(self, sample):
+        """
+        Args:
+            sample (tuple): A tuple containing (features, coords, patch_size).
+
+        Returns:
+            tuple: A tuple containing (feature_grid, mask).
+                   - feature_grid (torch.Tensor): The dense grid of features (C, H, W).
+                   - mask (torch.Tensor): The binary mask (1, H, W).
+        """
+        features, coords, patch_size = sample
+        features = torch.as_tensor(features, dtype=torch.float32)
+        coords = torch.as_tensor(coords, dtype=torch.long)
+
+        # Convert absolute coordinates to grid coordinates
+        grid_coords = coords // patch_size
+        
+        # Find the bounding box of the occupied grid cells
+        min_coords = torch.min(grid_coords, dim=0).values
+        max_coords = torch.max(grid_coords, dim=0).values
+        
+        # Shift coordinates to be relative to the top-left corner of the bounding box
+        shifted_coords = grid_coords - min_coords
+        
+        # Calculate the dimensions of the final dense grid
+        grid_dims = max_coords - min_coords + 1
+        grid_h, grid_w = grid_dims[1].item(), grid_dims[0].item()
+
+        feature_dim = features.shape[1]
+        
+        # Create a dense feature grid filled with the padding value
+        # Use (H, W, C) for easier indexing, then permute
+        feature_grid = torch.full(
+            (grid_h, grid_w, feature_dim), 
+            fill_value=self.pad_value, 
+            dtype=features.dtype
+        )
+        
+        # Create a corresponding mask grid initialized to zeros (padded)
+        mask_grid = torch.zeros((grid_h, grid_w), dtype=torch.float32)
+
+        # Place the features into the feature grid at their respective locations
+        feature_grid[shifted_coords[:, 1], shifted_coords[:, 0]] = features
+        
+        # Set the mask to 1.0 at the locations of valid features
+        mask_grid[shifted_coords[:, 1], shifted_coords[:, 0]] = 1.0
+        
+        # Permute feature grid to (C, H, W) and add channel dim to mask to get (1, H, W)
+        return feature_grid.permute(2, 0, 1), mask_grid.unsqueeze(0)
+
+class RandomVariableCrop:
+    """
+    Performs a random crop with a variable output size.
+    Crucially, it applies the *same* crop to both the feature grid and its mask
+    to maintain their correspondence.
+    """
+    def __init__(self, scale=(0.75, 1.0), ratio=(3. / 4., 4. / 3.)):
+        self.scale = scale
+        self.ratio = ratio
+
+    def __call__(self, sample):
+        """
+        Args:
+            sample (tuple): A tuple containing (grid, mask).
+                            - grid (torch.Tensor): A feature grid of shape (C, H, W).
+                            - mask (torch.Tensor): A mask of shape (1, H, W).
+        Returns:
+            tuple: A tuple containing the cropped (grid, mask).
+        """
+        grid, mask = sample
+        
+        # Use the library's robust function to get crop parameters based on the grid's size
+        top, left, h, w = transforms.RandomResizedCrop.get_params(grid, self.scale, self.ratio)
+        
+        # Apply the exact same crop to both the grid and the mask
+        cropped_grid = grid[:, top:top + h, left:left + w]
+        cropped_mask = mask[:, top:top + h, left:left + w]
+        
+        return cropped_grid, cropped_mask
+
+def load_wsi_feature(wsi_file, max_patch_num, transform=None):
+    with h5py.File(wsi_file, 'r') as f:
+        features = f['features'][:]
+        coords = f['coords'][:]
+        patch_size = f['coords'].attrs.get('patch_size', 256)
+
+    # do random sampling
+    if max_patch_num is not None and max_patch_num > 0:   
+        total_patches = features.shape[0]
+        if total_patches >= max_patch_num:
+            indices = np.linspace(0, total_patches - 1, max_patch_num, dtype=int)
+            features = features[indices]
+    
+    # do padding and random crop
+    sample = (features, coords, patch_size)
+    if transform:
+        return transform(sample)
+    else:
+        features = torch.from_numpy(features)
+        return features
+

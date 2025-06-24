@@ -107,7 +107,7 @@ def main():
     # Configuration - use available data file
     eval_data_path = '/home/winglet/pathology/vqa/dataset_pp/PathoVerse_train_stage1_caption.json'
     output_path = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/slidechat/eval_samples.py'
-    sample_num = 5
+    sample_num = 2
     seed = 42
     
     print("SlideChat Evaluation Sample Generator")

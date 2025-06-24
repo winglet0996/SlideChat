@@ -25,7 +25,7 @@ from xtuner.registry import BUILDER, MAP_FUNC
 from xtuner.tools.utils import (auto_dtype_of_deepspeed_config,
                                 get_seed_from_checkpoint)
 
-
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM')
@@ -61,28 +61,10 @@ def parse_args():
     parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
     
-    args.config = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/slidechat/stage_1.py'
-    # args.deepspeed = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
+    args.config = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/slidechat/stage_1_qwen3_8b_conv_longnet.py'
+    args.deepspeed = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
     args.work_dir = '/home/winglet/pathology/vqa/train_s1'
-
-    last_checkpoint_file = os.path.join(args.work_dir, 'last_checkpoint')
-    # Ensure the directory exists
-    os.makedirs(args.work_dir, exist_ok=True)
-    if not os.path.exists(last_checkpoint_file):
-        # Create the file if it doesn't exist
-        open(last_checkpoint_file, 'w').close()
-        print('-------------------------------------------------- Created empty last_checkpoint file ----------------------------------------------')
-    
-    with open(last_checkpoint_file, 'r', encoding='utf-8') as file:
-        first_line = file.readline().strip()
-    
-    if first_line:
-        print('--------------------------------------------------resume----------------------------------------------', first_line)
-        args.resume = first_line
-    else:
-        print('-------------------------------------------------- NO resume----------------------------------------------')
-        args.resume = None
-    
+   
     return args
 
 

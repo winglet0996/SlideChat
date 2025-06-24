@@ -12,10 +12,10 @@ from xtuner.model.utils import LoadWoInit
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Merge a HuggingFace adapter to base model')
-    parser.add_argument('model_name_or_path', help='model name or path')
-    parser.add_argument('adapter_name_or_path', help='adapter name or path')
+    parser.add_argument('--model_name_or_path', help='model name or path')
+    parser.add_argument('--adapter_name_or_path', help='adapter name or path')
     parser.add_argument(
-        'save_dir', help='the directory to save the merged model')
+        '--save_dir', help='the directory to save the merged model')
     parser.add_argument(
         '--max-shard-size',
         type=str,
@@ -37,6 +37,11 @@ def parse_args():
         help='Indicate the device')
 
     args = parser.parse_args()
+    
+    args.model_name_or_path = '/home/winglet/models/Qwen3-0.6B'
+    args.adapter_name_or_path = '/home/winglet/pathology/vqa/train_s1/iter_1.pth'
+    args.save_dir = '/home/winglet/pathology/vqa/train_s1/merged_model'
+
     return args
 
 

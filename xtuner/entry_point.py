@@ -155,8 +155,8 @@ def train():
 
 
 def test():
-    from xtuner.tools import test
-    return test.__file__
+    from xtuner.tools import test_raw
+    return test_raw.__file__
 
 
 def chat():
