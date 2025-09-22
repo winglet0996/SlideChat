@@ -54,7 +54,7 @@ class LLaVADataset_conv_longnet(Dataset):
             if mode == 'train':
                 self.transform = transforms.Compose([
                     PadToGrid(),
-                    RandomVariableCrop(scale=(0.75, 1.0))
+                    RandomVariableCrop(scale=(0.7, 1.0), ratio=(0.2, 5.0))
                 ])
             else:
                 self.transform = transforms.Compose([
@@ -99,7 +99,10 @@ class LLaVADataset_conv_longnet(Dataset):
                 with_image_token=True,
                 per_image_length=self.per_image_length,
                 max_patch_num=self.max_patch_num,
-                input_ids_with_output=input_ids_with_output)
+                input_ids_with_output=input_ids_with_output,
+                reg_token='<REG>',
+                srv_token='<SRV>',
+                )
 
         self.image_folder = image_folder
         self.image_path_list = image_path_list
@@ -126,6 +129,7 @@ class LLaVADataset_conv_longnet(Dataset):
 
     def __getitem__(self, index):
         data_dict = self.text_data[index]
+        # image manipulation
         if data_dict.get('image', None) is not None:
             image_list = data_dict['image']
             if isinstance(image_list, str):
@@ -152,4 +156,5 @@ class LLaVADataset_conv_longnet(Dataset):
                 masks.append(mask)
             data_dict['features'] = feats
             data_dict['masks'] = masks
+            data_dict['image_file'] = image_list
         return data_dict

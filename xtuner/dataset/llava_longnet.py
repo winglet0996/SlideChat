@@ -44,7 +44,7 @@ class LLaVADataset_longnet(Dataset):
                  pad_image_to_square=False,
                  max_patch_num=None,
                  mode=None,
-                 input_ids_with_output=None):
+                 input_ids_with_output=True):
         super().__init__()
 
         self.max_patch_num = max_patch_num

@@ -3,6 +3,12 @@ import argparse
 import json
 import logging
 import os
+import warnings
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# Set a different port for distributed training to avoid EADDRINUSE error
+if 'MASTER_PORT' not in os.environ:
+    os.environ['MASTER_PORT'] = '29501'
 import os.path as osp
 from functools import partial
 from types import FunctionType
@@ -24,8 +30,6 @@ from xtuner.model.utils import LoadWoInit, find_all_linear_names, traverse_dict
 from xtuner.registry import BUILDER, MAP_FUNC
 from xtuner.tools.utils import (auto_dtype_of_deepspeed_config,
                                 get_seed_from_checkpoint)
-
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM')
@@ -61,9 +65,9 @@ def parse_args():
     parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
     
-    args.config = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/slidechat/stage_1_qwen3_8b_conv_longnet.py'
-    args.deepspeed = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
-    args.work_dir = '/home/winglet/pathology/vqa/train_s1'
+    args.config = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py'
+    args.deepspeed = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
+    # args.work_dir = '/home/ps/pathology/codes/project/TCGA/train_s2'
    
     return args
 
@@ -131,6 +135,11 @@ def check_cfg(cfg, args):
 
 
 def main():
+    # Filter out the torch.utils.checkpoint warning about use_reentrant parameter
+    warnings.filterwarnings("ignore", 
+                          message="torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly.*",
+                          category=UserWarning)
+    
     args = parse_args()
 
     # parse config

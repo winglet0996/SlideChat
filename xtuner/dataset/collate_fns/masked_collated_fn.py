@@ -28,20 +28,44 @@ def masked_collated_fn(instances: Sequence[Dict],
     if has_image:
         features = []
         masks = []
+        image_batch_indices = []  # map each image to its sample index
 
-    for example in instances:
+    # Optional regression and survival targets collection
+    regression_targets = []
+    survival_targets = []
+
+    for b_idx, example in enumerate(instances):
         input_ids.append(torch.LongTensor(example['input_ids']))
         labels.append(torch.LongTensor(example['labels']))
         if use_varlen_attn:
             cumulative_len.append(torch.IntTensor(example['cumulative_len']))
             position_ids.append(torch.LongTensor(example['position_ids']))
 
+        # collect regression targets if present
+        if 'regression_targets' in example and example['regression_targets'] is not None:
+            # support scalar or list
+            tgt = example['regression_targets']
+            if isinstance(tgt, (list, tuple, np.ndarray)):
+                # use the first value for this sample
+                tgt = float(tgt[0])
+            regression_targets.append([tgt])
+        else:
+            regression_targets.append([np.nan])  # placeholder, will be masked later if unused
+
+        # collect survival targets if present
+        if 'survival_targets' in example and example['survival_targets'] is not None:
+            survival_targets.append(example['survival_targets'])
+        else:
+            survival_targets.append(None)  # placeholder
+
         if has_image:
             # Handle features
             if isinstance(example['features'], list):
                 features.extend(example['features'])
+                image_batch_indices.extend([b_idx] * len(example['features']))
             else:
                 features.append(example['features'])
+                image_batch_indices.append(b_idx)
             
             # Handle masks
             if isinstance(example['masks'], list):
@@ -67,8 +91,8 @@ def masked_collated_fn(instances: Sequence[Dict],
         # Some tokenizers have the same eos token and pad token, so input_ids
         # cannot be masked directly based on the pad token id.
         attention_mask = torch.zeros_like(input_ids).bool()
-        for i in ori_length:
-            attention_mask[:i] = True
+        for row, i in enumerate(ori_length):
+            attention_mask[row, :i] = True
 
         bs, seq_len = input_ids.shape
         position_ids = torch.arange(seq_len).unsqueeze(0).long().repeat(bs, 1)
@@ -101,10 +125,41 @@ def masked_collated_fn(instances: Sequence[Dict],
 
     if has_image:
         features = torch.stack(features)
-        masks = torch.stack(masks)
+        masks = torch.stack(masks) if masks[0] is not None else None
         data_dict['features'] = features
-        data_dict['masks'] = masks
+        if masks is not None:
+            data_dict['masks'] = masks
+        data_dict['labels_text'] = [
+            inst.get('conversations', [])[-1].get('value', '') for inst in instances
+        ]
+        data_dict['category'] = [
+            inst.get('category', None) for inst in instances
+        ]
+        data_dict['image_file'] = [
+            inst.get('image_file', None) for inst in instances
+        ]
+        # Add mapping from image to sample index
+        data_dict['image_batch_indices'] = torch.as_tensor(
+            image_batch_indices, dtype=torch.long)
 
+    # stack regression targets
+    if any(not np.isnan(t[0]) for t in regression_targets):
+        data_dict['regression_targets'] = torch.tensor(
+            regression_targets, dtype=torch.float32).squeeze(-1)
+
+    # stack survival targets 
+    if any(t is not None for t in survival_targets):
+        # Filter out None values and stack the valid ones
+        valid_survival_targets = [t for t in survival_targets if t is not None]
+        if valid_survival_targets:
+            # Assume survival_targets have 'target_y' and 'at_risk_mask' keys
+            target_y_list = [t['target_y'] for t in valid_survival_targets]
+            at_risk_mask_list = [t['at_risk_mask'] for t in valid_survival_targets]
+            
+            data_dict['survival_targets'] = {
+                'target_y': torch.tensor(target_y_list, dtype=torch.float32),
+                'at_risk_mask': torch.tensor(at_risk_mask_list, dtype=torch.float32)
+            }
 
     if return_hf_format:
         return data_dict

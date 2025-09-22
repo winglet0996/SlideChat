@@ -1,193 +1,255 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.models.layers import trunc_normal_
+from transformers import InstructBlipQFormerConfig
+from transformers.models.instructblip.modeling_instructblip import InstructBlipQFormerEncoder
+from typing import Optional, Tuple
 
 class PartialConv2d(nn.Conv2d):
     """
     Partial Convolution layer, as described in "Image Inpainting for Irregular Holes Using Partial Convolutions".
-    This version includes caching for efficiency and correct slide_winsize calculation.
+    This version is adapted to return the updated mask, which is essential for propagation.
     """
     def __init__(self, *args, **kwargs):
-        # Pop custom arguments before passing to parent
+        # Whether the mask is multi-channel or not
         self.multi_channel = kwargs.pop('multi_channel', False)
-        self.return_mask = kwargs.pop('return_mask', False)
+        # Whether to return the mask
+        self.return_mask = kwargs.pop('return_mask', True)
         super(PartialConv2d, self).__init__(*args, **kwargs)
 
-        # Create mask update kernel
         if self.multi_channel:
-            self.weight_maskUpdater = torch.ones(self.out_channels, self.in_channels, self.kernel_size[0], self.kernel_size[1])
+            weight_maskUpdater = torch.ones(self.out_channels, self.in_channels, self.kernel_size[0], self.kernel_size[1])
         else:
-            self.weight_maskUpdater = torch.ones(1, 1, self.kernel_size[0], self.kernel_size[1])
+            weight_maskUpdater = torch.ones(1, 1, self.kernel_size[0], self.kernel_size[1])
         
-        # Correctly calculate sliding window size based on convolution type.
-        # For standard conv (groups=1), window size is C_in * K_h * K_w.
-        # For depthwise conv (groups=C_in), each filter sees 1 channel, so it's K_h * K_w.
-        self.slide_winsize = (self.in_channels / self.groups) * self.kernel_size[0] * self.kernel_size[1]
+        self.slide_winsize = (self.in_channels // self.groups) * self.kernel_size[0] * self.kernel_size[1]
         
-        # Caching for performance
-        self.last_size = (None, None, None, None)
-        self.update_mask = None
-        self.mask_ratio = None
+        self.register_buffer('updater_buf', weight_maskUpdater) # Use a buffer
 
     def forward(self, input, mask_in=None):
         assert len(input.shape) == 4
         
-        # Initialize mask if not provided
         if mask_in is None:
+            # if mask is not provided, create a ones mask
             if self.multi_channel:
                 mask = torch.ones_like(input)
             else:
                 mask = torch.ones(input.shape[0], 1, input.shape[2], input.shape[3], device=input.device, dtype=input.dtype)
         else:
             mask = mask_in
-            
-        # Only update mask tensors if input size changes.
-        if self.update_mask is None or self.last_size != tuple(input.shape):
-            self.last_size = tuple(input.shape)
-            self.weight_maskUpdater = self.weight_maskUpdater.to(input)
-            
-            with torch.no_grad():
-                self.update_mask = F.conv2d(mask, self.weight_maskUpdater, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=1)
-                self.mask_ratio = self.slide_winsize / (self.update_mask + 1e-6)
-                self.update_mask = torch.clamp(self.update_mask, 0, 1)
-                self.mask_ratio = self.mask_ratio * self.update_mask
 
-        # Apply mask to input and perform convolution
+        with torch.no_grad():
+            # The updater does not require gradients
+            update_mask = F.conv2d(mask, self.updater_buf, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=1)
+            
+            # For mixed precision training, ensure consistent dtypes
+            mask_ratio = self.slide_winsize / (update_mask + 1e-8)
+            mask_ratio = mask_ratio.to(input.dtype)
+            
+            update_mask = torch.clamp(update_mask, 0, 1)
+            mask_ratio = mask_ratio * update_mask
+
+        # Apply the mask to the input
         masked_input = input * mask
+        
+        # Perform the convolution
         raw_out = super(PartialConv2d, self).forward(masked_input)
 
-        # Apply normalization and handle bias
         if self.bias is not None:
             bias_view = self.bias.view(1, self.out_channels, 1, 1)
-            output = (raw_out - bias_view) * self.mask_ratio + bias_view * self.update_mask
+            output = (raw_out - bias_view) * mask_ratio + bias_view
         else:
-            output = raw_out * self.mask_ratio
+            output = raw_out * mask_ratio
 
         if self.return_mask:
-            return output, self.update_mask
+            return output, update_mask
         else:
             return output
 
-class LayerNorm2d(nn.LayerNorm):
-    """
-    Channel-wise LayerNorm for 4D tensors (B, C, H, W).
-    """
-    def __init__(self, normalized_shape, eps=1e-6):
-        super().__init__(normalized_shape, eps=eps, elementwise_affine=True)
-    
-    def forward(self, x):
-        x = x.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
-        x = super().forward(x)
-        x = x.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
-        return x
-
 class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
     """
-    Stochastic depth implementation.
-    """
-    def __init__(self, drop_prob=0.):
-        super().__init__()
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
         self.drop_prob = drop_prob
 
     def forward(self, x):
         if self.drop_prob == 0. or not self.training:
             return x
         keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
         random_tensor.floor_()  # binarize
         output = x.div(keep_prob) * random_tensor
         return output
 
-class PartialConvMlp(nn.Module):
+class LayerNorm(nn.Module):
+    """ LayerNorm that supports two data formats: channels_last (default) or channels_first. 
+    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
+    shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
+    with shape (batch_size, channels, height, width).
     """
-    MLP Block using 1x1 PartialConvs.
-    """
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        
-        self.fc1 = PartialConv2d(in_features, hidden_features, kernel_size=1, return_mask=True)
-        self.act = act_layer()
-        self.fc2 = PartialConv2d(hidden_features, out_features, kernel_size=1, return_mask=True)
-        self.drop = nn.Dropout(drop)
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise NotImplementedError 
+        self.normalized_shape = (normalized_shape, )
+    
+    def forward(self, x):
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        elif self.data_format == "channels_first":
+            u = x.mean(1, keepdim=True)
+            s = (x - u).pow(2).mean(1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.eps)
+            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            return x
 
-    def forward(self, x, mask):
-        x, mask = self.fc1(x, mask)
-        x = self.act(x)
-        x = self.drop(x)
-        x, mask = self.fc2(x, mask)
-        x = self.drop(x)
-        return x, mask
-
-class PartialConvNeXtBlock(nn.Module):
-    """ 
-    ConvNeXt Block adapted for Partial Convolution.
+class GRN(nn.Module):
+    """ GRN (Global Response Normalization) layer
     """
-    def __init__(self, dim, drop_path=0., ls_init_value=1e-6, kernel_size=7, mlp_ratio=4):
+    def __init__(self, dim):
         super().__init__()
-        self.conv_dw = PartialConv2d(dim, dim, kernel_size=kernel_size, padding=kernel_size//2, groups=dim, return_mask=True)
-        self.norm = LayerNorm2d(dim, eps=1e-6)
-        self.mlp = PartialConvMlp(in_features=dim, hidden_features=int(mlp_ratio * dim))
-        self.gamma = nn.Parameter(ls_init_value * torch.ones(dim)) if ls_init_value > 0 else None
+        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
+
+    def forward(self, x):
+        Gx = torch.norm(x, p=2, dim=(1,2), keepdim=True)
+        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
+        return self.gamma * (x * Nx) + self.beta + x
+
+class PartialConvNeXtV2Block(nn.Module):
+    """ Partial ConvNeXtV2 Block.
+    
+    Args:
+        dim (int): Number of input channels.
+        drop_path (float): Stochastic depth rate. Default: 0.0
+    """
+    def __init__(self, dim, drop_path=0.):
+        super().__init__()
+        # Use PartialConv2d for the depthwise convolution
+        self.dwconv = PartialConv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
+        self.norm = LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
+        self.act = nn.GELU()
+        self.grn = GRN(4 * dim)
+        self.pwconv2 = nn.Linear(4 * dim, dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x, mask):
         shortcut = x
+        # The dwconv is a PartialConv2d, it returns the feature map and the updated mask
+        x, updated_mask = self.dwconv(x, mask)
         
-        # Main path
-        x_main, mask_updated = self.conv_dw(x, mask)
-        x_main = self.norm(x_main)
-        x_main, mask_updated = self.mlp(x_main, mask_updated)
-        
-        if self.gamma is not None:
-            x_main = x_main.mul(self.gamma.view(1, -1, 1, 1))
-
-        # The residual connection must be constrained by the *updated* mask
-        # to ensure the output feature map and the output mask are consistent.
-        x_main_w_drop = self.drop_path(x_main)
-        output = (shortcut * mask_updated) + x_main_w_drop
-        
-        return output, mask_updated
-
-class PartialConvDownsample(nn.Module):
-    """
-    Downsampling layer: Conv -> Norm.
-    It normalizes the features *after* their dimensions have been changed by the convolution.
-    """
-    def __init__(self, in_chs, out_chs, stride=2):
-        super().__init__()
-        self.conv = PartialConv2d(in_chs, out_chs, kernel_size=stride, stride=stride, return_mask=True)
-        self.norm = LayerNorm2d(out_chs) # Initialize with OUTPUT channels
-
-    def forward(self, x, mask):
-        x, mask = self.conv(x, mask)
+        # Permute to (N, H, W, C) to use nn.Linear and the official GRN
+        x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
-        return x, mask
-    
-class PartialConvNeXtStage(nn.Module):
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.grn(x)
+        x = self.pwconv2(x)
+        x = x.permute(0, 3, 1, 2) # Permute back to (N, C, H, W)
+
+        # Apply residual connection.
+        # The output of the main path is added to the original input.
+        x = shortcut + self.drop_path(x)
+        
+        return x, updated_mask
+
+
+class HighResPartialConvNeXt(nn.Module):
     """
-    A PartialConvNeXt Stage with multiple blocks.
+    A PartialConvNeXtV2-based model optimized for processing high-dimensional feature maps.
+    It removes the aggressive stem and classification head, acting as a general-purpose
+    feature refinement module.
+
+    Args:
+        in_chans (int): Number of input feature channels.
+        depths (tuple(int)): Number of blocks at each stage.
+        dims (int): Feature dimension at each stage.
+        drop_path_rate (float): Stochastic depth rate.
+        num_downsamples (int): Number of downsampling stages. Must be <= len(depths) - 1.
     """
-    def __init__(self, dim, depth, kernel_size=7, mlp_ratio=4., drop_path=0., ls_init_value=1e-6):
+    def __init__(self, in_chans=768, 
+                 depths=[2, 2, 6], dims=[768, 768, 768], 
+                 drop_path_rate=0.1, num_downsamples=2
+                 ):
         super().__init__()
         
-        if isinstance(drop_path, (list, tuple)):
-            drop_path_rates = drop_path
-        else:
-            drop_path_rates = [x.item() for x in torch.linspace(0, drop_path, depth)]
+        # Store dims for later access
+        self.dims = dims
         
-        self.blocks = nn.ModuleList([
-            PartialConvNeXtBlock(
-                dim=dim, kernel_size=kernel_size, mlp_ratio=mlp_ratio,
-                drop_path=drop_path_rates[i], ls_init_value=ls_init_value
-            ) for i in range(depth)
-        ])
+        if num_downsamples > len(depths) - 1:
+            raise ValueError(f"num_downsamples ({num_downsamples}) cannot exceed len(depths)-1 ({len(depths)-1})")
 
-    def forward(self, x, mask):
-        for block in self.blocks:
-            x, mask = block(x, mask)
+        # --- Gentle Input Projection (1x1 Conv) ---
+        # Only used if the input channels don't match the first stage dimension.
+        if in_chans != dims[0]:
+            self.input_proj = PartialConv2d(in_chans, dims[0], kernel_size=1)
+        else:
+            self.input_proj = None
+
+        # --- Stages & Downsampling Layers ---
+        self.stages = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        cur = 0
+
+        # Create all stages
+        for i in range(len(depths)):
+            stage = nn.ModuleList(
+                [PartialConvNeXtV2Block(dim=dims[i], drop_path=dp_rates[cur + j]) for j in range(depths[i])]
+            )
+            self.stages.append(stage)
+            cur += depths[i]
+
+            # Create corresponding downsampling layer if needed
+            if i < num_downsamples:
+                downsample_layer = nn.ModuleList([
+                    LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
+                    PartialConv2d(dims[i], dims[i+1], kernel_size=2, stride=2),
+                ])
+                self.downsample_layers.append(downsample_layer)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (PartialConv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, mask=None):
+        """
+        Input:
+            x (torch.Tensor): Input feature map of shape (N, C_in, H, W).
+            mask (torch.Tensor, optional): Input mask of shape (N, 1, H, W). Defaults to all ones.
+        
+        Returns:
+            (torch.Tensor, torch.Tensor): A tuple of (output_feature, output_mask).
+        """
+        if mask is None:
+            mask = torch.ones(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
+
+        if self.input_proj is not None:
+            x, mask = self.input_proj(x, mask)
+
+        # Iterate through stages and downsampling layers
+        for i, stage in enumerate(self.stages):
+            for block in stage:
+                x, mask = block(x, mask)
+            
+            if i < len(self.downsample_layers):
+                # Apply downsampling
+                x = self.downsample_layers[i][0](x) # LayerNorm
+                x, mask = self.downsample_layers[i][1](x, mask) # PartialConv
+
         return x, mask
     
 class RotaryEmbedding2D(nn.Module):
@@ -247,53 +309,514 @@ class RotaryEmbedding2D(nn.Module):
         x_rotated = torch.stack([x_real_rot, x_imag_rot], dim=2).reshape(B, self.dim, H, W)
         return torch.cat([x_rotated, x_pass], dim=1)
     
-
-class HighResPartialConvNeXt(nn.Module):
+class PositionalEmbedding2DSinusoidal(nn.Module):
     """
-    An example model tailored for high-resolution, high-dimensional feature map inputs.
-    It features a "gentle" start, lightweight high-res stages, and heavier low-res stages.
+    Adds 2D sinusoidal positional embeddings to a 4D tensor with scale balancing.
+    The input tensor is expected to have the shape (B, C, H, W).
+    
+    Args:
+        d_model (int): Model dimension, must be divisible by 4
+        temperature (int): Temperature for sinusoidal encoding
+        scale_mode (str): How to balance scales between input and positional embedding
+            - 'learned': Use learnable scaling parameters (recommended)
+            - 'normalize': Normalize both inputs to similar scales
+            - 'adaptive': Adaptively scale based on input statistics
+            - 'none': Direct addition (original behavior)
+        init_pe_scale (float): Initial scale for positional embedding when using learned scaling
     """
-    def __init__(self, in_chans=768, 
-                 depths=[2, 2, 6], 
-                 dims=[768, 768, 768],
-                 mlp_ratios=[2, 4, 4], # Use different mlp_ratios for different stages
-                 kernel_sizes=[3, 7, 7], # Use different kernel_sizes for different stages
-                 drop_path=0.1 # Add drop_path argument with default 0.
-                ):
+    def __init__(self, d_model, temperature=10000, scale_mode='learned', init_pe_scale=0.1):
         super().__init__()
+        if d_model % 4 != 0:
+            raise ValueError(f"d_model must be divisible by 4, got {d_model}")
         
-        # 1. Input Projection: No downsampling. Just a 1x1 conv to start the process.
-        # This layer is optional if your input channel is already what you want.
-        # self.input_projection = PartialConv2d(in_chans, dims[0], kernel_size=1, return_mask=True)
+        self.d_model = d_model
+        self.temperature = temperature
+        self.scale_mode = scale_mode
+        
+        if scale_mode == 'learned':
+            # Learnable scaling parameters
+            self.input_scale = nn.Parameter(torch.ones(1))
+            self.pe_scale = nn.Parameter(torch.full((1,), init_pe_scale))
+        elif scale_mode == 'normalize':
+            # Layer normalization for both inputs
+            self.input_norm = nn.LayerNorm(d_model)
+            self.pe_norm = nn.LayerNorm(d_model)
+        elif scale_mode == 'adaptive':
+            # Adaptive scaling based on input statistics
+            self.momentum = 0.1
+            self.register_buffer('running_input_std', torch.ones(1))
+            self.register_buffer('running_pe_std', torch.ones(1))
 
-        # 2. Stage 0 (Full Resolution): Lightweight stage on the full HxW input.
-        # Uses small kernel size and small mlp_ratio to save computation.
-        print(f"Stage 0 (Full Res): dim={dims[0]}, depth={depths[0]}, k_size={kernel_sizes[0]}, mlp_ratio={mlp_ratios[0]}, drop_path={drop_path}")
-        self.stage0 = PartialConvNeXtStage(dim=dims[0], depth=depths[0], 
-                                           kernel_size=kernel_sizes[0], mlp_ratio=mlp_ratios[0], drop_path=drop_path)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W). C must equal d_model.
         
-        # 3. Downsample 1 -> Stage 1 (H/2, W/2)
-        self.downsample1 = PartialConvDownsample(in_chs=dims[0], out_chs=dims[1], stride=2)
-        print(f"Stage 1 (H/2, W/2): dim={dims[1]}, depth={depths[1]}, k_size={kernel_sizes[1]}, mlp_ratio={mlp_ratios[1]}, drop_path={drop_path}")
-        self.stage1 = PartialConvNeXtStage(dim=dims[1], depth=depths[1],
-                                           kernel_size=kernel_sizes[1], mlp_ratio=mlp_ratios[1], drop_path=drop_path)
+        Returns:
+            torch.Tensor: Tensor with added positional embeddings, of the same shape.
+        """
+        B, C, H, W = x.shape
+        if C != self.d_model:
+            raise ValueError(f"Input channel {C} does not match d_model {self.d_model}")
         
-        # 4. Downsample 2 -> Stage 2 (H/4, W/4): Computation is cheaper, can be heavier.
-        self.downsample2 = PartialConvDownsample(in_chs=dims[1], out_chs=dims[2], stride=2)
-        print(f"Stage 2 (H/4, W/4): dim={dims[2]}, depth={depths[2]}, k_size={kernel_sizes[2]}, mlp_ratio={mlp_ratios[2]}, drop_path={drop_path}")
-        self.stage2 = PartialConvNeXtStage(dim=dims[2], depth=depths[2],
-                                           kernel_size=kernel_sizes[2], mlp_ratio=mlp_ratios[2], drop_path=drop_path)
-    def forward(self, x, mask):
-        # Full resolution processing
-        # x, mask = self.input_projection(x, mask)
-        x, mask = self.stage0(x, mask)
+        # Create coordinate grids
+        y_pos = torch.arange(H, dtype=torch.float32, device=x.device).unsqueeze(1).repeat(1, W)
+        x_pos = torch.arange(W, dtype=torch.float32, device=x.device).unsqueeze(0).repeat(H, 1)
         
-        # Downsample and process
-        x, mask = self.downsample1(x, mask)
-        x, mask = self.stage1(x, mask)
+        # Normalize coordinates to [0, 1]
+        y_pos = y_pos / H
+        x_pos = x_pos / W
+        
+        # Calculate dimension indices
+        dim_t = torch.arange(self.d_model // 4, dtype=torch.float32, device=x.device)
+        dim_t = self.temperature ** (2 * dim_t / (self.d_model // 4))
+        
+        # Calculate positional embeddings
+        pos_x = x_pos.unsqueeze(-1) / dim_t
+        pos_y = y_pos.unsqueeze(-1) / dim_t
+        
+        # Apply sin/cos
+        pos_x = torch.stack((pos_x.sin(), pos_x.cos()), dim=-1).flatten(-2)
+        pos_y = torch.stack((pos_y.sin(), pos_y.cos()), dim=-1).flatten(-2)
+        
+        # Concatenate x and y embeddings
+        pos_emb = torch.cat((pos_y, pos_x), dim=-1)  # (H, W, d_model)
+        
+        # Reshape to (1, d_model, H, W) for broadcasting
+        pos_emb = pos_emb.permute(2, 0, 1).unsqueeze(0)
+        
+        # Apply different scale balancing strategies
+        if self.scale_mode == 'learned':
+            # Use learnable scaling parameters
+            return self.input_scale * x + self.pe_scale * pos_emb
+            
+        elif self.scale_mode == 'normalize':
+            # Normalize both inputs to similar scales
+            x_flat = x.permute(0, 2, 3, 1)  # (B, H, W, C)
+            pe_flat = pos_emb.permute(0, 2, 3, 1)  # (1, H, W, C)
+            
+            x_norm = self.input_norm(x_flat)
+            pe_norm = self.pe_norm(pe_flat)
+            
+            result = (x_norm + pe_norm).permute(0, 3, 1, 2)  # Back to (B, C, H, W)
+            return result
+            
+        elif self.scale_mode == 'adaptive':
+            # Adaptive scaling based on running statistics
+            with torch.no_grad():
+                input_std = x.std()
+                pe_std = pos_emb.std()
+                
+                if self.training:
+                    # Update running statistics during training
+                    self.running_input_std.mul_(1 - self.momentum).add_(input_std * self.momentum)
+                    self.running_pe_std.mul_(1 - self.momentum).add_(pe_std * self.momentum)
+                
+                # Use running statistics for scaling
+                input_std_norm = self.running_input_std
+                pe_std_norm = self.running_pe_std
+            
+            # Scale positional embedding to match input scale
+            scale_factor = input_std_norm / (pe_std_norm + 1e-8)
+            return x + scale_factor * pos_emb
+            
+        else:  # scale_mode == 'none'
+            # Original direct addition
+            return x + pos_emb
 
-        # Downsample and process again
-        x, mask = self.downsample2(x, mask)
-        x, mask = self.stage2(x, mask)
+class CustomQformer(nn.Module):
+    """
+    A custom, flexible Q-Former module designed to be trained from scratch.
+
+    This implementation faithfully replicates the logic of the original InstructBLIP
+    Q-Former by using its core components. It allows for full control over the
+    input embeddings, enabling the use of an external word embedding layer (like Qwen3's)
+    via a projection layer. It correctly applies position embeddings, LayerNorm, and
+    Dropout before feeding the data into the main transformer encoder.
+
+    Args:
+        config (InstructBlipQFormerConfig):
+            Configuration for the Q-Former, defining its internal architecture.
+        word_embeddings (nn.Embedding):
+            The pretrained word embedding layer from the target language model.
+    """
+    def __init__(
+        self,
+        config: InstructBlipQFormerConfig,
+        word_embeddings: nn.Embedding,
+    ):
+        super().__init__()
+        self.config = config
+
+        # --- Core Components ---
         
-        return x, mask
+        # 1. External word embeddings from the main LLM
+        self.word_embeddings = word_embeddings
+        embedding_dim = self.word_embeddings.embedding_dim
+        qformer_hidden_size = config.hidden_size
+        
+        # 2. Projection layer to adapt LLM embeddings to the Q-Former's hidden size
+        self.text_input_projection = nn.Linear(embedding_dim, qformer_hidden_size)
+
+        # 3. The main stack of transformer layers
+        self.encoder = InstructBlipQFormerEncoder(config)
+
+        # 4. Learnable query tokens, which act as the interface to the LLM
+        self.query_tokens = nn.Parameter(
+            torch.randn(1, config.num_query_tokens, qformer_hidden_size) * 0.02
+        )
+
+        # 5. Position embeddings - only create if using absolute position embedding
+        if config.position_embedding_type == "absolute":
+            self.position_embeddings = nn.Embedding(
+                config.max_position_embeddings, qformer_hidden_size
+            )
+        else:
+            # For relative position embedding, the encoder will handle position encoding internally
+            self.position_embeddings = None
+        
+        # 6. LayerNorm and Dropout, applied after combining query and text embeddings
+        # This is a critical step replicated from the original implementation.
+        self.layernorm = nn.LayerNorm(qformer_hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass that fuses visual and textual information.
+
+        Args:
+            input_ids (torch.LongTensor): Token IDs for the text prompt.
+                Shape: (batch_size, seq_len)
+            attention_mask (torch.Tensor): Attention mask for the text prompt.
+                Shape: (batch_size, seq_len)
+            encoder_hidden_states (torch.Tensor): Output features from the vision encoder.
+                Shape: (batch_size, num_patches, image_feature_dim)
+            encoder_attention_mask (Optional[torch.Tensor]): Mask for image features.
+
+        Returns:
+            torch.Tensor: The fused query embeddings.
+                Shape: (batch_size, num_query_tokens, qformer_hidden_size)
+        """
+        batch_size, seq_length = input_ids.shape
+        device = input_ids.device
+        num_queries = self.query_tokens.shape[1]
+
+        # 1. Prepare text embeddings: embed, project, and conditionally add position encodings.
+        
+        text_word_embeds = self.word_embeddings(input_ids)
+        projected_text_embeds = self.text_input_projection(text_word_embeds)
+        
+        # Only add absolute position embeddings if they exist
+        if self.position_embeddings is not None:
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=device).expand(batch_size, -1)
+            text_pos_embeds = self.position_embeddings(position_ids)
+            final_text_embeds = projected_text_embeds + text_pos_embeds
+        else:
+            # For relative position embedding, don't add position encodings here
+            final_text_embeds = projected_text_embeds
+
+        # 2. Prepare query embeddings for the batch.
+        query_embeds = self.query_tokens.expand(batch_size, -1, -1)
+
+        # 3. Concatenate query and text embeddings and apply LayerNorm + Dropout.
+        # This mirrors the behavior of the original `InstructBlipQFormerEmbeddings`.
+        embedding_output = torch.cat([query_embeds, final_text_embeds], dim=1)
+        embedding_output = self.layernorm(embedding_output)
+        embedding_output = self.dropout(embedding_output)
+
+        # 4. Create attention masks for the combined sequence and the encoder.
+        query_attention_mask = torch.ones((batch_size, num_queries), dtype=torch.long, device=device)
+        combined_attention_mask = torch.cat([query_attention_mask, attention_mask], dim=1)
+        extended_attention_mask = self.get_extended_attention_mask(combined_attention_mask)
+        
+        if encoder_attention_mask is None:
+            encoder_attention_mask = torch.ones(
+                encoder_hidden_states.shape[:2], dtype=torch.long, device=device
+            )
+        extended_encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+
+        # 5. Pass inputs to the core encoder.
+        # The `query_length` argument is crucial for the internal cross-attention.
+        encoder_outputs = self.encoder(
+            hidden_states=embedding_output,
+            attention_mask=extended_attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=extended_encoder_attention_mask,
+            query_length=num_queries,
+            return_dict=True,
+        )
+
+        # 6. Extract the hidden states corresponding to the query tokens.
+        last_hidden_state = encoder_outputs.last_hidden_state
+        query_output = last_hidden_state[:, :num_queries, :]
+
+        return query_output
+
+    # Helper functions to create broadcastable attention masks.
+    def get_extended_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        extended_attention_mask = attention_mask[:, None, None, :]
+        extended_attention_mask = extended_attention_mask.to(dtype=torch.float32)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -1e4
+        return extended_attention_mask
+
+    def invert_attention_mask(self, encoder_attention_mask: torch.Tensor) -> torch.Tensor:
+        if encoder_attention_mask.dim() == 3:
+            encoder_extended_attention_mask = encoder_attention_mask[:, None, :, :]
+        else:
+            encoder_extended_attention_mask = encoder_attention_mask[:, None, None, :]
+        
+        encoder_extended_attention_mask = encoder_extended_attention_mask.to(dtype=torch.float32)
+        encoder_extended_attention_mask = (1.0 - encoder_extended_attention_mask) * -1e4
+        return encoder_extended_attention_mask
+    
+
+EPS = 1e-8  # Small epsilon to avoid division by zero
+
+
+class AttentionPooling(nn.Module):
+    """
+    Cross-attention style pooling for both regression and survival prediction.
+    Query: (N, q_dim)  from special token hidden state (<REG> or <SRV>)
+    Key/Value: visual feature map (N, C, H, W)
+    Optional binary mask: (N, 1, H, W), 1 for valid locations.
+    Output: (N, hidden_dim)
+    """
+    def __init__(self, q_dim: int, kv_dim: int, hidden_dim: int):
+        super().__init__()
+        self.q_proj = nn.Linear(q_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Conv2d(kv_dim, hidden_dim, kernel_size=1, bias=False)
+        self.v_proj = nn.Conv2d(kv_dim, hidden_dim, kernel_size=1, bias=False)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # q: (N, q_dim)
+        # kv: (N, C, H, W)
+        N, C, H, W = kv.shape
+        q_proj = self.q_proj(q)                                   # (N, Hdim)
+        k = self.k_proj(kv).flatten(2).transpose(1, 2)            # (N, HW, Hdim)
+        v = self.v_proj(kv).flatten(2).transpose(1, 2)            # (N, HW, Hdim)
+
+        # compute attention
+        q_proj = q_proj.unsqueeze(1)                              # (N, 1, Hdim)
+        attn_scores = torch.matmul(q_proj, k.transpose(-2, -1))   # (N, 1, HW)
+        attn_scores = attn_scores / (k.size(-1) ** 0.5)
+
+        if mask is not None:
+            # mask: (N, 1, H, W) -> (N, HW)
+            mask_flat = (mask > 0).float().flatten(1)             # (N, HW)
+            attn_scores = attn_scores.masked_fill(mask_flat.unsqueeze(1) == 0, float('-inf'))
+
+        attn = torch.softmax(attn_scores, dim=-1)                 # (N, 1, HW)
+        context = torch.matmul(attn, v)                           # (N, 1, Hdim)
+        context = context.squeeze(1)                              # (N, Hdim)
+        return self.out_proj(context)
+
+
+class RegressionHead(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # Add layer normalization
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),           # Add dropout for regularization
+            nn.Linear(hidden_dim, 1),
+        )
+        
+        # Better initialization
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights with improved scheme for regression tasks."""
+        for module in self.mlp.modules():
+            if isinstance(module, nn.Linear):
+                # Use Xavier/Glorot initialization with small gain for stable training
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                # Initialize layer norm parameters
+                nn.init.constant_(module.bias, 0.0)
+                nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
+
+class SurvivalHead(nn.Module):
+    """
+    Head for survival prediction using discrete-time logistic hazard model.
+    
+    The model outputs K hazard probabilities for K time intervals.
+    Each hazard h_k represents P(event in interval k | survived to interval k).
+    """
+    
+    def __init__(self, in_dim: int, hidden_dim: int, num_intervals: int = 6, time_intervals: torch.Tensor = [0, 1, 2, 3, 5, 7, 10]):
+        super().__init__()
+        self.num_intervals = num_intervals
+        self.time_intervals = time_intervals
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, num_intervals),  # Output logits for each interval
+        )
+        
+        # Better initialization
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights with improved scheme for survival prediction."""
+        for module in self.mlp.modules():
+            if isinstance(module, nn.Linear):
+                # Use Xavier/Glorot initialization with small gain for stable training
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                # Initialize layer norm parameters
+                nn.init.constant_(module.bias, 0.0)
+                nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input features (N, in_dim)
+        Returns:
+            logits: Survival logits for each interval (N, num_intervals)
+        """
+        return self.mlp(x)
+    
+    def predict_survival_probs(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Predict survival probabilities for each time interval.
+        
+        Args:
+            x: Input features (N, in_dim)
+        Returns:
+            survival_probs: Survival probability at end of each interval (N, num_intervals)
+        """
+        logits = self.forward(x)
+        hazards = torch.sigmoid(logits)  # (N, K) hazard probabilities
+        
+        # Survival probability: S(t_k) = ∏_{j=1}^k (1 - h_j)
+        survival_probs = torch.cumprod(1 - hazards, dim=1)  # (N, K)
+        return survival_probs
+    
+    def predict_risk_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Predict risk scores (higher = higher risk).
+        
+        Args:
+            x: Input features (N, in_dim)
+        Returns:
+            risk_scores: Risk scores (N,)
+        """
+        survival_probs = self.predict_survival_probs(x)
+        # Use negative log survival probability at final interval as risk score
+        final_survival = survival_probs[:, -1]
+        risk_scores = -torch.log(final_survival + EPS)
+        return risk_scores
+    
+    def predict_median_survival_time(self, x: torch.Tensor, 
+                                   time_intervals: torch.Tensor) -> torch.Tensor:
+        """
+        Predict median survival time for each sample.
+        
+        Args:
+            x: Input features (N, in_dim)
+            time_intervals: Time points for each interval (K,)
+        Returns:
+            median_times: Predicted median survival times (N,)
+        """
+        survival_probs = self.predict_survival_probs(x)  # (N, K)
+        
+        # Find first interval where survival probability drops below 0.5
+        below_half = survival_probs < 0.5
+        first_below = torch.argmax(below_half.float(), dim=1)
+        
+        # Handle cases where survival never drops below 0.5
+        never_below = ~below_half.any(dim=1)
+        first_below[never_below] = len(time_intervals) - 1
+        
+        median_times = time_intervals[first_below]
+        median_times = torch.as_tensor(median_times)
+        return median_times
+
+
+def logistic_hazard_loss(logits: torch.Tensor,
+                         target_y: torch.Tensor,
+                         at_risk_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute logistic hazard loss for discrete-time survival prediction.
+    
+    For each individual:
+    - If event occurs in interval m: y_ij=0 for j<m, y_im=1 for j=m, mask=0 for j>m
+    - If censored in interval c: y_ij=0 for j≤c, mask=0 for j>c
+    
+    Args:
+        logits: (N, K) logits for each interval (before sigmoid)
+        target_y: (N, K) binary targets for each interval
+        at_risk_mask: (N, K) mask indicating which intervals are at risk
+        
+    Returns:
+        scalar loss: Negative log-likelihood
+    """
+    bce = F.binary_cross_entropy_with_logits(logits, target_y, reduction='none')  # (N, K)
+    loss = (bce * at_risk_mask).sum() / (at_risk_mask.sum() + EPS)
+    return loss
+
+
+def prepare_survival_targets(event_times: torch.Tensor, 
+                           event_indicators: torch.Tensor,
+                           time_intervals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Prepare target labels and at-risk masks for discrete-time survival model.
+    
+    Args:
+        event_times: (N,) actual event/censoring times
+        event_indicators: (N,) 1 if event occurred, 0 if censored
+        time_intervals: (K+1,) interval boundaries [t0, t1, ..., tK]
+        
+    Returns:
+        target_y: (N, K) binary targets for each interval
+        at_risk_mask: (N, K) mask indicating at-risk status
+    """
+    N = len(event_times)
+    K = len(time_intervals) - 1
+    device = event_times.device
+    
+    target_y = torch.zeros(N, K, device=device)
+    at_risk_mask = torch.zeros(N, K, device=device)
+    
+    for i in range(N):
+        t_i = event_times[i]
+        delta_i = event_indicators[i]
+        
+        # Find which interval the event/censoring falls into
+        interval_idx = torch.searchsorted(time_intervals[1:], t_i, right=False)
+        interval_idx = torch.clamp(interval_idx, 0, K-1)
+        
+        if delta_i == 1:  # Event occurred
+            # At risk and no event for j < interval_idx
+            at_risk_mask[i, :interval_idx] = 1
+            target_y[i, :interval_idx] = 0
+            
+            # Event occurs in interval_idx
+            if interval_idx < K:
+                at_risk_mask[i, interval_idx] = 1
+                target_y[i, interval_idx] = 1
+                
+        else:  # Censored
+            # At risk and no event for j <= interval_idx
+            at_risk_mask[i, :interval_idx+1] = 1
+            target_y[i, :interval_idx+1] = 0
+    
+    return target_y, at_risk_mask

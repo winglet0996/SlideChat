@@ -139,7 +139,19 @@ def encode_fn(example,
         per_image_length = max_length//2 # hard code for conv patch compression
         input_ids = input_ids[:max_length - n_images * per_image_length]
         labels = labels[:max_length - n_images * per_image_length]
-    return {'input_ids': input_ids, 'labels': labels}
+    
+    # Prepare the result dictionary with tokenized data
+    result = {'input_ids': input_ids, 'labels': labels}
+    
+    # # Preserve regression_targets if present
+    # if 'regression_targets' in example and example['regression_targets'] is not None:
+    #     result['regression_targets'] = example['regression_targets']
+    
+    # # Preserve survival_targets if present  
+    # if 'survival_targets' in example and example['survival_targets'] is not None:
+    #     result['survival_targets'] = example['survival_targets']
+    
+    return result
 
 
 class Packer:
@@ -347,7 +359,7 @@ class RandomVariableCrop:
     Crucially, it applies the *same* crop to both the feature grid and its mask
     to maintain their correspondence.
     """
-    def __init__(self, scale=(0.75, 1.0), ratio=(3. / 4., 4. / 3.)):
+    def __init__(self, scale=(0.9, 1.0), ratio=(0.2, 5.0)):
         self.scale = scale
         self.ratio = ratio
 
@@ -375,7 +387,7 @@ def load_wsi_feature(wsi_file, max_patch_num, transform=None):
     with h5py.File(wsi_file, 'r') as f:
         features = f['features'][:]
         coords = f['coords'][:]
-        patch_size = f['coords'].attrs.get('patch_size', 256)
+        patch_size = f['coords'].attrs.get('patch_size_level0', 512)
 
     # do random sampling
     if max_patch_num is not None and max_patch_num > 0:   

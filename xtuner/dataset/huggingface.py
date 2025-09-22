@@ -70,9 +70,7 @@ def tokenize_dataset(dataset, tokenizer, max_length, with_image_token,
                      map_num_proc):
     assert (tokenizer is not None) and (max_length is not None), \
         f'({tokenizer}, {max_length})'
-    if isinstance(tokenizer, dict) or isinstance(
-            tokenizer, Config) or isinstance(tokenizer, ConfigDict):
-        tokenizer = BUILDER.build(tokenizer)
+    # Note: tokenizer is already built in the process function before this call
     dataset = dataset.map(
         partial(
             encode_fn,
@@ -117,9 +115,17 @@ def process(dataset,
             with_image_token=False,
             per_image_length=None,
             max_patch_num=None,
-            map_num_proc=None):
+            map_num_proc=None,
+            reg_token=None,
+            srv_token=None):
     """Post-process the dataset loaded from the Hugging Face Hub, or a local
     dataset.
+
+    Added Args:
+        reg_token: Optional special regression token to be added into tokenizer
+            before tokenization (<REG>), ensuring it is treated as a single id.
+        srv_token: Optional special survival token to be added into tokenizer
+            before tokenization (<SRV>), ensuring it is treated as a single id.
 
     Args:
         dataset: The dataset to be post-processed.
@@ -169,6 +175,33 @@ def process(dataset,
             ('`split` should be `train` or `None` if `pack_to_max_length` is '
              f'True, but got {split}.')
 
+    # Build tokenizer if it's a config before using it
+    if do_dataset_tokenization and tokenizer is not None:
+        if isinstance(tokenizer, dict) or isinstance(
+                tokenizer, Config) or isinstance(tokenizer, ConfigDict):
+            tokenizer = BUILDER.build(tokenizer)
+        
+        # Add special tokens if provided
+        if reg_token is not None:
+            try:
+                # Add early so encode_fn sees a single token
+                tokenizer.add_tokens([reg_token], special_tokens=True)
+            except Exception:
+                try:
+                    tokenizer.add_tokens([reg_token])
+                except Exception:
+                    pass  # Ignore if token already exists
+        
+        if srv_token is not None:
+            try:
+                # Add early so encode_fn sees a single token
+                tokenizer.add_tokens([srv_token], special_tokens=True)
+            except Exception:
+                try:
+                    tokenizer.add_tokens([srv_token])
+                except Exception:
+                    pass  # Ignore if token already exists
+
     # dataset = build_origin_dataset(dataset, split)
     dataset = build_origin_dataset(dataset=dataset, split=split)
 
@@ -187,7 +220,6 @@ def process(dataset,
             dataset=dataset,
             dataset_map_fn=dataset_map_fn,
             map_num_proc=map_num_proc)
-        
     # Add prompt template, such as <|System|>: xxx <|User|>: xxx <|Bot|>: xxx
     if template_map_fn is not None:
         # dataset = add_template_to_dataset(dataset, template_map_fn,
@@ -216,7 +248,7 @@ def process(dataset,
         #                            remove_unused_columns, map_num_proc)
         dataset = tokenize_dataset(
             dataset=dataset,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer,  # tokenizer is already built above
             max_length=max_length,
             with_image_token=with_image_token,
             per_image_length=per_image_length,
@@ -274,7 +306,9 @@ def process_hf_dataset(dataset,
                        with_image_token=False,
                        per_image_length=None,
                        max_patch_num=None,
-                       map_num_proc=1):
+                       map_num_proc=1,
+                       reg_token=None,
+                       srv_token=None):
     """Post-process the dataset loaded from the Hugging Face Hub, or a local
     dataset.
 
@@ -335,7 +369,9 @@ def process_hf_dataset(dataset,
         with_image_token=with_image_token,
         per_image_length=per_image_length,
         max_patch_num=max_patch_num,
-        map_num_proc=map_num_proc)
+        map_num_proc=map_num_proc,
+        reg_token=reg_token,
+        srv_token=srv_token)
     if not (dist.is_available() and dist.is_initialized()):
         return process(**kwargs)
 

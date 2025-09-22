@@ -13,37 +13,123 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
-from xtuner.dataset import LLaVADataset_longnet
+from xtuner.dataset import LLaVADataset_conv_longnet
 from xtuner.dataset.collate_fns import default_collate_fn, masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
-from xtuner.engine.hooks import DatasetInfoHook, EvaluateChatHook_longnet, HFCheckpointHook
+from xtuner.engine.hooks import DatasetInfoHook #, EvaluateChatHook_conv_longnet, HFCheckpointHook
 from xtuner.engine.runner import TrainLoop
-from xtuner.model import LLaVAModel_longnet
+from xtuner.model import LLaVAModel_conv_qformer
 from xtuner.utils import PROMPT_TEMPLATE
 from xtuner.configs.slidechat.eval_samples import evaluation_images, evaluation_inputs, evaluation_targets
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
+
 #######################################################################
 #                          PART 1  Settings                           #
 #######################################################################
 
+setting = 'full_param'
+
+if setting == 'alignment':
+    llm_lora = None
+    freeze_llm = True
+    lr = 1e-4
+    ckpt_path = None
+    max_epochs = 1
+    save_best_metrics = None
+if setting == 'lora':
+    llm_lora = dict(
+        type=LoraConfig,
+        r=64,
+        lora_alpha=64,
+        lora_dropout=0.1,
+        bias='none',
+        task_type='CAUSAL_LM')
+    save_best_metrics = ['eval/mcqa_overall_accuracy']
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_mcqa_qwen3_8b_conv_qformer_alignment_Diagnosis/iter_500.pth'
+    lr = 1e-5
+    freeze_llm = True
+    max_epochs = 3
+if setting == 'full_param':
+    llm_lora = None
+    freeze_llm = False
+    lr = 1e-5
+    save_best_metrics = ['eval/mcqa_overall_accuracy']
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_mcqa_qwen3_8b_conv_qformer_full_param/iter_1000.pth'
+    max_epochs = 3
+    
+resume = True
+
+# cat = 'Diagnosis'
+
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_train.json'
-ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_lognet/iter_500.pth'
-# ckpt_path = None
-# work_dir = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_lognet/'
-work_dir = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_lognet_lora_r64_a64/'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_test.json'
-test_output_path = work_dir + 'test_results_r64_a64'
-print_n_samples_in_test = None
+train_data_path = f'/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage2_mcqa_train.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage2_mcqa_test_eval_800.json'
+test_data_path = f'/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage2_mcqa_test.json'
+
+# ckpt_out_path = 's3://zhouxiao/ckpt'
+ckpt_out_path = None
+
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_mcqa_qwen3_8b_conv_qformer_{setting}/'
+vis_name = f'qwen3_8b_conv_qformer_{setting}'
+
+val_output_path = work_dir + 'val_results'
+test_output_path = work_dir + 'test_results_iter_5873'
+
+save_first_n_samples = None
+
 image_path_list = None
-vis_name = 'qwen3_8b_longnet_lora_r64_a64'
+
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
+def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
+    import os
+    import glob
+    import re
+    if not os.path.isdir(work_dir):
+        return None
+    all_ckpt_dirs = [p for p in glob.glob(os.path.join(work_dir, 'iter_*.pth')) if os.path.isdir(p)]
+    
+    if not all_ckpt_dirs:
+        return None
+
+    try:
+        sorted_ckpts = sorted(
+            all_ckpt_dirs,
+            key=lambda p: int(re.search(r'iter_(\d+)\.pth', os.path.basename(p)).group(1)),
+            reverse=True
+        )
+    except (AttributeError, ValueError):
+        print("Warning: Found directories with malformed names, skipping them.")
+        return None
+
+    expected_file_count = num_gpus + 1
+    
+    for ckpt_dir in sorted_ckpts:
+        try:
+            if len(os.listdir(ckpt_dir)) == expected_file_count:
+                return ckpt_dir
+            else:
+                print(f"Warning: Checkpoint '{os.path.basename(ckpt_dir)}' is incomplete. Skipping.")
+        except OSError as e:
+            print(f"Warning: Could not access checkpoint '{os.path.basename(ckpt_dir)}'. Error: {e}. Skipping.")
+            continue
+    return None
+
+if resume:
+    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=6)
+    
+    if latest_valid_ckpt:
+        ckpt_path = latest_valid_ckpt
+        print(f"Resuming from latest valid checkpoint: {ckpt_path}")
+    else:
+        print(f"Resume is True, but no complete checkpoints were found in {work_dir}. Starting from scratch.")
+        
+del _get_latest_valid_deepspeed_checkpoint
 
 max_length = 32768
-max_patch_num = 10240
-max_new_tokens = 256
-repetition_penalty = 1.1
+max_patch_num = None
+max_new_tokens = 1
+repetition_penalty = 1.0
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
 
@@ -51,10 +137,8 @@ sample_type='wsi' # 'wsi'or'image'
 # Scheduler & Optimizer
 batch_size = 1  # per_device
 accumulative_counts = 1
-dataloader_num_workers = 1
-max_epochs = 6
+dataloader_num_workers = 8
 optim_type = SophiaG
-lr = 2e-4
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
@@ -63,7 +147,7 @@ warmup_ratio = 0.03
 
 # Save
 save_steps = 500
-save_total_limit = 4  # Maximum checkpoints to keep (-1 means unlimited)
+save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 
 # Evaluate the generation performance during the training
 evaluation_freq = 500
@@ -79,13 +163,13 @@ tokenizer = dict(
     padding_side='right'
     )
 
-# removed image_processor
 
 model = dict(
-    type=LLaVAModel_longnet,
+    type=LLaVAModel_conv_qformer,
     tokenizer=tokenizer,
-    freeze_llm=True,
+    freeze_llm=freeze_llm,
     hidden_size=768,
+    freeze_word_embeddings=True,
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
@@ -103,25 +187,21 @@ model = dict(
     ),
     generation_kwargs=dict(
         max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.8,
-        repetition_penalty=repetition_penalty
+        do_sample=False,
+        # temperature=0.3,
+        # top_p=0.8,
+        # length_penalty=0.5,
+        # repetition_penalty=repetition_penalty
     ),
-    llm_lora=dict(
-        type=LoraConfig,
-        r=64,
-        lora_alpha=64,
-        lora_dropout=0.1,
-        bias='none',
-        task_type='CAUSAL_LM')
+    llm_lora=llm_lora
     )
+
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
 #######################################################################
 train_llava_dataset = dict(
-    type=LLaVADataset_longnet,
+    type=LLaVADataset_conv_longnet,
     data_path=train_data_path,
     image_folder='',
     image_path_list=image_path_list,
@@ -139,13 +219,38 @@ train_dataloader = dict(
     pin_memory=True,
     dataset=train_llava_dataset,
     sampler=dict(type=DefaultSampler, shuffle=True),
-    collate_fn=dict(type=default_collate_fn))
+    collate_fn=dict(type=masked_collated_fn))
 
-#######################################################################
-#                     Test Dataset & Dataloader                       #
-#######################################################################
+val_llava_dataset = dict(
+    type=LLaVADataset_conv_longnet,
+    data_path=val_data_path,
+    image_folder='',
+    image_path_list=image_path_list,
+    tokenizer=tokenizer,
+    dataset_map_fn=llava_map_fn,
+    template_map_fn=dict(type=template_map_fn_factory, template=prompt_template),
+    max_length=max_length,
+    max_patch_num=max_patch_num,
+    per_image_length=per_image_length,
+    mode='test',
+    input_ids_with_output=True)
+
+val_dataloader = dict(
+    batch_size=batch_size,
+    num_workers=dataloader_num_workers,
+    pin_memory=True,
+    dataset=val_llava_dataset,
+    sampler=dict(type=DefaultSampler, shuffle=False),
+    collate_fn=dict(type=masked_collated_fn))
+
+val_evaluator = dict(type=PathologyMetric,
+            tokenizer=tokenizer,
+            save_first_n_samples=save_first_n_samples,
+            output_dir= val_output_path
+            )
+
 test_llava_dataset = dict(
-    type=LLaVADataset_longnet,
+    type=LLaVADataset_conv_longnet,
     data_path=test_data_path,
     image_folder='',
     image_path_list=image_path_list,
@@ -163,8 +268,15 @@ test_dataloader = dict(
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=test_llava_dataset,
-    sampler=dict(type=DefaultSampler, shuffle=False),  # Don't shuffle for test
-    collate_fn=dict(type=default_collate_fn))
+    sampler=dict(type=DefaultSampler, shuffle=False),
+    collate_fn=dict(type=masked_collated_fn)
+)
+
+test_evaluator = dict(type=PathologyMetric,
+            tokenizer=tokenizer,
+            save_first_n_samples=save_first_n_samples,
+            output_dir=test_output_path
+            )
 
 #######################################################################
 #                    PART 4  Scheduler & Optimizer                    #
@@ -199,43 +311,18 @@ param_scheduler = [
 ]
 
 # train, val, test setting
-train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
-
-# Test configuration
+train_cfg = dict(type=TrainLoop,
+                 max_epochs=max_epochs,
+                 val_interval=evaluation_freq)
+val_cfg = dict(type='ValLoop')
 test_cfg = dict(type="TestLoop")
-
-# Test evaluator
-test_evaluator = dict(
-    type=PathologyMetric,
-    tokenizer=tokenizer,
-    print_first_n_samples=print_n_samples_in_test,
-    output_dir=test_output_path,
-    prefix="test"
-)
 
 #######################################################################
 #                           PART 5  Runtime                           #
 #######################################################################
 # Log the dialogue periodically during the training process, optional
 custom_hooks = [
-    dict(type=DatasetInfoHook, tokenizer=tokenizer),
-    dict(
-        type=EvaluateChatHook_longnet,
-        tokenizer=tokenizer,
-        every_n_iters=evaluation_freq,
-        evaluation_inputs=evaluation_inputs,
-        evaluation_images=evaluation_images,
-        evaluation_targets=evaluation_targets,
-        system=SYSTEM,
-        max_new_tokens=max_new_tokens,
-        prompt_template=prompt_template,
-        max_patch_num=max_patch_num,
-        generation_kwargs={'repetition_penalty': repetition_penalty,
-                           'max_new_tokens': max_new_tokens,
-                           'do_sample': True,
-                           'temperature': 0.7,
-                           'top_p': 0.8,
-                           'top_k': 20,})
+    dict(type=DatasetInfoHook, tokenizer=tokenizer)
 ]
 
 # configure default hooks
@@ -251,7 +338,10 @@ default_hooks = dict(
         type=CheckpointHook,
         by_epoch=False,
         interval=save_steps,
-        max_keep_ckpts=save_total_limit),
+        max_keep_ckpts=save_total_limit,
+        save_best=save_best_metrics,
+        rule='greater',
+        out_dir=ckpt_out_path,),
     # set sampler seed in distributed evrionment.
     sampler_seed=dict(type=DistSamplerSeedHook),
 )
@@ -274,7 +364,7 @@ visualizer = dict(
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='pathoverse_capgen',
+                project='pathoverse_mcqa_qformer',
                 name=vis_name
             )
         )
@@ -286,9 +376,6 @@ log_level = 'INFO'
 
 # load from which checkpoint
 load_from = ckpt_path
-
-# whether to resume training from the loaded checkpoint
-resume = False
  
 # Defaults to use random seed and disable `deterministic`
 randomness = dict(seed=None, deterministic=False)

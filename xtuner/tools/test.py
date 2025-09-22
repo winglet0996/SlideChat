@@ -1,6 +1,11 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import os
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# Set a different port for distributed training to avoid EADDRINUSE error
+if 'MASTER_PORT' not in os.environ:
+    os.environ['MASTER_PORT'] = '29501'
 import os.path as osp
 from types import FunctionType
 from collections import OrderedDict
@@ -37,10 +42,9 @@ def parse_args():
         help="job launcher",
     )
     args = parser.parse_args()
-    args.config = '/home/winglet/pathology/vqa/SlideChat/xtuner/configs/slidechat/stage_1_qwen3_8b_conv_longnet.py'
-    args.checkpoint = '/home/winglet/pathology/vqa/train_s1/iter_1.pth/mp_rank_00_model_states.pt'
-    if "LOCAL_RANK" not in os.environ:
-        os.environ["LOCAL_RANK"] = '0'
+    args.config = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py'
+    args.checkpoint = '/mnt/sda/pathology/codes/project/TCGA/train_s2_regression_qwen3_8b_conv_lora/iter_600.pth/mp_rank_00_model_states.pt'
+
     return args
 
 
@@ -75,6 +79,7 @@ def main():
     # avoid auto loading
     if cfg.load_from is not None:
         cfg.load_from = None
+    cfg.resume = False
 
     register_function(cfg._cfg_dict)
 
@@ -88,7 +93,7 @@ def main():
 
     try:
         checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-        runner.logger.info("Checkpoint file loaded.")
+        runner.logger.info(f"Checkpoint file loading from {args.checkpoint}.")
 
         if 'module' in checkpoint:
             state_dict = checkpoint['module']
@@ -109,7 +114,6 @@ def main():
             corrected_state_dict = state_dict
         
         missing_keys, unexpected_keys = runner.model.load_state_dict(corrected_state_dict, strict=False)
-        
         runner.logger.info("Checkpoint loaded into model successfully!")
         
     except Exception as e:

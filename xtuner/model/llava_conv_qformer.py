@@ -15,20 +15,20 @@ from transformers import (AddedToken, AutoConfig, CLIPImageProcessor,
                           CLIPVisionModel, LlamaForCausalLM,
                           LlamaTokenizerFast, LlavaConfig,
                           LlavaForConditionalGeneration, LlavaProcessor,
-                          GenerationConfig, StoppingCriteriaList)
+                          GenerationConfig, StoppingCriteriaList,
+                          InstructBlipQFormerConfig)
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from xtuner.registry import BUILDER
-from xtuner.utils import (DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, StopWordStoppingCriteria)
+from xtuner.utils import (DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, IGNORE_INDEX, StopWordStoppingCriteria)
 from .modules import ProjectorConfig, ProjectorModel, dispatch_modules
 from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names,
                     get_peft_model_state_dict, guess_load_checkpoint,
                     make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import HighResPartialConvNeXt, RotaryEmbedding2D
+from .custom_model import HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, CustomQformer
 
-from .torchscale.model.LongNet import make_longnet_from_name
 import torch.nn.functional as F
 
 
@@ -45,7 +45,7 @@ def convert_state_dict_to_hf(state_dict, mapping):
 
 
 
-class LLaVAModel_conv_longnet(BaseModel):
+class LLaVAModel_conv_qformer(BaseModel):
     def __init__(self,
                  llm,
                  tokenizer,
@@ -58,10 +58,13 @@ class LLaVAModel_conv_longnet(BaseModel):
                  max_position_embeddings=None,
                  hidden_size=None,
                  generation_kwargs=None,
-                 stop_words=None):
+                 stop_words=None,
+                 freeze_word_embeddings=True):
         super().__init__()
 
+        # Store training configuration
         self.freeze_llm = freeze_llm
+        self.freeze_word_embeddings = freeze_word_embeddings
 
         with LoadWoInit():
             if isinstance(llm, dict):
@@ -70,30 +73,73 @@ class LLaVAModel_conv_longnet(BaseModel):
             self.llm = self._build_from_cfg_or_module(llm)
         
         # High-resolution partial convolution for feature preprocessing
-        self.conv = HighResPartialConvNeXt().to(self.llm.dtype)
+        self.conv = HighResPartialConvNeXt(in_chans=768,
+                                           depths=[3, 9, 3],
+                                           dims=[768, 768, hidden_size],
+                                           drop_path_rate=0.1,
+                                           num_downsamples=2
+                                           ).to(self.llm.dtype)
         
-        # 2D rotary embedding for positional encoding (apply to half dimensions)
-        self.rotary_emb = RotaryEmbedding2D(dim=hidden_size//2).to(self.llm.dtype)
+        # Positional embedding for 2D features with scale balancing
+        self.pos_emb_2d = PositionalEmbedding2DSinusoidal(
+            d_model=hidden_size, 
+            scale_mode='learned',  # Use learnable scaling for better adaptability
+            init_pe_scale=0.1      # Start with small positional embedding contribution
+        ).to(self.llm.dtype)
 
-        self.encoder_name = "LongNet_{}_layers_{}_dim".format(2, hidden_size)
-        self.LongNet_encoder = make_longnet_from_name(self.encoder_name,
-                                                      checkpoint_activations=use_activation_checkpointing) # , drop_path_rate=0.3, dropout=0.3, segment_length=1024
-        self.LongNet_encoder = self.LongNet_encoder.to(self.llm.dtype)
+        # Build tokenizer first to get word embeddings
+        self.tokenizer = BUILDER.build(tokenizer)
+
+        # Get the actual vocab size from LLM's word embeddings
+        llm_vocab_size = self.llm.get_input_embeddings().num_embeddings
+        
+        # Initialize Q-Former with custom configuration
+        qformer_config = InstructBlipQFormerConfig(
+            encoder_hidden_size=hidden_size,  # Vision feature dimension
+            hidden_size=768,  # Q-Former internal dimension
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            num_query_tokens=512,  # Fixed query length
+            position_embedding_type='absolute',
+            layer_norm_eps=1e-12,
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+            vocab_size=llm_vocab_size,
+        )
+        
+        # Initialize custom Q-Former, directly using LLM's word embeddings
+        self.qformer = CustomQformer(
+            config=qformer_config,
+            word_embeddings=self.llm.get_input_embeddings()
+        ).to(self.llm.dtype)
+        
+        # Apply word embeddings freezing if required
+        if self.freeze_word_embeddings:
+            self.qformer.word_embeddings.requires_grad_(False)
+        
+        # Enable gradient checkpointing for Q-Former if requested
+        if use_activation_checkpointing:
+            self.qformer.encoder.gradient_checkpointing = True
+
         self.llm.config.use_cache = False
         dispatch_modules(self.llm)
 
         self.projector_depth = projector_depth
 
+        visual_hidden_size = qformer_config.hidden_size
+
         projector_config = ProjectorConfig(
-            visual_hidden_size=hidden_size,
+            visual_hidden_size=visual_hidden_size,
             llm_hidden_size=self.llm.config.hidden_size,
             depth=self.projector_depth)        
 
         self.projector = ProjectorModel(projector_config).to(
             self.llm.dtype)
         
+        # Apply basic parameter freezing
         if self.freeze_llm:
-            print('freeze_llm')
+            print('Freezing LLM parameters')
             self.llm.requires_grad_(False)
         
         if use_activation_checkpointing:
@@ -103,8 +149,15 @@ class LLaVAModel_conv_longnet(BaseModel):
             else:
                 self.llm.get_input_embeddings().register_forward_hook(
                     make_inputs_require_grad)
-                
+    
             self.projector.enable_input_require_grads()
+    
+            # Enable gradient checkpointing for conv layers
+            if hasattr(self.conv, 'gradient_checkpointing_enable'):
+                self.conv.gradient_checkpointing_enable()
+
+            # Enable gradient checkpointing for Q-Former
+            self.qformer.encoder.gradient_checkpointing = True
 
             # enable gradient (activation) checkpointing for memory efficiency
             self.gradient_checkpointing_enable()
@@ -123,11 +176,24 @@ class LLaVAModel_conv_longnet(BaseModel):
 
         self.visual_select_layer = visual_select_layer
 
-        self.tokenizer = BUILDER.build(tokenizer)
         if generation_kwargs:
             self.generation_config = GenerationConfig(**generation_kwargs)
         else:
             self.generation_config = GenerationConfig()
+
+        try:
+            # self.llm may be a PeftModel
+            setattr(self.llm, 'generation_config', self.generation_config)
+            # its base_model (original HF model)
+            if hasattr(self.llm, 'base_model') and hasattr(self.llm.base_model, 'generation_config'):
+                self.llm.base_model.generation_config = self.generation_config
+            # some models nest another .model
+            if hasattr(self.llm, 'base_model') and hasattr(self.llm.base_model, 'model') \
+               and hasattr(self.llm.base_model.model, 'generation_config'):
+                self.llm.base_model.model.generation_config = self.generation_config
+        except Exception:
+            pass
+        
         self.stop_criteria = StoppingCriteriaList()
         if stop_words:
             for word in stop_words:
@@ -135,7 +201,6 @@ class LLaVAModel_conv_longnet(BaseModel):
                     StopWordStoppingCriteria(self.tokenizer, word))
         
         self._is_init = True
-
         self.is_first_iter = True
 
     def _parse_lora_config(self, lora_config):
@@ -161,6 +226,10 @@ class LLaVAModel_conv_longnet(BaseModel):
     def activation_checkpointing_enable(self):
         self.llm.gradient_checkpointing_enable()
         self.projector.gradient_checkpointing_enable()
+        if hasattr(self.qformer.encoder, 'gradient_checkpointing_enable'):
+            self.qformer.encoder.gradient_checkpointing_enable()
+        else:
+            self.qformer.encoder.gradient_checkpointing = True
 
     def gradient_checkpointing_disable(self):
         self.activation_checkpointing_disable()
@@ -168,6 +237,10 @@ class LLaVAModel_conv_longnet(BaseModel):
     def activation_checkpointing_disable(self):
         self.llm.gradient_checkpointing_disable()
         self.projector.gradient_checkpointing_disable()
+        if hasattr(self.qformer.encoder, 'gradient_checkpointing_disable'):
+            self.qformer.encoder.gradient_checkpointing_disable()
+        else:
+            self.qformer.encoder.gradient_checkpointing = False
 
     def init_weights(self):
         pass
@@ -189,15 +262,17 @@ class LLaVAModel_conv_longnet(BaseModel):
             {k: v
              for k, v in state_dict.items() if 'projector.' in k})
         
-        # Step 4. Conv and RotaryEmb
+        # Step 4. Conv and PositionalEmbedding
         to_return.update(
             {k: v
-             for k, v in state_dict.items() if 'conv.' in k or 'rotary_emb.' in k})
+             for k, v in state_dict.items() if 'conv.' in k or 'pos_emb_2d.' in k})
         
-        # Step 5. LongNet_encoder
+        # Step 5. Q-Former (exclude word embeddings to avoid duplication)
         to_return.update(
             {k: v
-             for k, v in state_dict.items() if 'LongNet_encoder.' in k})
+                for k, v in state_dict.items() 
+                if 'qformer.' in k and 'word_embeddings' not in k})
+        
         return to_return
 
     @staticmethod
@@ -293,40 +368,56 @@ class LLaVAModel_conv_longnet(BaseModel):
         else:
             raise NotImplementedError
 
-    def _project_vision_features(self, features, masks=None):
+    def _project_vision_features(self, features, masks=None, text_input_ids=None, text_attention_mask=None):
         """Projects vision features through HighResPartialConvNeXt, 
-        RotaryEmbedding2D, and LongNet encoder before final projection."""
+        RotaryEmbedding2D, optionally Q-Former, before final projection."""
         
+        device = features.device
+        dtype = self.llm.dtype
+
         # features: (B, C, H, W), masks: (B, 1, H, W) or None
-        conv_input = features.to(self.llm.dtype)  # Ensure correct dtype
+        conv_input = features.to(dtype)
         B, C, H, W = conv_input.shape
         
         # Process masks
         if masks is None:
             # Create default mask (all valid)
-            mask = torch.ones(B, 1, H, W, device=conv_input.device, dtype=conv_input.dtype)
+            mask = torch.ones(B, 1, H, W, device=device, dtype=dtype)
         else:
-            mask = masks.to(conv_input.device, dtype=conv_input.dtype)
+            mask = masks.to(device, dtype=dtype)
         
         # Pass through HighResPartialConvNeXt
         conv_output, updated_mask = self.conv(conv_input, mask)
         
-        # Apply 2D rotary positional embedding
-        conv_output = self.rotary_emb(conv_output)
-        
-        # Reshape back to sequence format for LongNet
+        # Add positional embedding
+        conv_output = self.pos_emb_2d(conv_output)
+
+        # Reshape back to sequence format
         _, C_new, H_new, W_new = conv_output.shape
-        feat_to_proj = conv_output.permute(0, 2, 3, 1).view(B, H_new * W_new, C_new)
-        feat_to_proj = feat_to_proj.to(self.llm.dtype)
+        vision_features = conv_output.permute(0, 2, 3, 1).view(B, H_new * W_new, C_new)  # (B, H*W, C)
+        vision_features = vision_features.to(self.llm.dtype)
         
-        # Pass through LongNet encoder
-        long_net_output = self.LongNet_encoder(
-            src_tokens=None, token_embeddings=feat_to_proj.permute(1, 0, 2)
-        )["encoder_out"]
-        feat_to_proj = long_net_output.permute(1, 0, 2)
+        # Prepare the vision mask for Q-Former
+        # updated_mask shape: (B, 1, H_new, W_new)
+        vision_attention_mask = updated_mask.squeeze(1).view(B, -1)  # Shape: (B, H_new * W_new)
         
-        # Final projection
-        projected_features = self.projector(feat_to_proj.to(self.llm.dtype))
+        # Use Q-Former to fuse vision and text features
+        # replace IMAGE_TOKEN_INDEX in text_input_ids with pad_token_id (for Q-Former processing only)
+        qformer_text_input_ids = text_input_ids.clone()
+        qformer_text_input_ids[qformer_text_input_ids == IMAGE_TOKEN_INDEX] = self.tokenizer.pad_token_id
+        
+        # Q-Former forward pass
+        qformer_output = self.qformer(
+            input_ids=qformer_text_input_ids,
+            attention_mask=text_attention_mask,
+            encoder_hidden_states=vision_features,
+            encoder_attention_mask=vision_attention_mask
+        )
+        # qformer_output shape: (B, query_length, qformer_hidden_size)
+        feat_to_proj = qformer_output
+
+        # Final projection to LLM hidden size
+        projected_features = self.projector(feat_to_proj)
         return projected_features
 
     def forward(self, data, data_samples=None, mode='loss'):
@@ -336,8 +427,17 @@ class LLaVAModel_conv_longnet(BaseModel):
             self.to(data['input_ids'].device)
             self.is_first_iter = False
         
+        # Extract text information for Q-Former if available
+        text_input_ids = data.get('input_ids', None)
+        text_attention_mask = data.get('attention_mask', None)
+        
         # features (B, C, H, W) and masks (B, 1, H, W)
-        projected_features = self._project_vision_features(data['features'], data['masks'])
+        projected_features = self._project_vision_features(
+            data['features'], 
+            data['masks'],
+            text_input_ids=text_input_ids,
+            text_attention_mask=text_attention_mask
+        )
         # Replace with projected features, keep original key for compatibility
         data['pixel_values'] = projected_features
         # Clean up original keys

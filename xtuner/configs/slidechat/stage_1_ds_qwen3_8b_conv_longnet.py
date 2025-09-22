@@ -13,12 +13,12 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
-from xtuner.dataset import LLaVADataset_longnet
+from xtuner.dataset import LLaVADataset_conv_longnet
 from xtuner.dataset.collate_fns import default_collate_fn, masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
-from xtuner.engine.hooks import DatasetInfoHook, EvaluateChatHook_longnet, HFCheckpointHook
+from xtuner.engine.hooks import DatasetInfoHook, EvaluateChatHook_conv_longnet, HFCheckpointHook
 from xtuner.engine.runner import TrainLoop
-from xtuner.model import LLaVAModel_longnet
+from xtuner.model import LLaVAModel_conv_longnet
 from xtuner.utils import PROMPT_TEMPLATE
 from xtuner.configs.slidechat.eval_samples import evaluation_images, evaluation_inputs, evaluation_targets
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
@@ -26,22 +26,23 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
+llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/DeepSeek-R1-0528-Qwen3-8B'
 train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_train.json'
-ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_lognet/iter_500.pth'
-# ckpt_path = None
-# work_dir = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_lognet/'
-work_dir = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_lognet_lora_r64_a64/'
+# ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_freeze_llm/iter_4195.pth'
+ckpt_path = None
+work_dir = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_ds_qwen3_8b_conv_longnet/'
 test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_test.json'
-test_output_path = work_dir + 'test_results_r64_a64'
+test_output_path = work_dir + 'test_results'
 print_n_samples_in_test = None
+vis_name = 'ds_qwen3_8b_conv_longnet'
+
 image_path_list = None
-vis_name = 'qwen3_8b_longnet_lora_r64_a64'
-prompt_template = PROMPT_TEMPLATE.qwen_chat
+
+prompt_template = PROMPT_TEMPLATE.deepseek_v2
 
 
 max_length = 32768
-max_patch_num = 10240
+max_patch_num = None
 max_new_tokens = 256
 repetition_penalty = 1.1
 per_image_length = None
@@ -52,10 +53,10 @@ sample_type='wsi' # 'wsi'or'image'
 batch_size = 1  # per_device
 accumulative_counts = 1
 dataloader_num_workers = 1
-max_epochs = 6
+max_epochs = 4
 optim_type = SophiaG
 lr = 2e-4
-betas = (0.9, 0.999)
+betas = (0.965, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
@@ -63,7 +64,7 @@ warmup_ratio = 0.03
 
 # Save
 save_steps = 500
-save_total_limit = 4  # Maximum checkpoints to keep (-1 means unlimited)
+save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 
 # Evaluate the generation performance during the training
 evaluation_freq = 500
@@ -82,7 +83,7 @@ tokenizer = dict(
 # removed image_processor
 
 model = dict(
-    type=LLaVAModel_longnet,
+    type=LLaVAModel_conv_longnet,
     tokenizer=tokenizer,
     freeze_llm=True,
     hidden_size=768,
@@ -108,20 +109,20 @@ model = dict(
         top_p=0.8,
         repetition_penalty=repetition_penalty
     ),
-    llm_lora=dict(
-        type=LoraConfig,
-        r=64,
-        lora_alpha=64,
-        lora_dropout=0.1,
-        bias='none',
-        task_type='CAUSAL_LM')
+    # llm_lora=dict(
+    #     type=LoraConfig,
+    #     r=64,
+    #     lora_alpha=16,
+    #     lora_dropout=0.1,
+    #     bias='none',
+    #     task_type='CAUSAL_LM')
     )
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
 #######################################################################
 train_llava_dataset = dict(
-    type=LLaVADataset_longnet,
+    type=LLaVADataset_conv_longnet,
     data_path=train_data_path,
     image_folder='',
     image_path_list=image_path_list,
@@ -139,13 +140,13 @@ train_dataloader = dict(
     pin_memory=True,
     dataset=train_llava_dataset,
     sampler=dict(type=DefaultSampler, shuffle=True),
-    collate_fn=dict(type=default_collate_fn))
+    collate_fn=dict(type=masked_collated_fn))
 
 #######################################################################
 #                     Test Dataset & Dataloader                       #
 #######################################################################
 test_llava_dataset = dict(
-    type=LLaVADataset_longnet,
+    type=LLaVADataset_conv_longnet,
     data_path=test_data_path,
     image_folder='',
     image_path_list=image_path_list,
@@ -156,7 +157,7 @@ test_llava_dataset = dict(
     max_patch_num=max_patch_num,
     per_image_length=per_image_length,
     mode='test',
-    input_ids_with_output=True)
+    input_ids_with_output=False)
 
 test_dataloader = dict(
     batch_size=batch_size,
@@ -164,7 +165,7 @@ test_dataloader = dict(
     pin_memory=True,
     dataset=test_llava_dataset,
     sampler=dict(type=DefaultSampler, shuffle=False),  # Don't shuffle for test
-    collate_fn=dict(type=default_collate_fn))
+    collate_fn=dict(type=masked_collated_fn))
 
 #######################################################################
 #                    PART 4  Scheduler & Optimizer                    #
@@ -220,7 +221,7 @@ test_evaluator = dict(
 custom_hooks = [
     dict(type=DatasetInfoHook, tokenizer=tokenizer),
     dict(
-        type=EvaluateChatHook_longnet,
+        type=EvaluateChatHook_conv_longnet,
         tokenizer=tokenizer,
         every_n_iters=evaluation_freq,
         evaluation_inputs=evaluation_inputs,

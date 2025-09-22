@@ -16,7 +16,7 @@ from peft import LoraConfig
 from xtuner.dataset import LLaVADataset_conv_longnet
 from xtuner.dataset.collate_fns import default_collate_fn, masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
-from xtuner.engine.hooks import DatasetInfoHook, EvaluateChatHook_conv_longnet, HFCheckpointHook
+from xtuner.engine.hooks import DatasetInfoHook #, EvaluateChatHook_conv_longnet, HFCheckpointHook
 from xtuner.engine.runner import TrainLoop
 from xtuner.model import LLaVAModel_conv_longnet
 from xtuner.utils import PROMPT_TEMPLATE
@@ -26,14 +26,25 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-llm_name_or_path = '/home/winglet/models/Qwen3-8B'
-train_data_path = '/home/winglet/pathology/vqa/dataset_pp/PathoVerse_train_stage1_caption.json'
-test_data_path = '/home/winglet/pathology/vqa/dataset_pp/PathoVerse_train_stage1_caption_test.json'
-# ckpt_path = '/home/winglet/pathology/vqa/train_s1/iter_1.pth'
-ckpt_path = None
-work_dir = '/home/winglet/pathology/vqa/train_s1/'
-test_output_path = work_dir + 'test_results'
-print_n_samples_in_test = None
+setting = 'full_param'
+llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_train.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_test_eval_50.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage1_caption_test.json'
+
+ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_conv_longnet_full_param/iter_1000.pth'
+# ckpt_out_path = 's3://zhouxiao/ckpt'
+ckpt_out_path = None
+resume = True
+
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_capgen_qwen3_8b_conv_longnet_{setting}/'
+
+val_output_path = work_dir + 'val_results'
+test_output_path = work_dir + 'test_results_rep_11_temp_03'
+
+save_first_n_samples = None
+vis_name = f'qwen3_8b_conv_longnet_{setting}'
+
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -50,11 +61,11 @@ sample_type='wsi' # 'wsi'or'image'
 # Scheduler & Optimizer
 batch_size = 1  # per_device
 accumulative_counts = 1
-dataloader_num_workers = 1
-max_epochs = 50
+dataloader_num_workers = 32
+max_epochs = 6
 optim_type = SophiaG
-lr = 2e-4
-betas = (0.965, 0.999)
+lr = 2e-5
+betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
@@ -62,7 +73,7 @@ warmup_ratio = 0.03
 
 # Save
 save_steps = 500
-save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
+save_total_limit = 4  # Maximum checkpoints to keep (-1 means unlimited)
 
 # Evaluate the generation performance during the training
 evaluation_freq = 500
@@ -78,12 +89,10 @@ tokenizer = dict(
     padding_side='right'
     )
 
-# removed image_processor
-
 model = dict(
     type=LLaVAModel_conv_longnet,
     tokenizer=tokenizer,
-    freeze_llm=True,
+    freeze_llm=False,
     hidden_size=768,
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
@@ -103,7 +112,7 @@ model = dict(
     generation_kwargs=dict(
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        temperature=0.7,
+        temperature=0.3,
         top_p=0.8,
         repetition_penalty=repetition_penalty
     ),
@@ -140,9 +149,34 @@ train_dataloader = dict(
     sampler=dict(type=DefaultSampler, shuffle=True),
     collate_fn=dict(type=masked_collated_fn))
 
-#######################################################################
-#                     Test Dataset & Dataloader                       #
-#######################################################################
+val_llava_dataset = dict(
+    type=LLaVADataset_conv_longnet,
+    data_path=val_data_path,
+    image_folder='',
+    image_path_list=image_path_list,
+    tokenizer=tokenizer,
+    dataset_map_fn=llava_map_fn,
+    template_map_fn=dict(type=template_map_fn_factory, template=prompt_template),
+    max_length=max_length,
+    max_patch_num=max_patch_num,
+    per_image_length=per_image_length,
+    mode='test',
+    input_ids_with_output=True)
+
+val_dataloader = dict(
+    batch_size=batch_size,
+    num_workers=dataloader_num_workers,
+    pin_memory=True,
+    dataset=val_llava_dataset,
+    sampler=dict(type=DefaultSampler, shuffle=False),
+    collate_fn=dict(type=masked_collated_fn))
+
+val_evaluator = dict(type=PathologyMetric,
+            tokenizer=tokenizer,
+            save_first_n_samples=save_first_n_samples,
+            output_dir= val_output_path
+            )
+
 test_llava_dataset = dict(
     type=LLaVADataset_conv_longnet,
     data_path=test_data_path,
@@ -155,15 +189,22 @@ test_llava_dataset = dict(
     max_patch_num=max_patch_num,
     per_image_length=per_image_length,
     mode='test',
-    input_ids_with_output=False)
+    input_ids_with_output=True)
 
 test_dataloader = dict(
     batch_size=batch_size,
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=test_llava_dataset,
-    sampler=dict(type=DefaultSampler, shuffle=False),  # Don't shuffle for test
-    collate_fn=dict(type=masked_collated_fn))
+    sampler=dict(type=DefaultSampler, shuffle=False),
+    collate_fn=dict(type=masked_collated_fn)
+)
+
+test_evaluator = dict(type=PathologyMetric,
+            tokenizer=tokenizer,
+            save_first_n_samples=save_first_n_samples,
+            output_dir=test_output_path
+            )
 
 #######################################################################
 #                    PART 4  Scheduler & Optimizer                    #
@@ -198,43 +239,18 @@ param_scheduler = [
 ]
 
 # train, val, test setting
-train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
-
-# Test configuration
+train_cfg = dict(type=TrainLoop,
+                 max_epochs=max_epochs,
+                 val_interval=evaluation_freq)
+val_cfg = dict(type='ValLoop')
 test_cfg = dict(type="TestLoop")
-
-# Test evaluator
-test_evaluator = dict(
-    type=PathologyMetric,
-    tokenizer=tokenizer,
-    print_first_n_samples=print_n_samples_in_test,
-    output_dir=test_output_path,
-    prefix="test"
-)
 
 #######################################################################
 #                           PART 5  Runtime                           #
 #######################################################################
 # Log the dialogue periodically during the training process, optional
 custom_hooks = [
-    dict(type=DatasetInfoHook, tokenizer=tokenizer),
-    dict(
-        type=EvaluateChatHook_conv_longnet,
-        tokenizer=tokenizer,
-        every_n_iters=evaluation_freq,
-        evaluation_inputs=evaluation_inputs,
-        evaluation_images=evaluation_images,
-        evaluation_targets=evaluation_targets,
-        system=SYSTEM,
-        max_new_tokens=max_new_tokens,
-        prompt_template=prompt_template,
-        max_patch_num=max_patch_num,
-        generation_kwargs={'repetition_penalty': repetition_penalty,
-                           'max_new_tokens': max_new_tokens,
-                           'do_sample': True,
-                           'temperature': 0.7,
-                           'top_p': 0.8,
-                           'top_k': 20,})
+    dict(type=DatasetInfoHook, tokenizer=tokenizer)
 ]
 
 # configure default hooks
@@ -250,7 +266,8 @@ default_hooks = dict(
         type=CheckpointHook,
         by_epoch=False,
         interval=save_steps,
-        max_keep_ckpts=save_total_limit),
+        max_keep_ckpts=save_total_limit,
+        out_dir=ckpt_out_path,),
     # set sampler seed in distributed evrionment.
     sampler_seed=dict(type=DistSamplerSeedHook),
 )
@@ -274,7 +291,7 @@ visualizer = None
 #             type=WandbVisBackend,
 #             init_kwargs=dict(
 #                 project='pathoverse_capgen',
-#                 name='qwen3_8b_freeze_llm'
+#                 name=vis_name
 #             )
 #         )
 #     ]
@@ -285,9 +302,6 @@ log_level = 'INFO'
 
 # load from which checkpoint
 load_from = ckpt_path
-
-# whether to resume training from the loaded checkpoint
-resume = False
  
 # Defaults to use random seed and disable `deterministic`
 randomness = dict(seed=None, deterministic=False)
