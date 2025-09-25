@@ -6,9 +6,11 @@ import os
 import warnings
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-# Set a different port for distributed training to avoid EADDRINUSE error
-if 'MASTER_PORT' not in os.environ:
-    os.environ['MASTER_PORT'] = '29501'
+# if 'MASTER_PORT' not in os.environ:
+# os.environ['MASTER_PORT'] = '29501'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
 import os.path as osp
 from functools import partial
 from types import FunctionType
@@ -67,7 +69,8 @@ def parse_args():
     
     args.config = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py'
     args.deepspeed = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
-    # args.work_dir = '/home/ps/pathology/codes/project/TCGA/train_s2'
+    # args.launcher = 'pytorch'
+    # args.work_dir = '/home/ps/pathology/codes/project/TCGA/multitask'
    
     return args
 

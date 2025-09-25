@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 # xtuner/configs/llava/internlm2_chat_7b_clip_vit_large_p14_336/pretrain/llava_internlm2_chat_7b_clip_vit_large_p14_336_e1_gpu8_pretrain.py
 import torch
-from mmengine.dataset import DefaultSampler
+from mmengine.dataset import DefaultSampler, InfiniteSampler
 from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
                             LoggerHook, ParamSchedulerHook)
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
@@ -26,30 +26,30 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'lora'
+setting = 'alignment'
 
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 5e-5  # Reduced from 1e-4 for better stability
+    lr = 5e-4  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    max_epochs = 1
+    max_epochs = 10
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=64,
-        lora_alpha=64,
+        r=16,
+        lora_alpha=32,
         lora_dropout=0.1,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy']
     save_best_metrics = None
-    ckpt_path = '/mnt/sda/pathology/codes/project/TCGA/train_s2_regression_qwen3_8b_conv_alignment/iter_200.pth'
+    ckpt_path = '/home/ps/pathology/codes/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment/iter_200.pth'
     # ckpt_path = None
-    lr = 2e-5
+    lr = 1e-5
     freeze_llm = True
-    max_epochs = 5
+    max_epochs = 100
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -62,26 +62,26 @@ resume = False
 
 # cat = 'Diagnosis'
 
-llm_name_or_path = '/home/ps/pathology/model_weights/model_zoo/Qwen3-8B'
-train_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/PathoVerse_stage2_regression_train_no-knowledge.json'
-val_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/PathoVerse_stage2_regression_test_no-knowledge_eval_60.json'
-test_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/PathoVerse_stage2_regression_test_no-knowledge_eval_60.json'
+llm_name_or_path = '/home/ps/pathology/model_weights/model_zoo/Qwen3-4B'
+train_data_path = '/mnt/sda/pathology/codes/project/TCGA/dataset_pp/categorized_json/split_Survival_OS.json'
+val_data_path = '/mnt/sda/pathology/codes/project/TCGA/dataset_pp/categorized_json/split_Survival_OS.json'
+test_data_path = '/mnt/sda/pathology/codes/project/TCGA/dataset_pp/categorized_json/split_Survival_OS.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/home/ps/pathology/codes/project/TCGA/train_s2_regression_qwen3_8b_conv_{setting}/'
+work_dir = f'/home/ps/pathology/codes/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}/'
 vis_name = f'qwen3_8b_conv_{setting}'
 
 val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 200  # More frequent saves for alignment debugging
-save_total_limit = 3  # Keep more checkpoints for analysis
+save_steps = 200  # More frequent saves for monitoring convergence
+save_total_limit = 5  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 10  # More frequent evaluation for alignment debugging
+evaluation_freq = 100  # More frequent evaluation for monitoring convergence
 
 image_path_list = None
 
@@ -135,7 +135,7 @@ del _get_latest_valid_deepspeed_checkpoint
 
 max_length = 32768
 max_patch_num = None
-max_new_tokens = 1
+max_new_tokens = 2
 repetition_penalty = 1.0
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
@@ -144,13 +144,13 @@ sample_type='wsi' # 'wsi'or'image'
 # Scheduler & Optimizer
 batch_size = 1  # per_device
 accumulative_counts = 1
-dataloader_num_workers = 8
+dataloader_num_workers = 0
 optim_type = SophiaG
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
-warmup_ratio = 0.03
+warmup_ratio = 0.05
 
 
 SYSTEM = ''
@@ -198,9 +198,9 @@ model = dict(
     enable_survival = True,
     reg_token = '<REG>',
     srv_token = '<SRV>',
-    lambda_llm = 1,
-    lambda_reg = 10,
-    lambda_srv = 10,
+    lambda_llm = 0.1,  # Reduce language modeling loss for better task learning
+    lambda_reg = 10.0,  # Increase regression loss weight for better learning
+    lambda_srv = 10.0,  # Increase survival loss weight for better learning
     )
 
 #######################################################################
@@ -224,7 +224,7 @@ train_dataloader = dict(
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=train_llava_dataset,
-    sampler=dict(type=DefaultSampler, shuffle=True),
+    sampler=dict(type=InfiniteSampler, shuffle=True),
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
@@ -368,7 +368,7 @@ visualizer = None
 #         dict(
 #             type=WandbVisBackend,
 #             init_kwargs=dict(
-#                 project='pathoverse_mcqa_conv',
+#                 project='pathoverse_multitask_conv',
 #                 name=vis_name
 #             )
 #         )

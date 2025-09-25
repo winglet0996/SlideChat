@@ -183,24 +183,10 @@ def process(dataset,
         
         # Add special tokens if provided
         if reg_token is not None:
-            try:
-                # Add early so encode_fn sees a single token
-                tokenizer.add_tokens([reg_token], special_tokens=True)
-            except Exception:
-                try:
-                    tokenizer.add_tokens([reg_token])
-                except Exception:
-                    pass  # Ignore if token already exists
+            tokenizer.add_tokens([reg_token])
         
         if srv_token is not None:
-            try:
-                # Add early so encode_fn sees a single token
-                tokenizer.add_tokens([srv_token], special_tokens=True)
-            except Exception:
-                try:
-                    tokenizer.add_tokens([srv_token])
-                except Exception:
-                    pass  # Ignore if token already exists
+            tokenizer.add_tokens([srv_token])
 
     # dataset = build_origin_dataset(dataset, split)
     dataset = build_origin_dataset(dataset=dataset, split=split)
