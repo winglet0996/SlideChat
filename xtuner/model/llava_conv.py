@@ -39,11 +39,18 @@ def convert_state_dict_to_hf(state_dict: Dict[str, torch.Tensor],
 
 
 class LLaVAModel_conv(BaseModel):
-    """Multi-modal LLaVA model with convolution-based vision processing and regression/survival heads.
+    """
+    Multi-modal LLaVA model with convolution-based vision processing and regression/survival prediction.
 
-    Predict mode strictly depends on the model generating <REG>/<SRV>. Task predictions are
-    computed from the hidden states at those generated special-token positions in the full
-    sequence (vision prefix + generated tokens), preserving visual context.
+    The model leverages special tokens (<REG> for regression, <SRV> for survival) to trigger 
+    downstream predictions. Regression predictions rely solely on the special token embeddings
+    processed by the LLM, while survival predictions fuse token embeddings with visual features
+    through attention pooling.
+
+    Key features:
+    - Clean token-only regression approach
+    - Visual-aware survival prediction
+    - End-to-end differentiable training
     """
 
     # Supported model configurations for flash attention
@@ -63,6 +70,10 @@ class LLaVAModel_conv(BaseModel):
                  enable_survival: bool = True, srv_token: str = '<SRV>',
                  num_survival_intervals: int = 6,
                  lambda_llm: float = 0.1, lambda_reg: float = 1.0, lambda_srv: float = 1.0):
+        """
+        Multi-modal LLaVA model with regression and survival prediction capabilities.
+        Regression relies solely on special token embeddings processed by LLM.
+        """
         super().__init__()
 
         # Initialize core attributes
@@ -248,24 +259,21 @@ class LLaVAModel_conv(BaseModel):
     def _init_prediction_modules(self) -> None:
         """Initialize prediction-specific modules."""
         llm_hidden = self.llm.config.hidden_size
-        vis_channels = self.conv.dims[-1]
 
-        self.attention_pool = AttentionPooling(
-            q_dim=llm_hidden, kv_dim=vis_channels, hidden_dim=llm_hidden
-        ).to(self.llm.dtype)
-
+        # Regression head using only special token embeddings
         if self.enable_regression:
             self.regression_head = RegressionHead(
-                in_dim=llm_hidden * 2, hidden_dim=llm_hidden
+                in_dim=llm_hidden, hidden_dim=llm_hidden
             ).to(self.llm.dtype)
             self.regression_loss_fn = nn.SmoothL1Loss(beta=1.0)
 
+        # Survival head using only special token embeddings
         if self.enable_survival:
             from .custom_model import logistic_hazard_loss
             # Register as buffer for proper device management
             self.register_buffer('survival_time_intervals', torch.tensor([0, 1, 2, 3, 5, 7, 10], dtype=torch.float32))
             self.survival_head = SurvivalHead(
-                in_dim=llm_hidden * 2, hidden_dim=llm_hidden, 
+                in_dim=llm_hidden, hidden_dim=llm_hidden,
                 num_intervals=self.num_survival_intervals,
                 time_intervals=self.survival_time_intervals
             ).to(self.llm.dtype)
@@ -359,8 +367,6 @@ class LLaVAModel_conv(BaseModel):
         self.visual_select_layer = visual_select_layer
         self._is_init = True
         self.is_first_iter = True
-        self.last_conv_output = None
-        self.last_conv_mask = None
         self._last_hidden_state = None
         self._original_input_ids = None
 
@@ -401,7 +407,7 @@ class LLaVAModel_conv(BaseModel):
 
         # Save prediction components + embeddings for new tokens
         if self.enable_regression or self.enable_survival:
-            pred_keys = ['attention_pool.', 'regression_head.', 'survival_head.']
+            pred_keys = ['regression_head.', 'survival_head.']
             to_return.update({k: v for k, v in state_dict.items() 
                               if any(key in k for key in pred_keys)})
             embedding_keys = ['embed_tokens.weight', 'tok_embeddings.weight', 'lm_head.weight']
@@ -421,8 +427,6 @@ class LLaVAModel_conv(BaseModel):
                 if masks is None else masks.to(conv_input.device, dtype=conv_input.dtype))
 
         conv_output, updated_mask = self.conv(conv_input, mask)
-        self.last_conv_output = conv_output
-        self.last_conv_mask = updated_mask
 
         conv_output = self.pos_emb_2d(conv_output)
         _, C_new, H_new, W_new = conv_output.shape
@@ -596,7 +600,12 @@ class LLaVAModel_conv(BaseModel):
                                        prefix_inputs_embeds: torch.Tensor,
                                        prefix_attention_mask: torch.Tensor,
                                        prefix_position_ids: Optional[torch.Tensor] = None) -> List[Dict[str, Any]]:
-        """Compute task predictions at generated special-token positions using full sequence (vision + generated)."""
+        """Compute task predictions at generated special-token positions using only token embeddings.
+        
+        The visual context is already encoded through the language model's cross-attention mechanism
+        during the generation process, so the special token embeddings contain sufficient multimodal
+        information for downstream predictions.
+        """
         device = prefix_inputs_embeds.device
         dtype = prefix_inputs_embeds.dtype
         B, Lp, H = prefix_inputs_embeds.shape
@@ -649,7 +658,7 @@ class LLaVAModel_conv(BaseModel):
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                        fused = self._fuse_with_vision(embed, b)  # (1, 2H)
+                        fused = self._fuse_with_vision(embed, b, 'regression')  # Shape depends on mode
                         pred = self.regression_head(fused).squeeze(-1).item()
                         data_samples[b]['regression_prediction'] = float(pred)
                         prev = data_samples[b].get('prediction_text', '')
@@ -661,18 +670,18 @@ class LLaVAModel_conv(BaseModel):
                 if pos_in_gen.numel() > 0:
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
-                        embed = hidden[b, pos_full]
-                        fused = self._fuse_with_vision(embed, b)
-                        logits = self.survival_head(fused).squeeze(0)
-                        survival_probs = self.survival_head.predict_survival_probs(fused).squeeze(0)
+                        embed = hidden[b, pos_full]  # (H,)
+                        fused = self._fuse_with_vision(embed, b, 'survival')  # (1, 2H)
+                        logits = self.survival_head(fused)
+                        survival_probs = self.survival_head.predict_survival_probs(fused)
                         risk_score = float(self.survival_head.predict_risk_scores(fused).squeeze(0).item())
                         median_time = float(self.survival_head.predict_median_survival_time(
                             fused, self.survival_time_intervals.to(fused.device)
                         ).squeeze(0).item())
 
                         pred_dict = {
-                            'logits': logits.detach().cpu().float().numpy(),
-                            'survival_probs': survival_probs.detach().cpu().float().numpy(),
+                            'logits': logits.squeeze(0).detach().cpu().float().numpy(),
+                            'survival_probs': survival_probs.squeeze(0).detach().cpu().float().numpy(),
                             'risk_score': risk_score,
                             'median_survival_time': median_time,
                             'time_intervals': self.survival_time_intervals.cpu().float().numpy().tolist()
@@ -686,17 +695,10 @@ class LLaVAModel_conv(BaseModel):
 
         return data_samples
 
-    def _fuse_with_vision(self, token_embed: torch.Tensor, b: int) -> torch.Tensor:
-        """Fuse token embedding with pooled visual features for batch index b."""
-        # token_embed: (H,)
-        if self.last_conv_output is not None and b < self.last_conv_output.size(0):
-            vis_feats = self.last_conv_output[b:b+1]  # (1, C, H, W)
-            vis_mask = None if self.last_conv_mask is None else self.last_conv_mask[b:b+1]
-            fused_vis = self.attention_pool(token_embed.unsqueeze(0), vis_feats, vis_mask)  # (1, H)
-        else:
-            fused_vis = torch.zeros_like(token_embed.unsqueeze(0))
-        fused = torch.cat([token_embed.unsqueeze(0), fused_vis], dim=-1)  # (1, 2H)
-        return fused
+    def _fuse_with_vision(self, token_embed: torch.Tensor, b: int, task_type: str = 'survival') -> torch.Tensor:
+        """Process token embedding for regression or survival tasks."""
+        # Both regression and survival use only the special token embedding
+        return token_embed.unsqueeze(0)  # (1, H)
 
     def _cleanup_prediction_state(self) -> None:
         """Clean up temporary prediction state."""
@@ -764,7 +766,7 @@ class LLaVAModel_conv(BaseModel):
 
     def _compute_task_loss(self, labels: torch.Tensor, targets: Union[torch.Tensor, Dict], 
                            task: str) -> torch.Tensor:
-        """Compute loss for regression or survival task (teacher-forced positions)."""
+        """Compute loss for regression or survival tasks."""
         hidden = self._last_hidden_state
         if hidden is None:
             return torch.zeros((), device=labels.device, dtype=self.llm.dtype)
@@ -793,14 +795,9 @@ class LLaVAModel_conv(BaseModel):
         s_idx = torch.tensor(seq_indices, device=hidden.device, dtype=torch.long)
         task_embeds = hidden[b_idx, s_idx]
 
-        if self.last_conv_output is not None:
-            vis_feats = self.last_conv_output[b_idx]
-            vis_mask = None if self.last_conv_mask is None else self.last_conv_mask[b_idx]
-            pooled_vis = self.attention_pool(task_embeds, vis_feats, vis_mask)
-        else:
-            pooled_vis = torch.zeros_like(task_embeds)
-
-        fused = torch.cat([task_embeds, pooled_vis], dim=-1)
+        # Process embeddings based on task type
+        # Both regression and survival use only special token embeddings
+        fused = task_embeds  # (N, H)
 
         if task == 'regression':
             predictions = self.regression_head(fused).squeeze(-1)

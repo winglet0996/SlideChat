@@ -589,33 +589,75 @@ class AttentionPooling(nn.Module):
     """
     def __init__(self, q_dim: int, kv_dim: int, hidden_dim: int):
         super().__init__()
-        self.q_proj = nn.Linear(q_dim, hidden_dim, bias=False)
-        self.k_proj = nn.Conv2d(kv_dim, hidden_dim, kernel_size=1, bias=False)
-        self.v_proj = nn.Conv2d(kv_dim, hidden_dim, kernel_size=1, bias=False)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.hidden_dim = hidden_dim
+        # Enable bias for better gradient flow
+        self.q_proj = nn.Linear(q_dim, hidden_dim, bias=True)
+        self.k_proj = nn.Conv2d(kv_dim, hidden_dim, kernel_size=1, bias=True)
+        self.v_proj = nn.Conv2d(kv_dim, hidden_dim, kernel_size=1, bias=True)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        
+        # Better initialization
+        self._init_weights()
+
+    
+    def _init_weights(self):
+        """Initialize weights for stable cross-attention training."""
+        # Xavier initialization for linear layers
+        for module in [self.q_proj, self.out_proj]:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        
+        # Xavier initialization for conv layers
+        for module in [self.k_proj, self.v_proj]:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
 
     def forward(self, q: torch.Tensor, kv: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         # q: (N, q_dim)
         # kv: (N, C, H, W)
         N, C, H, W = kv.shape
+        
+        # Project query, key, and value
         q_proj = self.q_proj(q)                                   # (N, Hdim)
         k = self.k_proj(kv).flatten(2).transpose(1, 2)            # (N, HW, Hdim)
         v = self.v_proj(kv).flatten(2).transpose(1, 2)            # (N, HW, Hdim)
 
-        # compute attention
+        # Compute attention with improved numerical stability
         q_proj = q_proj.unsqueeze(1)                              # (N, 1, Hdim)
         attn_scores = torch.matmul(q_proj, k.transpose(-2, -1))   # (N, 1, HW)
-        attn_scores = attn_scores / (k.size(-1) ** 0.5)
+        
+        # Use temperature scaling for better numerical stability
+        temperature = max(1.0, (self.hidden_dim ** 0.5))
+        attn_scores = attn_scores / temperature
 
         if mask is not None:
-            # mask: (N, 1, H, W) -> (N, HW)
-            mask_flat = (mask > 0).float().flatten(1)             # (N, HW)
-            attn_scores = attn_scores.masked_fill(mask_flat.unsqueeze(1) == 0, float('-inf'))
+            # Ensure mask is properly shaped and processed
+            if mask.dim() == 4:  # (N, 1, H, W)
+                mask_flat = (mask > 0).float().flatten(2).squeeze(1)  # (N, HW)
+            elif mask.dim() == 3:  # (N, H, W)
+                mask_flat = (mask > 0).float().flatten(1)  # (N, HW)
+            else:
+                mask_flat = mask  # Assume already flattened
+            
+            # Apply mask with improved numerical stability
+            attn_scores = attn_scores.masked_fill(
+                mask_flat.unsqueeze(1) == 0, -1e9  # Use -1e9 instead of -inf for better stability
+            )
 
+        # Apply softmax with clamping for numerical stability
+        attn_scores = torch.clamp(attn_scores, min=-10, max=10)
         attn = torch.softmax(attn_scores, dim=-1)                 # (N, 1, HW)
+        
+        # Apply attention weights to values
         context = torch.matmul(attn, v)                           # (N, 1, Hdim)
         context = context.squeeze(1)                              # (N, Hdim)
-        return self.out_proj(context)
+        
+        # Apply output projection
+        output = self.out_proj(context)
+        
+        return output
 
 
 class RegressionHead(nn.Module):
@@ -623,7 +665,7 @@ class RegressionHead(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),  # Add layer normalization
+            # nn.LayerNorm(hidden_dim),  # Add layer normalization
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),           # Add dropout for regularization
             nn.Linear(hidden_dim, 1),
@@ -663,7 +705,7 @@ class SurvivalHead(nn.Module):
         self.time_intervals = time_intervals
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            # nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, num_intervals),  # Output logits for each interval
@@ -681,7 +723,6 @@ class SurvivalHead(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
             elif isinstance(module, nn.LayerNorm):
-                # Initialize layer norm parameters
                 nn.init.constant_(module.bias, 0.0)
                 nn.init.constant_(module.weight, 1.0)
 

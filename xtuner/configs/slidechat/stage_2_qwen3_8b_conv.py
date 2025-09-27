@@ -26,14 +26,14 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'alignment'
+setting = 'lora'
 
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 5e-4  # Reduced from 1e-4 for better stability
+    lr = 5e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    max_epochs = 10
+    max_epochs = 100
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -198,9 +198,9 @@ model = dict(
     enable_survival = True,
     reg_token = '<REG>',
     srv_token = '<SRV>',
-    lambda_llm = 0.1,  # Reduce language modeling loss for better task learning
-    lambda_reg = 10.0,  # Increase regression loss weight for better learning
-    lambda_srv = 10.0,  # Increase survival loss weight for better learning
+    lambda_llm = 1,  # Reduce language modeling loss for better task learning
+    lambda_reg = 1,  # Increase regression loss weight for better learning
+    lambda_srv = 1,  # Increase survival loss weight for better learning
     )
 
 #######################################################################
