@@ -5,6 +5,7 @@ import torch
 import numpy as np
 from typing import Any, Sequence, Dict, List, Optional, Union
 from scipy import stats
+from sklearn.metrics import balanced_accuracy_score
 from collections import defaultdict
 
 from mmengine.evaluator import BaseMetric
@@ -34,33 +35,33 @@ class PathologyMetric(BaseMetric):
     # Metric configurations
     TEXT_METRICS = ['BLEU-1', 'BLEU-2', 'BLEU-3', 'BLEU-4', 'ROUGE-L']
     REGRESSION_METRICS = ['RMSE', 'MAE', 'R2', 'Pearson', 'Spearman'] 
-    SURVIVAL_METRICS = ['C-Index', 'IBS', 'Time-AUC']
+    SURVIVAL_METRICS = ['C-Index']
     
     # Pattern matching
     DIAGNOSIS_PATTERN = re.compile(r'Final diagnosis:\s*(.+?)(?:\n|$)', re.IGNORECASE | re.DOTALL)
-    CHOICE_PATTERN = re.compile(r'^[A-Z]$')
 
     def __init__(self,
-                 tokenizer: Dict,
+                 tokenizer: Union[Dict, Any],
                  output_dir: Optional[str] = None,
                  survival_time_intervals: Optional[List[float]] = None,
-                 survival_training_data_path: Optional[str] = '/home/ps/pathology/codes/project/TCGA/dataset_pp/PathoVerse_stage2_regression_train_no-knowledge.json',
                  *args, **kwargs):
         """
         Initialize the multi-task pathology metric evaluator.
 
         Args:
-            tokenizer: Configuration for building the tokenizer
+            tokenizer: Configuration dict for building the tokenizer, or tokenizer object directly
             output_dir: Directory to save evaluation JSON results
             survival_time_intervals: Time intervals for survival analysis
-            survival_training_data_path: Path to JSON file containing training survival data
         """
         super().__init__(*args, **kwargs)
-        self.tokenizer = BUILDER.build(tokenizer)
+        # Allow passing tokenizer object directly or build from config
+        if isinstance(tokenizer, dict):
+            self.tokenizer = BUILDER.build(tokenizer)
+        else:
+            self.tokenizer = tokenizer
         self.rouge_scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
         self.smoothie = SmoothingFunction().method4
         self.output_dir = output_dir
-        self.survival_training_data_path = survival_training_data_path
         
         # Survival metrics: lazily initialize from model outputs if intervals not specified
         self._survival_intervals = np.array(survival_time_intervals) if survival_time_intervals is not None else None
@@ -93,9 +94,6 @@ class PathologyMetric(BaseMetric):
             self.survival_metrics = SurvivalMetrics(self._survival_intervals)
             
             # Load training data if path is provided
-            if self.survival_training_data_path:
-                self.survival_metrics.load_training_data_from_json(self.survival_training_data_path)
-
         for i, sample in enumerate(data_samples):
             # Decode input and predictions
             input_str = self._decode_full_input(batch_data['input_ids'][i])
@@ -134,6 +132,7 @@ class PathologyMetric(BaseMetric):
             'survival_targets': data_batch['data'].get('survival_targets', None),
             'survival_times': data_batch['data'].get('survival_times', None),
             'survival_events': data_batch['data'].get('survival_events', None),
+            'project': data_batch['data'].get('project', None),
         }
 
     def _extract_sample_metadata(self, batch_data: Dict[str, Any], idx: int) -> Dict[str, Any]:
@@ -154,6 +153,20 @@ class PathologyMetric(BaseMetric):
         else:
             metadata['category'] = ""
         
+        # Extract project
+        if batch_data['project'] is not None:
+            if isinstance(batch_data['project'], (list, tuple)):
+                proj = batch_data['project'][idx] if idx < len(batch_data['project']) else ""
+            else:
+                proj = str(batch_data['project'])
+            
+            # Handle nested projects
+            if isinstance(proj, (list, tuple)) and proj:
+                proj = str(proj[0])
+            metadata['project'] = str(proj) if proj else "Unknown"
+        else:
+            metadata['project'] = "Unknown"
+        
         # Extract targets
         metadata['target_str'] = self._get_target_text(batch_data, idx)
         metadata['regression_target'] = self._get_regression_target(batch_data['regression_targets'], idx)
@@ -165,13 +178,17 @@ class PathologyMetric(BaseMetric):
         return metadata
 
     def _determine_task_type(self, metadata: Dict[str, Any], pred_str: str, sample: Dict) -> str:
-        """Determine task type using explicit model fields."""
+        """Determine task type using explicit model fields and category."""
         if 'survival_prediction' in sample:
             return 'survival'
         if 'regression_prediction' in sample:
             return 'regression'
-        # MCQA is inferred from prediction text pattern only
-        return 'mcqa' if self._looks_like_mcqa(pred_str) else 'text'
+        # Check category field for text task
+        category = metadata.get('category', '').lower()
+        if 'text' in category:
+            return 'text'
+        # Default to MCQA
+        return 'mcqa'
 
     def _process_survival_sample(self, sample: Dict, input_str: str, pred_str: str, 
                                metadata: Dict[str, Any]) -> None:
@@ -183,6 +200,7 @@ class PathologyMetric(BaseMetric):
         self.results.append({
             'task_type': 'survival',
             'filename': metadata['filename'],
+            'project': metadata['project'],
             'input': input_str.strip(),
             'prediction': pred_str.strip(),
             'category': metadata['category'],
@@ -202,6 +220,7 @@ class PathologyMetric(BaseMetric):
         self.results.append({
             'task_type': 'regression',
             'filename': metadata['filename'],
+            'project': metadata['project'],
             'input': input_str.strip(),
             'prediction': pred_str.strip(),
             'pred_value': float(pred_value),
@@ -223,6 +242,7 @@ class PathologyMetric(BaseMetric):
         self.results.append({
             'task_type': 'mcqa',
             'filename': metadata['filename'],
+            'project': metadata['project'],
             'input': input_str.strip(),
             'prediction': pred_str.strip(),
             'pred_choice': pred_choice,
@@ -252,6 +272,7 @@ class PathologyMetric(BaseMetric):
         self.results.append({
             'task_type': 'text',
             'filename': metadata['filename'],
+            'project': metadata['project'],
             'input': input_str.strip(),
             'prediction': pred_str.strip(),
             'target': target_str,
@@ -265,6 +286,9 @@ class PathologyMetric(BaseMetric):
     def compute_metrics(self, results: List[Dict]) -> Dict[str, float]:
         """
         Compute metrics for all task types with proper error handling.
+
+        Text, MCQA, and regression metrics are aggregated by category with overall summaries,
+        while survival metrics continue to report per-project and per-category breakdowns.
         """
         if not results:
             return {}
@@ -280,18 +304,18 @@ class PathologyMetric(BaseMetric):
 
         # Compute metrics for each task type
         all_metrics = {}
-        
+
         if task_results['text']:
-            all_metrics.update(self._compute_text_metrics(task_results['text']))
-        
+            all_metrics.update(self._compute_text_metrics_by_category(task_results['text']))
+
         if task_results['mcqa']:
             all_metrics.update(self._compute_mcqa_metrics(task_results['mcqa']))
-        
+
         if task_results['regression']:
             all_metrics.update(self._compute_regression_metrics(task_results['regression']))
-        
+
         if task_results['survival'] and self.survival_metrics:
-            all_metrics.update(self._compute_survival_metrics(task_results['survival']))
+            all_metrics.update(self._compute_survival_metrics_with_projects(task_results['survival']))
 
         # Save results and print summaries
         if is_main_process() and self.output_dir:
@@ -299,9 +323,6 @@ class PathologyMetric(BaseMetric):
             self._print_metric_summaries(all_metrics)
 
         return all_metrics
-
-    # (Old _compute_survival_metrics removed; per-category version defined later.)
-
     # Helper methods for text scoring, MCQA, regression, etc.
     def _compute_text_scores(self, pred: str, target: str) -> Dict[str, float]:
         """Compute BLEU and ROUGE scores for text pair."""
@@ -326,12 +347,13 @@ class PathologyMetric(BaseMetric):
         
         return scores
 
-    def _looks_like_mcqa(self, text: str) -> bool:
-        """Check if text looks like MCQA response."""
-        text = text.strip()
-        return bool(self.CHOICE_PATTERN.match(text)) or any(
-            choice in text.upper()[:10] for choice in ['A)', 'B)', 'C)', 'D)', 'E)']
-        )
+    @staticmethod
+    def _make_safe_key(value: str, fallback: str = 'uncategorized') -> str:
+        """Convert arbitrary string into a safe lowercase identifier."""
+        if value is None:
+            value = ''
+        safe = re.sub(r'[^0-9a-zA-Z]+', '_', value.strip()).strip('_').lower()
+        return safe or fallback
 
     def _extract_mcqa_choice(self, text: str) -> str:
         """Extract choice letter from MCQA response."""
@@ -340,8 +362,8 @@ class PathologyMetric(BaseMetric):
         
         text = text.strip().upper()
         
-        # Direct match
-        if self.CHOICE_PATTERN.match(text):
+        # Direct single letter match
+        if len(text) == 1 and text in 'ABCDE':
             return text
         
         # Extract from patterns like "A)", "A:", "A."
@@ -463,6 +485,10 @@ class PathologyMetric(BaseMetric):
         if st is None:
             return None
 
+        # Lazy init survival metrics if needed
+        if self.survival_metrics is None and self._survival_intervals is not None:
+            self.survival_metrics = SurvivalMetrics(self._survival_intervals)
+
         target_y = st['target_y'][idx]
         at_risk_mask = st['at_risk_mask'][idx]
 
@@ -482,10 +508,14 @@ class PathologyMetric(BaseMetric):
             event = 0.0
 
         # Ensure k is within valid range for interval_endpoints
-        k = min(k, len(self.survival_metrics.interval_endpoints) - 1)
+        if self.survival_metrics is not None:
+            k = min(k, len(self.survival_metrics.interval_endpoints) - 1)
+            # Map interval index to time using interval right endpoints (ensures within bounds)
+            time = float(self.survival_metrics.interval_endpoints[k])
+        else:
+            # Fallback if survival_metrics not initialized yet
+            time = float(k + 1)  # Simple fallback
         
-        # Map interval index to time using interval right endpoints (ensures within bounds)
-        time = float(self.survival_metrics.interval_endpoints[k])
         return {'time': time, 'event': event}
 
     def _extract_filename_from_image_file(self, image_file_batch: Any, idx: int) -> str:
@@ -504,7 +534,7 @@ class PathologyMetric(BaseMetric):
             return f"sample_{idx}"
 
     def _compute_text_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute text generation metrics."""
+        """Compute text generation metrics (legacy method, kept for compatibility)."""
         if not results:
             return {}
         
@@ -530,58 +560,167 @@ class PathologyMetric(BaseMetric):
             diagnosis_accuracy.append(float(res.get('diagnosis_correct', False)))
         
         # Compute metrics with confidence intervals
-        engine_metrics = {}
+        metrics = {}
         for name, scores in metrics_scores.items():
             if scores:
-                mean, lower, upper = self._bootstrap_ci(scores)
-                engine_metrics[f'eval/{name}'] = mean
-        
+                mean, _, _ = self._bootstrap_ci(scores)
+                metrics[name] = mean
+
         # Diagnosis accuracy
         if diagnosis_accuracy:
             diag_acc_mean, _, _ = self._bootstrap_ci(diagnosis_accuracy)
-            engine_metrics['eval/diag_accuracy'] = diag_acc_mean
+            metrics['diag_accuracy'] = diag_acc_mean
+
+        return metrics
+
+    def _compute_text_metrics_by_category(self, results: List[Dict]) -> Dict[str, float]:
+        """Compute text metrics grouped by category with overall summary."""
+        if not results:
+            self._text_metrics_table = []
+            return {}
+
+        category_groups = defaultdict(list)
+        for res in results:
+            category = res.get('category') or 'Uncategorized'
+            category_groups[category].append(res)
+
+        metrics = {}
+        table = []
+
+        for category in sorted(category_groups.keys()):
+            group = category_groups[category]
+            cat_metrics = self._compute_text_metrics(group)
+            safe_cat = self._make_safe_key(category)
+            for metric_name, value in cat_metrics.items():
+                metrics[f'eval/text_{safe_cat}_{metric_name}'] = value
+            table.append({'category': category, 'metrics': cat_metrics, 'count': len(group)})
+
+        overall_metrics = self._compute_text_metrics(results)
+        for metric_name, value in overall_metrics.items():
+            metrics[f'eval/text_overall_{metric_name}'] = value
+        table.append({'category': 'Overall', 'metrics': overall_metrics, 'count': len(results)})
+
+        self._text_metrics_table = table
+        return metrics
+
+
+    def _extract_choices_from_input(self, input_text: str) -> frozenset:
+        """Extract actual choice content from MCQA input text."""
+        match = re.search(r'<CHOICES>(.*?)</CHOICES>', input_text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            match = re.search(r'<CHOICES>(.*?)(?:assistant|$)', input_text, re.DOTALL | re.IGNORECASE)
+        if match:
+            choices_text = match.group(1).strip()
+            # Extract choice content after A), B), C), etc.
+            choice_contents = re.findall(r'^[A-Z]\)\s*(.+?)$', choices_text, re.MULTILINE)
+            return frozenset(c.strip() for c in choice_contents)
+        return frozenset()
+
+    def _map_choice_to_content(self, choice_letter: str, input_text: str) -> str:
+        """Map choice letter (A/B/C/D/E) to actual choice content."""
+        if not choice_letter:
+            return choice_letter
         
-        return engine_metrics
+        # Normalize choice letter to uppercase
+        choice_letter = choice_letter.strip().upper()
+        
+        # Extract choices block
+        match = re.search(r'<CHOICES>(.*?)</CHOICES>', input_text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            match = re.search(r'<CHOICES>(.*?)(?:assistant|$)', input_text, re.DOTALL | re.IGNORECASE)
+        
+        if match:
+            choices_text = match.group(1).strip()
+            # Try multiple patterns to match the choice
+            patterns = [
+                rf'^{re.escape(choice_letter)}\)\s*(.+?)$',  # A) content
+                rf'^{re.escape(choice_letter)}\.\s*(.+?)$',  # A. content
+                rf'^{re.escape(choice_letter)}:\s*(.+?)$',   # A: content
+                rf'^{re.escape(choice_letter)}\s+(.+?)$',    # A content
+            ]
+            
+            for pattern in patterns:
+                content_match = re.search(pattern, choices_text, re.MULTILINE)
+                if content_match:
+                    mapped_content = content_match.group(1).strip()
+                    # Remove trailing punctuation/newlines
+                    mapped_content = re.sub(r'[\n\r]+.*$', '', mapped_content).strip()
+                    return mapped_content
+        
+        # Fallback: return original letter if mapping fails
+        return choice_letter
 
     def _compute_mcqa_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute MCQA metrics."""
+        """Compute MCQA balanced accuracy metrics per category and overall."""
         if not results:
+            self._mcqa_metrics_table = []
             return {}
         
-        category_to_corrects = defaultdict(list)
-        overall_corrects = []
+        # Group by category: collect predictions, targets, and inputs
+        category_groups = defaultdict(lambda: {'preds': [], 'targets': [], 'inputs': []})
         
         for res in results:
-            correct = float(res.get('correct', False))
+            pred_choice = res.get('pred_choice', '')
+            target_choice = res.get('target_choice', '')
             category = res.get('category', 'Unknown')
+            input_text = res.get('input', '')
             
-            category_to_corrects[category].append(correct)
-            overall_corrects.append(correct)
+            if pred_choice and target_choice:
+                category_groups[category]['preds'].append(pred_choice)
+                category_groups[category]['targets'].append(target_choice)
+                category_groups[category]['inputs'].append(input_text)
         
-        # Compute per-category and overall accuracy
+        # Compute per-category balanced accuracy
         engine_metrics = {}
-        for cat, values in category_to_corrects.items():
-            if values:
-                mean, _, _ = self._bootstrap_ci(values)
-                safe_cat = cat.replace('/', '_').replace(' ', '_')
-                engine_metrics[f'eval/mcqa_{safe_cat}_accuracy'] = mean
+        table = []
+        category_metrics = []  # Store (bacc, sample_count) for weighted average
+
+        for cat in sorted(category_groups.keys()):
+            group = category_groups[cat]
+            if len(group['preds']) > 0:
+                # Check if all samples have same choice set
+                choice_sets = [self._extract_choices_from_input(inp) for inp in group['inputs']]
+                unique_choice_sets = set(choice_sets)
+                
+                if len(unique_choice_sets) == 1 and unique_choice_sets != {frozenset()}:
+                    # Map letters to actual choice content before computing BACC
+                    mapped_preds = [self._map_choice_to_content(group['preds'][i], group['inputs'][i]) for i in range(len(group['preds']))]
+                    mapped_targets = [self._map_choice_to_content(group['targets'][i], group['inputs'][i]) for i in range(len(group['targets']))]
+                    bacc = balanced_accuracy_score(mapped_targets, mapped_preds)
+                else:
+                    # Use standard ACC when choice sets differ
+                    bacc = np.mean([p == t for p, t in zip(group['preds'], group['targets'])])
+                
+                sample_count = len(group['preds'])
+                category_metrics.append((bacc, sample_count))
+                
+                safe_cat = self._make_safe_key(cat, fallback='unknown')
+                engine_metrics[f'eval/mcqa_{safe_cat}_balanced_accuracy'] = float(bacc)
+                table.append({'category': cat, 'metrics': {'balanced_accuracy': float(bacc)}, 'count': sample_count})
         
-        # Overall accuracy
-        if overall_corrects:
-            overall_mean, _, _ = self._bootstrap_ci(overall_corrects)
-            engine_metrics['eval/mcqa_overall_accuracy'] = overall_mean
+        # Overall: weighted average of per-category BACC/ACC
+        if category_metrics:
+            total_samples = sum(count for _, count in category_metrics)
+            overall_weighted_acc = sum(bacc * count for bacc, count in category_metrics) / total_samples if total_samples > 0 else 0.0
+            
+            engine_metrics['eval/mcqa_overall_balanced_accuracy'] = float(overall_weighted_acc)
+            table.append({'category': 'Overall', 'metrics': {'balanced_accuracy': float(overall_weighted_acc)}, 'count': total_samples})
+
+        self._mcqa_metrics_table = table
         
         return engine_metrics
 
+
     def _compute_regression_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute regression metrics per category and overall."""
+        """Compute regression metrics per category and overall (legacy method)."""
         if not results:
             return {}
             
         # Group results by category
         cat_groups = defaultdict(list)
         for r in results:
-            cat_groups[r.get('category', 'regression')].append(r)
+            category = r.get('category') or 'Regression'
+            cat_groups[category].append(r)
 
         def compute_category_metrics(group: List[Dict]) -> Optional[Dict[str, float]]:
             """Compute metrics for a single category group."""
@@ -618,23 +757,31 @@ class PathologyMetric(BaseMetric):
 
         # Compute metrics for all categories
         engine_metrics = {}
-        for cat, group in cat_groups.items():
+        table = []
+        for cat in sorted(cat_groups.keys()):
+            group = cat_groups[cat]
+            display_cat = cat if cat else 'Regression'
             metrics = compute_category_metrics(group)
             if metrics:
-                safe_cat = cat.lower().replace(' ', '_').replace('/', '_')
+                safe_cat = self._make_safe_key(display_cat, fallback='regression')
                 for metric_name, value in metrics.items():
                     engine_metrics[f'eval/reg_{safe_cat}_{metric_name}'] = float(value)
+                table.append({'category': display_cat, 'metrics': metrics, 'count': len(group)})
         
         # Compute overall metrics
         overall_metrics = compute_category_metrics(results)
         if overall_metrics:
             for metric_name, value in overall_metrics.items():
                 engine_metrics[f'eval/reg_overall_{metric_name}'] = float(value)
+            table.append({'category': 'Overall', 'metrics': overall_metrics, 'count': len(results)})
+
+        self._regression_metrics_table = table
                 
         return engine_metrics
 
+
     def _compute_survival_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute survival metrics per category and overall."""
+        """Compute survival metrics per category and overall (legacy method)."""
         if not self.survival_metrics or not results:
             return {}
             
@@ -643,53 +790,183 @@ class PathologyMetric(BaseMetric):
         for r in results:
             cat_groups[r.get('category', 'Survival')].append(r)
             
-        def compute_category_survival_metrics(group: List[Dict]) -> Dict[str, float]:
+        def compute_category_survival_metrics(group: List[Dict]) -> Optional[Dict[str, float]]:
             """Compute survival metrics for a single category group."""
-            survival_probs = np.array([g['survival_probs'] for g in group], dtype=float)
-            risk_scores = np.array([g['risk_score'] for g in group], dtype=float)
-            event_times = np.array([g['event_time'] for g in group], dtype=float)
-            event_indicators = np.array([g['event_indicator'] for g in group], dtype=float)
-            return self.survival_metrics.compute_all_metrics(survival_probs, risk_scores, event_times, event_indicators)
+            risk_scores, event_times, event_indicators = [], [], []
+            for g in group:
+                rs = g.get('risk_score')
+                et = g.get('event_time')
+                ei = g.get('event_indicator')
+                if rs is None or et is None or ei is None:
+                    continue
+                risk_scores.append(float(rs))
+                event_times.append(float(et))
+                event_indicators.append(float(ei))
+
+            if not risk_scores:
+                return None
+
+            risk_scores = np.array(risk_scores, dtype=float)
+            event_times = np.array(event_times, dtype=float)
+            event_indicators = np.array(event_indicators, dtype=float)
+
+            try:
+                c_index = self.survival_metrics.compute_concordance_index(
+                    risk_scores, event_times, event_indicators)
+            except Exception as e:
+                print_log(f'Survival C-index failed for category computation: {e}', 'current')
+                return None
+
+            return {'c_index': float(c_index)}
         
         engine_metrics = {}
         
         # Compute per-category metrics
         for cat, group in cat_groups.items():
-            try:
-                metrics = compute_category_survival_metrics(group)
-                safe_cat = cat.lower().replace(' ', '_').replace('/', '_')
-                for metric_name, value in metrics.items():
-                    engine_metrics[f'eval/surv_{safe_cat}_{metric_name}'] = float(value)
-            except Exception as e:
-                print_log(f'Survival metrics failed for category {cat}: {e}', 'current')
+            metrics = compute_category_survival_metrics(group)
+            if not metrics:
+                continue
+            safe_cat = cat.lower().replace(' ', '_').replace('/', '_')
+            engine_metrics[f'eval/surv_{safe_cat}_c_index'] = metrics['c_index']
         
         # Compute overall metrics
-        try:
-            overall_metrics = compute_category_survival_metrics(results)
-            for metric_name, value in overall_metrics.items():
-                engine_metrics[f'eval/surv_overall_{metric_name}'] = float(value)
+        overall_metrics = compute_category_survival_metrics(results)
+        if overall_metrics:
+            engine_metrics['eval/surv_overall_c_index'] = overall_metrics['c_index']
             self._survival_metrics = overall_metrics
-        except Exception as e:
-            print_log(f'Overall survival metrics failed: {e}', 'current')
-            
+        
         return engine_metrics
 
+    def _compute_survival_metrics_with_projects(self, results: List[Dict]) -> Dict[str, float]:
+        """Compute survival metrics per category for each project and aggregate across projects."""
+        if not self.survival_metrics or not results:
+            return {}
+        
+        # Group by project
+        project_results = defaultdict(list)
+        for res in results:
+            project = res.get('project', 'Unknown')
+            project_results[project].append(res)
+        
+        all_metrics = {}
+        # Structure: category -> list of (c_index, count) from each project
+        category_metrics_across_projects = defaultdict(list)
+        
+        # Compute per-project, per-category metrics
+        for project, proj_results in project_results.items():
+            metrics = self._compute_single_project_survival_metrics(proj_results)
+            safe_proj = project.replace('-', '_').replace(' ', '_')
+            
+            # Add per-project per-category metrics
+            if metrics:
+                for key, value in metrics.items():
+                    all_metrics[f'eval/surv_{safe_proj}_{key}'] = value
+                    # Track category metrics for cross-project aggregation
+                    # metrics keys are like: 'survival_os_c_index', 'mutation_c_index', etc.
+                    if key.endswith('_c_index'):
+                        category_name = key[:-8]  # Remove '_c_index' suffix
+                        # Count samples in this category for this project
+                        cat_count = sum(1 for r in proj_results if self._make_safe_key(r.get('category', '')) == category_name)
+                        category_metrics_across_projects[category_name].append((value, cat_count))
+        
+        # Compute weighted average across projects for each category
+        for category, metrics_list in category_metrics_across_projects.items():
+            if metrics_list:
+                total_samples = sum(count for _, count in metrics_list)
+                if total_samples > 0:
+                    weighted_c_index = sum(c_index * count for c_index, count in metrics_list) / total_samples
+                    all_metrics[f'eval/surv_overall_{category}_c_index'] = float(weighted_c_index)
+        
+        return all_metrics
+    
+    def _compute_single_project_survival_metrics(self, results: List[Dict]) -> Dict[str, float]:
+        """Compute survival metrics per category for a single project (no overall metric).
+        
+        Returns per-category C-index metrics only.
+        """
+        # Group by category
+        category_data = defaultdict(lambda: {'risk_scores': [], 'event_times': [], 'event_indicators': []})
+        
+        for res in results:
+            rs = res.get('risk_score')
+            et = res.get('event_time')
+            ei = res.get('event_indicator')
+            if rs is None or et is None or ei is None:
+                continue
+            
+            # Group by category
+            category = res.get('category', 'Unknown')
+            category_data[category]['risk_scores'].append(float(rs))
+            category_data[category]['event_times'].append(float(et))
+            category_data[category]['event_indicators'].append(float(ei))
+
+        if not category_data:
+            return {}
+
+        metrics = {}
+        
+        # Compute per-category C-index only (no overall)
+        for category, cat_data in category_data.items():
+            if len(cat_data['risk_scores']) < 2:
+                continue  # Skip categories with insufficient data
+                
+            cat_risk = np.array(cat_data['risk_scores'], dtype=float)
+            cat_time = np.array(cat_data['event_times'], dtype=float)
+            cat_event = np.array(cat_data['event_indicators'], dtype=float)
+            
+            try:
+                cat_c_index = self.survival_metrics.compute_concordance_index(
+                    cat_risk, cat_time, cat_event)
+                safe_cat = self._make_safe_key(category)
+                metrics[f'{safe_cat}_c_index'] = float(cat_c_index)
+            except Exception as e:
+                # Silently skip categories that cannot compute C-index (e.g., no admissible pairs)
+                continue
+        
+        return metrics
+
     def _save_all_results(self, task_results: Dict[str, List[Dict]]) -> None:
-        """Save results with category split for structured tasks."""
+        """Persist raw evaluation results for each task type."""
         for task_type, results in task_results.items():
             if not results:
                 continue
-                
-            # Save merged file
+
             merged_path = os.path.join(self.output_dir, f'{task_type}_results.json')
             self._save_json_file(results, merged_path, f"{len(results)} {task_type} results")
-            
-            # Save per-category files for structured tasks
-            if task_type in ['mcqa', 'regression', 'survival']:
-                self._save_category_results(results, task_type)
+            self._save_project_results(results, task_type)
+
+    def _save_project_results(self, results: List[Dict], task_type: str) -> None:
+        """Persist results split by project, adding per-category files for survival."""
+        project_results = defaultdict(list)
+        for result in results:
+            project = result.get('project', 'Unknown')
+            project_results[project].append(result)
+
+        for project, project_data in project_results.items():
+            safe_project = project.replace('-', '_').replace(' ', '_')
+            file_path = os.path.join(self.output_dir, f'{task_type}_{safe_project}_results.json')
+            description = f"{task_type} project {project} ({len(project_data)} samples)"
+            self._save_json_file(project_data, file_path, description)
+
+            if task_type == 'survival':
+                category_results = defaultdict(list)
+                for item in project_data:
+                    category = item.get('category', 'Unknown')
+                    category_results[category].append(item)
+
+                for category, category_data in category_results.items():
+                    safe_category = category.replace('/', '_').replace(' ', '_').replace('-', '_')
+                    cat_file_path = os.path.join(
+                        self.output_dir,
+                        f'{task_type}_{safe_project}_{safe_category}_results.json'
+                    )
+                    cat_description = (
+                        f"{task_type} project {project} category {category} ({len(category_data)} samples)"
+                    )
+                    self._save_json_file(category_data, cat_file_path, cat_description)
 
     def _save_json_file(self, data: List[Dict], file_path: str, description: str) -> None:
-        """Save data to JSON file with error handling."""
+        """Write JSON data to disk with logging."""
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
@@ -697,324 +974,226 @@ class PathologyMetric(BaseMetric):
         except Exception as e:
             print_log(f"Error saving {description}: {e}", 'current')
 
-    def _save_category_results(self, results: List[Dict], task_type: str) -> None:
-        """Save results split by category."""
-        category_results = defaultdict(list)
-        for result in results:
-            category = result.get('category', 'Unknown')
-            category_results[category].append(result)
-            
-        for category, category_data in category_results.items():
-            safe_category = category.lower().replace(' ', '_').replace('/', '_')
-            file_path = os.path.join(self.output_dir, f'{task_type}_{safe_category}_results.json')
-            description = f"{task_type} category {category} ({len(category_data)})"
-            self._save_json_file(category_data, file_path, description)
-
     def _print_metric_summaries(self, all_metrics: Dict[str, float]) -> None:
-        """Print formatted metric summaries by task type in table format."""
-        print_log("=" * 100, 'current')
-        print_log(" " * 35 + "EVALUATION RESULTS SUMMARY", 'current')
-        print_log("=" * 100, 'current')
-        
+        """Render formatted metric summaries for each task."""
+        print_log("=" * 120, 'current')
+        print_log(" " * 45 + "EVALUATION RESULTS SUMMARY", 'current')
+        print_log("=" * 120, 'current')
+
         if not hasattr(self, '_computed_task_results'):
-            print_log("=" * 100, 'current')
+            print_log("=" * 120, 'current')
             return
-            
+
         task_results = self._computed_task_results
-        task_printers = {
-            'text': self._print_text_summary,
-            'mcqa': lambda m: self._print_mcqa_summary(m, task_results['mcqa']),
-            'regression': lambda m: self._print_regression_summary(m, task_results['regression']),
-            'survival': lambda m: self._print_survival_summary_detailed(m, task_results['survival'])
-        }
-        
-        for task_type, printer in task_printers.items():
-            if task_type in task_results and task_results[task_type]:
-                printer(all_metrics)
-        
-        print_log("=" * 100, 'current')
 
-    def _print_text_summary(self, all_metrics: Dict[str, float]) -> None:
-        """Print text generation metrics summary."""
-        print_log("\nFREE-TEXT GENERATION RESULTS:", 'current')
-        print_log("-" * 80, 'current')
-        print_log(f"{'Metric':<30} {'Value':<15}", 'current')
-        print_log("-" * 80, 'current')
-        
-        text_metrics = {
-            'eval/full_BLEU-4': 'Full Text BLEU-4',
-            'eval/full_ROUGE-L': 'Full Text ROUGE-L',
-            'eval/diag_BLEU-4': 'Diagnosis BLEU-4',
-            'eval/diag_ROUGE-L': 'Diagnosis ROUGE-L',
-            'eval/diag_accuracy': 'Diagnosis Accuracy'
-        }
-        
-        for key, name in text_metrics.items():
-            if key in all_metrics:
-                value = all_metrics[key]
-                print_log(f"{name:<30} {value:<15.4f}", 'current')
-        print_log("-" * 80, 'current')
+        if task_results.get('text'):
+            self._print_text_summary()
 
-    def _print_mcqa_summary(self, all_metrics: Dict[str, float], results: List[Dict]) -> None:
-        """Print MCQA metrics summary by category."""
-        print_log("\nMULTI-CHOICE QA RESULTS:", 'current')
-        print_log("-" * 60, 'current')
-        print_log(f"{'Category':<25} {'Accuracy':<15} {'Count':<10}", 'current')
-        print_log("-" * 60, 'current')
-        
-        category_counts = defaultdict(int)
-        for result in results:
-            category_counts[result.get('category', 'Unknown')] += 1
-        
-        # Print per-category results
-        for key, value in all_metrics.items():
-            if not (key.startswith('eval/mcqa_') and key.endswith('_accuracy') and 'overall' not in key):
-                continue
-                
-            cat_part = key.replace('eval/mcqa_', '').replace('_accuracy', '')
-            original_cat = self._find_original_category(cat_part, category_counts.keys())
-            
-            if original_cat:
-                count = category_counts[original_cat]
-                print_log(f"{original_cat:<25} {value:<15.4f} {count:<10}", 'current')
-        
-        # Print overall summary
-        if 'eval/mcqa_overall_accuracy' in all_metrics:
-            total_count = sum(category_counts.values())
-            print_log("-" * 60, 'current')
-            print_log(f"{'OVERALL':<25} {all_metrics['eval/mcqa_overall_accuracy']:<15.4f} {total_count:<10}", 'current')
-        
-        print_log("-" * 60, 'current')
+        if task_results.get('mcqa'):
+            self._print_mcqa_summary()
 
-    def _print_regression_summary(self, all_metrics: Dict[str, float], results: List[Dict]) -> None:
-        """Print regression metrics summary by category."""
-        print_log("\nREGRESSION RESULTS:", 'current')
-        print_log("-" * 100, 'current')
-        print_log(f"{'Category':<20} {'RMSE':<10} {'MAE':<10} {'R²':<10} {'Pearson':<10} {'Spearman':<10} {'Count':<10}", 'current')
-        print_log("-" * 100, 'current')
-        
-        category_counts = defaultdict(int)
-        for result in results:
-            category_counts[result.get('category', 'regression')] += 1
-        
-        # Extract categories directly from metric keys, excluding overall
-        categories_with_metrics = {}
-        for key, value in all_metrics.items():
-            if key.startswith('eval/reg_') and not key.startswith('eval/reg_overall_') and key.endswith('_rmse'):
-                # Extract category from key like 'eval/reg_hrd_regression_rmse' -> 'hrd_regression'
-                cat_part = key.replace('eval/reg_', '').replace('_rmse', '')
-                categories_with_metrics[cat_part] = True
-        
-        # Print per-category results
-        for cat_part in sorted(categories_with_metrics.keys()):
-            original_cat = self._find_original_category(cat_part, category_counts.keys()) or cat_part.replace('_', ' ').title()
-            metrics = self._get_regression_metrics(all_metrics, cat_part)
-            count = category_counts.get(original_cat, 0)
-            
-            print_log(f"{original_cat:<20} {metrics['rmse']:<10.4f} {metrics['mae']:<10.4f} {metrics['r2']:<10.4f} "
-                     f"{metrics['pearson']:<10.4f} {metrics['spearman']:<10.4f} {count:<10}", 'current')
-        
-        # Print overall summary
-        if any(k.startswith('eval/reg_overall_') for k in all_metrics):
-            overall = self._get_regression_metrics(all_metrics, 'overall')
-            total_count = sum(category_counts.values())
-            print_log("-" * 100, 'current')
-            print_log(f"{'OVERALL':<20} {overall['rmse']:<10.4f} {overall['mae']:<10.4f} {overall['r2']:<10.4f} "
-                     f"{overall['pearson']:<10.4f} {overall['spearman']:<10.4f} {total_count:<10}", 'current')
-        
-        print_log("-" * 100, 'current')
+        if task_results.get('regression'):
+            self._print_regression_summary()
 
-    def _print_survival_summary_detailed(self, all_metrics: Dict[str, float], results: List[Dict]) -> None:
-        """Print survival metrics summary by category."""
-        print_log("\nSURVIVAL ANALYSIS RESULTS:", 'current')
-        print_log("-" * 90, 'current')
-        print_log(f"{'Category':<20} {'C-Index':<12} {'IBS':<12} {'Time-AUC':<12} {'Count':<10}", 'current')
-        print_log("-" * 90, 'current')
-        
-        category_counts = defaultdict(int)
-        for result in results:
-            category_counts[result.get('category', 'Survival')] += 1
-        
-        # Extract categories directly from metric keys, excluding overall
-        categories_with_metrics = {}
-        for key, value in all_metrics.items():
-            if key.startswith('eval/surv_') and not key.startswith('eval/surv_overall_') and key.endswith('_c_index'):
-                # Extract category from key like 'eval/surv_survival_os_c_index' -> 'survival_os'
-                cat_part = key.replace('eval/surv_', '').replace('_c_index', '')
-                categories_with_metrics[cat_part] = True
-        
-        # Print per-category results
-        for cat_part in sorted(categories_with_metrics.keys()):
-            original_cat = self._find_original_category(cat_part, category_counts.keys()) or cat_part.replace('_', ' ').title()
-            metrics = self._get_survival_metrics(all_metrics, cat_part)
-            count = category_counts.get(original_cat, 0)
-            
-            print_log(f"{original_cat:<20} {metrics['c_index']:<12.4f} {metrics['ibs']:<12.4f} "
-                     f"{metrics['auc']:<12.4f} {count:<10}", 'current')
-        
-        # Print overall summary
-        if any(k.startswith('eval/surv_overall_') for k in all_metrics):
-            overall = self._get_survival_metrics(all_metrics, 'overall')
-            total_count = sum(category_counts.values())
-            print_log("-" * 90, 'current')
-            print_log(f"{'OVERALL':<20} {overall['c_index']:<12.4f} {overall['ibs']:<12.4f} "
-                     f"{overall['auc']:<12.4f} {total_count:<10}", 'current')
-        
-        print_log("-" * 90, 'current')
+        if task_results.get('survival'):
+            self._print_survival_summary_with_projects(all_metrics, task_results['survival'])
 
-    def _find_original_category(self, cat_part: str, category_names) -> Optional[str]:
-        """Find original category name from safe category part."""
-        cat_part_lower = cat_part.lower()
-        
-        for cat in category_names:
-            # Exact match after normalization
-            safe_cat = cat.lower().replace(' ', '_').replace('/', '_')
-            if safe_cat == cat_part_lower:
-                return cat
-                
-            # Try removing common prefixes/suffixes for partial matching
-            # For example: "Survival OS" -> "survival_os", but metric might be "survival_os" or just "os"
-            if cat_part_lower in safe_cat or safe_cat in cat_part_lower:
-                return cat
-                
-        return None
+        print_log("=" * 120, 'current')
 
-    def _extract_categories_from_metrics(self, all_metrics: Dict[str, float], prefix: str, 
-                                       exclude_prefix: str, metric_offset: int = -1) -> set:
-        """Extract category parts from metric keys."""
-        categories = set()
-        for key in all_metrics.keys():
-            if key.startswith(prefix) and not key.startswith(exclude_prefix):
-                parts = key.split('_')
-                if len(parts) >= 3:
-                    # Extract everything between prefix and metric name
-                    # For 'eval/reg_hrd_regression_rmse', we want 'hrd_regression'
-                    # For 'eval/surv_survival_os_c_index', we want 'survival_os'  
-                    if metric_offset == -1:
-                        # Default: take everything except the last part (metric name)
-                        cat_part = '_'.join(parts[2:-1])
-                    elif metric_offset == -2:
-                        # For survival: take everything except last 2 parts (compound metric names)
-                        cat_part = '_'.join(parts[2:-2])
-                    else:
-                        cat_part = '_'.join(parts[2:metric_offset])
-                    
-                    if cat_part:  # Only add non-empty categories
-                        categories.add(cat_part)
-        return categories
-
-    def _get_regression_metrics(self, all_metrics: Dict[str, float], cat_part: str) -> Dict[str, float]:
-        """Get regression metrics for a specific category."""
-        prefix = f'eval/reg_{cat_part}_' if cat_part != 'overall' else 'eval/reg_overall_'
-        return {
-            'rmse': all_metrics.get(f'{prefix}rmse', 0.0),
-            'mae': all_metrics.get(f'{prefix}mae', 0.0),
-            'r2': all_metrics.get(f'{prefix}r2', 0.0),
-            'pearson': all_metrics.get(f'{prefix}pearson', 0.0),
-            'spearman': all_metrics.get(f'{prefix}spearman', 0.0)
-        }
-
-    def _get_survival_metrics(self, all_metrics: Dict[str, float], cat_part: str) -> Dict[str, float]:
-        """Get survival metrics for a specific category."""
-        prefix = f'eval/surv_{cat_part}_' if cat_part != 'overall' else 'eval/surv_overall_'
-        return {
-            'c_index': all_metrics.get(f'{prefix}c_index', 0.0),
-            'ibs': all_metrics.get(f'{prefix}integrated_brier_score', 0.0),
-            'auc': all_metrics.get(f'{prefix}time_dependent_auc', 0.0)
-        }
-
-    def _print_survival_summary(self) -> None:
-        """Print survival metrics in table format (legacy method)."""
-        if not hasattr(self, '_survival_metrics') or not self._survival_metrics:
+    def _print_text_summary(self) -> None:
+        """Print text generation metrics per category."""
+        table = getattr(self, '_text_metrics_table', None)
+        if not table:
             return
+
+        print_log("\nFREE-TEXT GENERATION RESULTS (Per Category):", 'current')
+        print_log("-" * 120, 'current')
+        print_log(
+            f"{'Category':<25} {'BLEU-4':<12} {'ROUGE-L':<12} "
+            f"{'Diag BLEU-4':<12} {'Diag ROUGE-L':<15} {'Diag Acc':<12} {'Count':<10}",
+            'current'
+        )
+        print_log("-" * 120, 'current')
+
+        for row in table:
+            metrics = row.get('metrics', {})
+            count = row.get('count', 0)
+            category = row.get('category', 'Uncategorized')
+
+            print_log(
+                f"{category:<25} "
+                f"{metrics.get('full_BLEU-4', 0.0):<12.4f} "
+                f"{metrics.get('full_ROUGE-L', 0.0):<12.4f} "
+                f"{metrics.get('diag_BLEU-4', 0.0):<12.4f} "
+                f"{metrics.get('diag_ROUGE-L', 0.0):<15.4f} "
+                f"{metrics.get('diag_accuracy', 0.0):<12.4f} "
+                f"{count:<10}",
+                'current'
+            )
+
+        print_log("-" * 120, 'current')
+
+    def _print_mcqa_summary(self) -> None:
+        """Print MCQA balanced accuracy metrics per category."""
+        table = getattr(self, '_mcqa_metrics_table', None)
+        if not table:
+            return
+
+        print_log("\nMULTI-CHOICE QA RESULTS (Per Category):", 'current')
+        print_log("-" * 80, 'current')
+        print_log(f"{'Category':<30} {'Balanced Acc':<15} {'Count':<10}", 'current')
+        print_log("-" * 80, 'current')
+
+        for row in table:
+            bacc = row.get('metrics', {}).get('balanced_accuracy', 0.0)
+            count = row.get('count', 0)
+            category = row.get('category', 'Unknown')
+            print_log(f"{category:<30} {bacc:<15.4f} {count:<10}", 'current')
+
+        print_log("-" * 80, 'current')
+
+    def _print_regression_summary(self) -> None:
+        """Print regression metrics per category."""
+        table = getattr(self, '_regression_metrics_table', None)
+        if not table:
+            return
+
+        print_log("\nREGRESSION RESULTS (Per Category):", 'current')
+        print_log("-" * 120, 'current')
+        print_log(f"{'Category':<25} {'RMSE':<12} {'MAE':<12} {'R²':<12} "
+                  f"{'Pearson':<12} {'Spearman':<12} {'Count':<10}", 'current')
+        print_log("-" * 120, 'current')
+
+        for row in table:
+            metrics = row.get('metrics', {})
+            count = row.get('count', 0)
+            category = row.get('category', 'Regression')
+
+            print_log(
+                f"{category:<25} "
+                f"{metrics.get('rmse', 0.0):<12.4f} "
+                f"{metrics.get('mae', 0.0):<12.4f} "
+                f"{metrics.get('r2', 0.0):<12.4f} "
+                f"{metrics.get('pearson', 0.0):<12.4f} "
+                f"{metrics.get('spearman', 0.0):<12.4f} "
+                f"{count:<10}",
+                'current'
+            )
+
+        print_log("-" * 120, 'current')
+
+    def _print_survival_summary_with_projects(self, all_metrics: Dict[str, float], results: List[Dict]) -> None:
+        """Print survival metrics summary per category for each project and overall."""
+        print_log("\nSURVIVAL ANALYSIS RESULTS (Per Project & Category):", 'current')
+        print_log("-" * 100, 'current')
+        print_log(f"{'Project':<25} {'Category':<25} {'C-Index':<15} {'Count':<10}", 'current')
+        print_log("-" * 100, 'current')
+        
+        # Count samples per project and category
+        project_category_counts = defaultdict(lambda: defaultdict(int))
+        
+        for result in results:
+            project = result.get('project', 'Unknown')
+            category = result.get('category', 'Unknown')
+            project_category_counts[project][category] += 1
+        
+        # Group metrics by project and category
+        project_metrics = defaultdict(dict)
+        for key, value in all_metrics.items():
+            if key.startswith('eval/surv_') and not key.startswith('eval/surv_overall_'):
+                # Parse key: 'eval/surv_TCGA_CESC_survival_os_c_index'
+                remainder = key.replace('eval/surv_', '')
+                
+                if not remainder.endswith('_c_index'):
+                    continue
+                    
+                # Remove _c_index suffix
+                prefix = remainder.replace('_c_index', '')
+                
+                # Find matching project by reconstructing project name from parts
+                for proj in project_category_counts.keys():
+                    safe_proj = proj.replace('-', '_').replace(' ', '_')
+                    
+                    # Check if prefix starts with this project
+                    if prefix.startswith(safe_proj + '_'):
+                        # This is a category metric
+                        category_part = prefix[len(safe_proj)+1:]
+                        project_metrics[proj][category_part] = value
+                        break
+        
+        # Print per-project per-category results
+        for project in sorted(project_category_counts.keys()):
+            metrics = project_metrics.get(project, {})
             
-        print_log("\nSURVIVAL ANALYSIS RESULTS:", 'current')
-        print_log("-" * 60, 'current')
-        print_log(f"{'Metric':<25} {'Value':<15}", 'current')
-        print_log("-" * 60, 'current')
+            # Print per-category C-index for this project
+            for cat_safe in sorted(metrics.keys()):
+                c_index = metrics[cat_safe]
+                
+                # Find original category name
+                original_cat = None
+                for cat in project_category_counts[project].keys():
+                    if self._make_safe_key(cat) == cat_safe:
+                        original_cat = cat
+                        break
+                
+                if original_cat is None:
+                    original_cat = cat_safe.replace('_', ' ').title()
+                
+                count = project_category_counts[project].get(original_cat, 0)
+                print_log(f"{project:<25} {original_cat:<25} {c_index:<15.4f} {count:<10}", 'current')
         
-        metric_names = {
-            'c_index': 'C-Index',
-            'integrated_brier_score': 'Integrated Brier Score', 
-            'time_dependent_auc': 'Time-dependent AUC'
-        }
+        # Print cross-project overall metrics per category
+        print_log("-" * 100, 'current')
+        print_log("CROSS-PROJECT OVERALL (Per Category):", 'current')
+        print_log("-" * 100, 'current')
         
-        for key, name in metric_names.items():
-            if key in self._survival_metrics:
-                value = self._survival_metrics[key]
-                if isinstance(value, float):
-                    print_log(f"{name:<25} {value:<15.4f}", 'current')
-                else:
-                    print_log(f"{name:<25} {value:<15}", 'current')
-        print_log("-" * 60, 'current')
+        # Collect overall metrics per category
+        overall_category_metrics = {}
+        overall_category_counts = defaultdict(int)
+        
+        for key, value in all_metrics.items():
+            if key.startswith('eval/surv_overall_') and key.endswith('_c_index'):
+                category_part = key.replace('eval/surv_overall_', '').replace('_c_index', '')
+                overall_category_metrics[category_part] = value
+                
+                # Count total samples for this category across all projects
+                for project, cats in project_category_counts.items():
+                    for cat, count in cats.items():
+                        if self._make_safe_key(cat) == category_part:
+                            overall_category_counts[category_part] += count
+        
+        # Print overall category metrics
+        for cat_safe in sorted(overall_category_metrics.keys()):
+            c_index = overall_category_metrics[cat_safe]
+            count = overall_category_counts[cat_safe]
+            
+            # Try to find original category name
+            original_cat = None
+            for project, cats in project_category_counts.items():
+                for cat in cats.keys():
+                    if self._make_safe_key(cat) == cat_safe:
+                        original_cat = cat
+                        break
+                if original_cat:
+                    break
+            
+            if original_cat is None:
+                original_cat = cat_safe.replace('_', ' ').title()
+            
+            print_log(f"{'All Projects':<25} {original_cat:<25} {c_index:<15.4f} {count:<10}", 'current')
+        
+        print_log("-" * 100, 'current')
 
 
 class SurvivalMetrics:
-    """Survival analysis metrics: C-index, Integrated Brier Score, time-dependent AUC."""
+    """Survival analysis metric utilities (C-index only)."""
     
     def __init__(self, time_intervals: np.ndarray):
         """Initialize with time interval boundaries (len = n+1)."""
         self.time_intervals = time_intervals
-        self.interval_midpoints = (time_intervals[:-1] + time_intervals[1:]) / 2
         # Use right endpoints to ensure all times are within bounds
         self.interval_endpoints = time_intervals[1:]
-        # Optional training data for IPCW estimation in IBS calculation
-        self._train_event_times: Optional[np.ndarray] = None
-        self._train_event_indicators: Optional[np.ndarray] = None
 
-    def set_training_data(self, event_times: np.ndarray, event_indicators: np.ndarray) -> None:
-        """Set training data for IPCW estimation in IBS calculation."""
-        self._train_event_times = np.asarray(event_times, dtype=float)
-        self._train_event_indicators = np.asarray(event_indicators, dtype=float)
-
-    def load_training_data_from_json(self, path: str) -> int:
-        """Load survival samples from JSON file and set as training data.
-        
-        Returns:
-            Number of loaded samples.
-        """
-        import json
-        
-        with open(path, 'r', encoding='utf-8') as f:
-            samples = json.load(f)
-
-        event_times, event_indicators = [], []
-        n_intervals = len(self.interval_endpoints)
-
-        for sample in samples:
-            category = sample.get('category', '')
-            if not category.startswith('Survival'):
-                continue
-            
-            survival_targets = sample.get('survival_targets')
-            if not survival_targets:
-                continue
-                
-            target_y = list(survival_targets.get('target_y', []))
-            at_risk_mask = list(survival_targets.get('at_risk_mask', []))
-            
-            if len(target_y) != n_intervals or len(at_risk_mask) != n_intervals:
-                continue
-            
-            # Determine event time and indicator
-            if any(v == 1 for v in target_y):
-                k = target_y.index(1)
-                event = 1.0
-            else:
-                at_risk_indices = [i for i, v in enumerate(at_risk_mask) if v == 1]
-                k = max(at_risk_indices) if at_risk_indices else 0
-                event = 0.0
-            
-            k = min(k, n_intervals - 1)
-            time = float(self.interval_endpoints[k])
-            event_times.append(time)
-            event_indicators.append(event)
-
-        if event_times:
-            self.set_training_data(np.array(event_times), np.array(event_indicators))
-        
-        return len(event_times)
-    
     def compute_concordance_index(self,
                                   risk_scores: np.ndarray,
                                   event_times: np.ndarray,
@@ -1024,142 +1203,14 @@ class SurvivalMetrics:
         # lifelines interprets smaller values as higher risk -> negate scores
         return float(concordance_index(event_times, -risk_scores, event_indicators))
     
-    def compute_integrated_brier_score(self,
-                                        survival_probs: np.ndarray,
-                                        event_times: np.ndarray,
-                                        event_indicators: np.ndarray,
-                                        max_time: Optional[float] = None) -> float:
-        """Integrated Brier Score (IBS) using sksurv.
-
-        - Aligns predicted survival probability grid to interval endpoints or
-          midpoints; interpolates if necessary.
-        - Uses only evaluation times strictly within follow-up (< max observed time)
-          and optionally <= max_time.
-        - Returns NaN if no events or no valid evaluation times.
-        """
-        try:
-            from sksurv.metrics import integrated_brier_score
-            from sksurv.util import Surv
-            import warnings
-        except ImportError:
-            return float('nan')
-
-        # Test (evaluation) data
-        y_test = Surv.from_arrays(event_indicators.astype(bool), event_times)
-        if not y_test['event'].any():  # no events -> IBS undefined
-            return float('nan')
-
-        # Training (reference) data for IPCW; fallback to test set if not provided
-        if self._train_event_times is not None and self._train_event_indicators is not None:
-            y_train = Surv.from_arrays(self._train_event_indicators.astype(bool), self._train_event_times)
-            # If training set has no events, fallback gracefully
-            if not y_train['event'].any():
-                y_train = y_test
-        else:
-            y_train = y_test
-
-        n_times_pred = survival_probs.shape[1]
-        # Prefer endpoints (right boundaries), fallback to midpoints; else interpolate to endpoints
-        candidate_grids = [self.interval_endpoints, self.interval_midpoints]
-        eval_times = None
-        for grid in candidate_grids:
-            if len(grid) == n_times_pred:
-                eval_times = grid
-                break
-        if eval_times is None:  # interpolate to endpoints
-            target = self.interval_endpoints
-            orig_x = np.linspace(0, 1, n_times_pred)
-            new_x = np.linspace(0, 1, len(target))
-            survival_probs = np.vstack([np.interp(new_x, orig_x, row) for row in survival_probs])
-            eval_times = target
-
-        max_follow_up = float(np.max(event_times))  # right-open upper bound
-        mask = eval_times < max_follow_up
-        if max_time is not None:
-            mask &= (eval_times <= max_time)
-        if not mask.any():
-            return float('nan')
-        eval_times = eval_times[mask]
-        survival_probs = survival_probs[:, mask]
-        if eval_times.size == 0:
-            return float('nan')
-
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            # Correct usage: first argument = reference (training) data, second = evaluation (test) data
-            try:
-                ibs = integrated_brier_score(y_train, y_test, survival_probs, eval_times)
-            except Exception:
-                # Fallback: clip eval_times to strictly inside (min_evt, max_evt) if possible
-                evt_times = y_test['time'][y_test['event']]
-                if len(evt_times) == 0:
-                    return float('nan')
-                lo, hi = float(np.min(evt_times)), float(np.max(evt_times))
-                tight_mask = (eval_times > lo) & (eval_times < hi)
-                if tight_mask.any():
-                    et2 = eval_times[tight_mask]
-                    sp2 = survival_probs[:, tight_mask]
-                    try:
-                        ibs = integrated_brier_score(y_train, y_test, sp2, et2)
-                    except Exception:
-                        return float('nan')
-                else:
-                    return float('nan')
-        return float(ibs)
-
-    def compute_time_dependent_auc(self,
-                                   risk_scores: np.ndarray,
-                                   event_times: np.ndarray,
-                                   event_indicators: np.ndarray,
-                                   prediction_time: float) -> float:
-        """Time-dependent AUC at a single prediction_time (sksurv)."""
-        try:
-            from sksurv.metrics import cumulative_dynamic_auc
-            from sksurv.util import Surv
-            import warnings
-        except ImportError:
-            return float('nan')
-
-        y = Surv.from_arrays(event_indicators.astype(bool), event_times)
-        if not y['event'].any():
-            return float('nan')
-        event_times_only = y['time'][y['event']]
-        first_evt = event_times_only.min()
-        last_evt = event_times_only.max()
-        if not (first_evt <= prediction_time < last_evt):
-            return float('nan')
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            auc, _ = cumulative_dynamic_auc(y, y, risk_scores, [prediction_time])
-        return float(auc[0])
-    
     def compute_all_metrics(self,
-                          survival_probs: np.ndarray,
+                          _survival_probs: np.ndarray,
                           risk_scores: np.ndarray, 
                           event_times: np.ndarray,
                           event_indicators: np.ndarray) -> Dict[str, float]:
-        """
-        Compute all survival metrics.
-        
-        Returns:
-            Dictionary of metric names and values
-        """
-        metrics = {}
-        
-        # C-index
-        metrics['c_index'] = self.compute_concordance_index(
-            risk_scores, event_times, event_indicators
-        )
-        
-        # Integrated Brier Score
-        metrics['integrated_brier_score'] = self.compute_integrated_brier_score(
-            survival_probs, event_times, event_indicators
-        )
-        
-        # Time-dependent AUC at median time
-        median_time = np.median(self.time_intervals)
-        metrics['time_dependent_auc'] = self.compute_time_dependent_auc(
-            risk_scores, event_times, event_indicators, median_time
-        )
-        
-        return metrics
+        """Compute survival metrics usable by legacy callers (C-index only)."""
+        return {
+            'c_index': self.compute_concordance_index(
+                risk_scores, event_times, event_indicators
+            )
+        }

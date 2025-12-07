@@ -138,6 +138,9 @@ def masked_collated_fn(instances: Sequence[Dict],
         data_dict['image_file'] = [
             inst.get('image_file', None) for inst in instances
         ]
+        data_dict['project'] = [
+            inst.get('project', None) for inst in instances
+        ]
         # Add mapping from image to sample index
         data_dict['image_batch_indices'] = torch.as_tensor(
             image_batch_indices, dtype=torch.long)

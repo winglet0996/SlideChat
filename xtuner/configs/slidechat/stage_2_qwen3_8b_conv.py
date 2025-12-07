@@ -26,62 +26,62 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'lora'
+setting = 'full_param'
 
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 5e-5  # Reduced from 1e-4 for better stability
+    lr = 1e-4  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    max_epochs = 100
+    max_epochs = 1
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=16,
-        lora_alpha=32,
+        r=64,
+        lora_alpha=64,
         lora_dropout=0.1,
         bias='none',
         task_type='CAUSAL_LM')
-    # save_best_metrics = ['eval/mcqa_overall_accuracy']
+    save_best_metrics = ['eval/surv_all_projects_c_index']
     save_best_metrics = None
-    ckpt_path = '/home/ps/pathology/codes/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment/iter_200.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_multitask/iter_1000.pth'
     # ckpt_path = None
-    lr = 1e-5
+    lr = 2e-5
     freeze_llm = True
-    max_epochs = 100
+    max_epochs = 5
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
     lr = 1e-5
-    save_best_metrics = ['eval/mcqa_overall_accuracy']
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_mcqa_qwen3_8b_conv_alignment_Diagnosis/iter_500.pth'
-    max_epochs = 3
+    save_best_metrics = ['eval/surv_all_projects_c_index']
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment/iter_200.pth'
+    max_epochs = 50
     
 resume = False
 
 # cat = 'Diagnosis'
 
-llm_name_or_path = '/home/ps/pathology/model_weights/model_zoo/Qwen3-4B'
-train_data_path = '/mnt/sda/pathology/codes/project/TCGA/dataset_pp/categorized_json/split_Survival_OS.json'
-val_data_path = '/mnt/sda/pathology/codes/project/TCGA/dataset_pp/categorized_json/split_Survival_OS.json'
-test_data_path = '/mnt/sda/pathology/codes/project/TCGA/dataset_pp/categorized_json/split_Survival_OS.json'
+llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/categorized_json/train/split_Survival_OS.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/categorized_json/test/split_Survival_OS.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/categorized_json/test/split_Survival_OS.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/home/ps/pathology/codes/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}/'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}/'
 vis_name = f'qwen3_8b_conv_{setting}'
 
 val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 200  # More frequent saves for monitoring convergence
-save_total_limit = 5  # Keep more checkpoints for analysis
+save_steps = 1000  # More frequent saves for alignment debugging
+save_total_limit = 3  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 100  # More frequent evaluation for monitoring convergence
+evaluation_freq = 1000  # More frequent evaluation for alignment debugging
 
 image_path_list = None
 
@@ -135,7 +135,7 @@ del _get_latest_valid_deepspeed_checkpoint
 
 max_length = 32768
 max_patch_num = None
-max_new_tokens = 2
+max_new_tokens = 1
 repetition_penalty = 1.0
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
@@ -144,13 +144,13 @@ sample_type='wsi' # 'wsi'or'image'
 # Scheduler & Optimizer
 batch_size = 1  # per_device
 accumulative_counts = 1
-dataloader_num_workers = 0
+dataloader_num_workers = 4
 optim_type = SophiaG
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
-warmup_ratio = 0.05
+warmup_ratio = 0.03
 
 
 SYSTEM = ''
@@ -198,9 +198,9 @@ model = dict(
     enable_survival = True,
     reg_token = '<REG>',
     srv_token = '<SRV>',
-    lambda_llm = 1,  # Reduce language modeling loss for better task learning
-    lambda_reg = 1,  # Increase regression loss weight for better learning
-    lambda_srv = 1,  # Increase survival loss weight for better learning
+    lambda_llm = 1,
+    lambda_reg = 5,
+    lambda_srv = 5,
     )
 
 #######################################################################
@@ -362,18 +362,18 @@ env_cfg = dict(
 
 # set visualizer
 visualizer = None
-# visualizer = dict(
-#     type=Visualizer,
-#     vis_backends=[
-#         dict(
-#             type=WandbVisBackend,
-#             init_kwargs=dict(
-#                 project='pathoverse_multitask_conv',
-#                 name=vis_name
-#             )
-#         )
-#     ]
-# )
+visualizer = dict(
+    type=Visualizer,
+    vis_backends=[
+        dict(
+            type=WandbVisBackend,
+            init_kwargs=dict(
+                project='pathoverse_multitask_conv',
+                name=vis_name
+            )
+        )
+    ]
+)
 
 # set log level
 log_level = 'INFO'

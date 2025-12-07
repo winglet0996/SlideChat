@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 # xtuner/configs/llava/internlm2_chat_7b_clip_vit_large_p14_336/pretrain/llava_internlm2_chat_7b_clip_vit_large_p14_336_e1_gpu8_pretrain.py
 import torch
-from mmengine.dataset import DefaultSampler
+from mmengine.dataset import DefaultSampler, InfiniteSampler
 from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
                             LoggerHook, ParamSchedulerHook)
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
@@ -14,7 +14,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           CLIPVisionModel)
 from peft import LoraConfig
 from xtuner.dataset import LLaVADataset_conv_longnet
-from xtuner.dataset.collate_fns import default_collate_fn, masked_collated_fn
+from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
 from xtuner.engine.hooks import DatasetInfoHook #, EvaluateChatHook_conv_longnet, HFCheckpointHook
 from xtuner.engine.runner import TrainLoop
@@ -26,12 +26,12 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'lora'
+setting = 'full_param'
 
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 1e-4
+    lr = 5e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
     max_epochs = 1
     save_best_metrics = None
@@ -43,11 +43,13 @@ if setting == 'lora':
         lora_dropout=0.1,
         bias='none',
         task_type='CAUSAL_LM')
-    save_best_metrics = ['eval/mcqa_overall_accuracy']
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_mcqa_qwen3_8b_conv_lora/iter_28500.pth'
+    # save_best_metrics = ['eval/mcqa_overall_accuracy']
+    save_best_metrics = None
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment/iter_200.pth'
+    # ckpt_path = None
     lr = 1e-5
     freeze_llm = True
-    max_epochs = 3
+    max_epochs = 5
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -61,20 +63,25 @@ resume = False
 # cat = 'Diagnosis'
 
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
-train_data_path = f'/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage2_mcqa_train.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage2_mcqa_test_eval_800.json'
-test_data_path = f'/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_train_stage2_mcqa_test.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/categorized_json/train/TCGA-CESC/split_Survival_OS.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/categorized_json/test/TCGA-CESC/split_Survival_OS.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/categorized_json/test/TCGA-CESC/split_Survival_OS.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_mcqa_qwen3_8b_conv_{setting}/'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}/'
 vis_name = f'qwen3_8b_conv_{setting}'
 
 val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_results_iter_70000'
+test_output_path = work_dir + 'test_results'
 
-save_first_n_samples = None
+# Save
+save_steps = 200  # More frequent saves for alignment debugging
+save_total_limit = 3  # Keep more checkpoints for analysis
+
+# Evaluate the generation performance during the training
+evaluation_freq = 100  # More frequent evaluation for alignment debugging
 
 image_path_list = None
 
@@ -137,7 +144,7 @@ sample_type='wsi' # 'wsi'or'image'
 # Scheduler & Optimizer
 batch_size = 1  # per_device
 accumulative_counts = 1
-dataloader_num_workers = 8
+dataloader_num_workers = 4
 optim_type = SophiaG
 betas = (0.9, 0.999)
 rho = 0.01
@@ -145,12 +152,7 @@ weight_decay = 1e-1
 max_norm = 1  # grad clip
 warmup_ratio = 0.03
 
-# Save
-save_steps = 500
-save_total_limit = 3  # Maximum checkpoints to keep (-1 means unlimited)
 
-# Evaluate the generation performance during the training
-evaluation_freq = 500
 SYSTEM = ''
 
 #######################################################################
@@ -191,7 +193,14 @@ model = dict(
         # length_penalty=0.5,
         # repetition_penalty=repetition_penalty
     ),
-    llm_lora=llm_lora
+    llm_lora=llm_lora,
+    enable_regression = True,
+    enable_survival = True,
+    reg_token = '<REG>',
+    srv_token = '<SRV>',
+    lambda_llm = 1,
+    lambda_reg = 1,
+    lambda_srv = 1,
     )
 
 #######################################################################
@@ -215,7 +224,7 @@ train_dataloader = dict(
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=train_llava_dataset,
-    sampler=dict(type=DefaultSampler, shuffle=True),
+    sampler=dict(type=InfiniteSampler, shuffle=True),
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
@@ -242,7 +251,6 @@ val_dataloader = dict(
 
 val_evaluator = dict(type=PathologyMetric,
             tokenizer=tokenizer,
-            save_first_n_samples=save_first_n_samples,
             output_dir= val_output_path
             )
 
@@ -271,7 +279,6 @@ test_dataloader = dict(
 
 test_evaluator = dict(type=PathologyMetric,
             tokenizer=tokenizer,
-            save_first_n_samples=save_first_n_samples,
             output_dir=test_output_path
             )
 
@@ -361,7 +368,7 @@ visualizer = None
 #         dict(
 #             type=WandbVisBackend,
 #             init_kwargs=dict(
-#                 project='pathoverse_mcqa_conv',
+#                 project='pathoverse_multitask_conv',
 #                 name=vis_name
 #             )
 #         )

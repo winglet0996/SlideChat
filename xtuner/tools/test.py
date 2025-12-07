@@ -2,10 +2,10 @@
 import argparse
 import os
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 # Set a different port for distributed training to avoid EADDRINUSE error
-if 'MASTER_PORT' not in os.environ:
-    os.environ['MASTER_PORT'] = '29501'
+# if 'MASTER_PORT' not in os.environ:
+    # os.environ['MASTER_PORT'] = '29501'
 import os.path as osp
 from types import FunctionType
 from collections import OrderedDict
@@ -42,8 +42,8 @@ def parse_args():
         help="job launcher",
     )
     args = parser.parse_args()
-    args.config = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py'
-    args.checkpoint = '/mnt/sda/pathology/codes/project/TCGA/train_s2_regression_qwen3_8b_conv_lora/iter_600.pth/mp_rank_00_model_states.pt'
+    # args.config = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py'
+    # args.checkpoint = '/mnt/sda/pathology/codes/project/TCGA/train_s2_regression_qwen3_8b_conv_lora/iter_600.pth/mp_rank_00_model_states.pt'
 
     return args
 

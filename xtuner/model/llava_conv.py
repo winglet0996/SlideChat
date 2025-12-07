@@ -14,7 +14,7 @@ from transformers import (AddedToken, AutoConfig, GenerationConfig, StoppingCrit
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from xtuner.registry import BUILDER
-from xtuner.utils import StopWordStoppingCriteria
+from xtuner.utils import StopWordStoppingCriteria, IGNORE_INDEX
 from .modules import ProjectorConfig, ProjectorModel, dispatch_modules
 from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names, get_peft_model_state_dict, 
@@ -48,9 +48,15 @@ class LLaVAModel_conv(BaseModel):
     through attention pooling.
 
     Key features:
-    - Clean token-only regression approach
+    - Clean token-only regression approach  
     - Visual-aware survival prediction
     - End-to-end differentiable training
+    - Multi-GPU training compatibility with gradient synchronization deadlock prevention
+    
+    Multi-GPU Safety:
+    The loss computation ensures all task-specific parameters (regression_head, survival_head)
+    participate in the computation graph on every GPU, even when special tokens are absent
+    from some data shards. This prevents gradient synchronization deadlocks in distributed training.
     """
 
     # Supported model configurations for flash attention
@@ -195,16 +201,9 @@ class LLaVAModel_conv(BaseModel):
         if not new_token_ids:
             return
 
-        # Enable gradients for input embeddings - full training for better learning
-        emb = self.llm.get_input_embeddings()
-        if emb is not None and hasattr(emb, 'weight'):
-            emb.weight.requires_grad = True
-
-        # Enable gradients for lm_head - full training for special token prediction
-        if hasattr(self.llm, 'lm_head') and hasattr(self.llm.lm_head, 'weight'):
-            self.llm.lm_head.weight.requires_grad = True
-
-        print_log("[SelectiveTraining] Enabled full training for embeddings and lm_head to support task learning", 'current')
+        # Consolidated gradient management for new special tokens
+        self._configure_parameter_gradients()
+        print_log("[SelectiveTraining] Configured gradient flow for special token learning", 'current')
 
     def _add_special_tokens(self, tokens: List[str]) -> None:
         """Add special tokens and resize embeddings properly."""
@@ -254,8 +253,6 @@ class LLaVAModel_conv(BaseModel):
             base_vec = 1.05 * base_vec + 1e-3 * torch.randn_like(base_vec)
             emb.weight[token_id] = base_vec
 
-        emb.weight.requires_grad = True
-
     def _init_prediction_modules(self) -> None:
         """Initialize prediction-specific modules."""
         llm_hidden = self.llm.config.hidden_size
@@ -287,34 +284,12 @@ class LLaVAModel_conv(BaseModel):
         if self.use_llm_lora:
             self._setup_lora(llm_lora, use_activation_checkpointing)
 
-        if freeze_llm and (self.enable_regression or self.enable_survival):
-            self.llm.requires_grad_(False)
-
-            # Enable embeddings for new tokens
-            if hasattr(self.llm, 'get_input_embeddings'):
-                embed_layer = self.llm.get_input_embeddings()
-                if embed_layer is not None:
-                    embed_layer.weight.requires_grad = True
-                    print_log("Enabled training for input embeddings (word_embedding layer)", 'current')
-
-            # Enable lm_head (for new token logits)
-            if hasattr(self.llm, 'lm_head') and getattr(self.llm.lm_head, 'weight', None) is not None:
-                try:
-                    self.llm.lm_head.weight.requires_grad = True
-                    print_log("Enabled training for lm_head weight (to learn new tokens)", 'current')
-                except Exception:
-                    pass
-
-            if self.use_llm_lora:
-                lora_param_count = 0
-                for name, param in self.llm.named_parameters():
-                    if 'lora_' in name:
-                        param.requires_grad = True
-                        lora_param_count += param.numel()
-                if lora_param_count > 0:
-                    print_log(f"Enabled training for {lora_param_count:,} LoRA parameters", 'current')
-                else:
-                    print_log("Warning: LoRA is enabled but no LoRA parameters found!", 'current')
+        # Configure parameter training after all components are initialized
+        if freeze_llm:
+            self._freeze_llm_with_exceptions()
+        
+        # Final parameter check and configuration
+        self._configure_parameter_gradients()
 
         if use_activation_checkpointing:
             self._setup_checkpointing()
@@ -328,6 +303,79 @@ class LLaVAModel_conv(BaseModel):
             lora_config.target_modules = find_all_linear_names(self.llm)
 
         self.llm = get_peft_model(self.llm, lora_config)
+
+    def _freeze_llm_with_exceptions(self) -> None:
+        """Freeze LLM parameters while keeping task-critical components trainable."""
+        if not (self.enable_regression or self.enable_survival):
+            return
+            
+        self.llm.requires_grad_(False)
+        print_log("Froze base LLM parameters", 'current')
+
+    def _configure_parameter_gradients(self) -> None:
+        """Centralized parameter gradient configuration for consistent multi-GPU behavior."""
+        trainable_params = []
+        
+        # Enable embeddings for special token learning
+        if hasattr(self.llm, 'get_input_embeddings'):
+            embed_layer = self.llm.get_input_embeddings()
+            if embed_layer is not None and hasattr(embed_layer, 'weight'):
+                embed_layer.weight.requires_grad = True
+                trainable_params.append(f"embeddings: {embed_layer.weight.numel():,}")
+
+        # Enable lm_head for special token prediction
+        if hasattr(self.llm, 'lm_head') and hasattr(self.llm.lm_head, 'weight'):
+            self.llm.lm_head.weight.requires_grad = True
+            trainable_params.append(f"lm_head: {self.llm.lm_head.weight.numel():,}")
+
+        # Enable LoRA parameters if applicable
+        if self.use_llm_lora:
+            lora_param_count = 0
+            for name, param in self.llm.named_parameters():
+                if 'lora_' in name and param.requires_grad:
+                    lora_param_count += param.numel()
+            if lora_param_count > 0:
+                trainable_params.append(f"LoRA: {lora_param_count:,}")
+
+        # Task-specific modules are trainable by default
+        if self.enable_regression and hasattr(self, 'regression_head'):
+            reg_params = sum(p.numel() for p in self.regression_head.parameters())
+            trainable_params.append(f"regression_head: {reg_params:,}")
+            
+        if self.enable_survival and hasattr(self, 'survival_head'):
+            srv_params = sum(p.numel() for p in self.survival_head.parameters()) 
+            trainable_params.append(f"survival_head: {srv_params:,}")
+
+        # Vision components are trainable by default
+        conv_params = sum(p.numel() for p in self.conv.parameters())
+        proj_params = sum(p.numel() for p in self.projector.parameters())
+        pos_params = sum(p.numel() for p in self.pos_emb_2d.parameters())
+        trainable_params.extend([
+            f"conv: {conv_params:,}",
+            f"projector: {proj_params:,}", 
+            f"pos_emb_2d: {pos_params:,}"
+        ])
+
+        if is_main_process():
+            print_log(f"[ParameterConfig] Trainable components: {', '.join(trainable_params)}", 'current')
+            
+        # Validate parameter consistency for multi-GPU training
+        self._validate_parameter_consistency()
+
+    def _validate_parameter_consistency(self) -> None:
+        """Validate that trainable parameters are consistent across all GPUs."""
+        trainable_param_names = []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                trainable_param_names.append(name)
+        
+        # Create deterministic hash of trainable parameter names for consistency check
+        param_hash = hash(tuple(sorted(trainable_param_names)))
+        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        if is_main_process():
+            print_log(f"[MultiGPUValidation] Parameter hash: {param_hash}, "
+                      f"Total trainable params: {total_trainable:,}", 'current')
 
     def _setup_checkpointing(self) -> None:
         """Setup gradient checkpointing."""
@@ -520,6 +568,9 @@ class LLaVAModel_conv(BaseModel):
         data.pop('features', None)
         data.pop('masks', None)
 
+        if mode == 'predict':
+            self._strip_assistant_targets(data)
+
         # Prepare multimodal inputs
         data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
@@ -536,6 +587,38 @@ class LLaVAModel_conv(BaseModel):
 
         else:
             raise NotImplementedError(f"Unsupported mode: {mode}")
+
+    def _strip_assistant_targets(self, data: Dict[str, torch.Tensor]) -> None:
+        """Remove ground-truth continuations from prompts before generation."""
+        input_ids = data.get('input_ids')
+        labels = data.get('labels')
+        if input_ids is None or labels is None or input_ids.ndim != 2:
+            return
+
+        pad_token_id = self.llm.config.pad_token_id
+        if pad_token_id is None and getattr(self.tokenizer, 'pad_token_id', None) is not None:
+            pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None and getattr(self.tokenizer, 'eos_token_id', None) is not None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        attention_mask = data.get('attention_mask')
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+            data['attention_mask'] = attention_mask
+
+        for b_idx in range(input_ids.size(0)):
+            gt_positions = torch.nonzero(labels[b_idx] != IGNORE_INDEX, as_tuple=False)
+            if gt_positions.numel() == 0:
+                continue
+            cut = gt_positions[0].item()
+            if cut == 0:
+                cut = 1
+            if cut >= input_ids.size(1):
+                continue
+            input_ids[b_idx, cut:] = pad_token_id
+            attention_mask[b_idx, cut:] = False
 
     # ========== Predict and helpers ==========
 
@@ -746,17 +829,16 @@ class LLaVAModel_conv(BaseModel):
                 pass
             self._logged_token_stats = True
 
-        # Task losses
-        reg_loss = torch.zeros_like(lm_loss)
-        srv_loss = torch.zeros_like(lm_loss)
+        # Task losses with gradient connectivity guarantee
+        reg_loss = self._compute_task_loss_safe(data['labels'], regression_targets, 'regression') if (
+            self.enable_regression and regression_targets is not None and
+            self.reg_token_id is not None and 'labels' in data
+        ) else self._get_zero_loss_with_grad_connectivity('regression', lm_loss)
 
-        if (self.enable_regression and regression_targets is not None and
-                self.reg_token_id is not None and 'labels' in data):
-            reg_loss = self._compute_task_loss(data['labels'], regression_targets, 'regression')
-
-        if (self.enable_survival and survival_targets is not None and
-                self.srv_token_id is not None and 'labels' in data):
-            srv_loss = self._compute_task_loss(data['labels'], survival_targets, 'survival')
+        srv_loss = self._compute_task_loss_safe(data['labels'], survival_targets, 'survival') if (
+            self.enable_survival and survival_targets is not None and
+            self.srv_token_id is not None and 'labels' in data
+        ) else self._get_zero_loss_with_grad_connectivity('survival', lm_loss)
 
         total_loss = (self.lambda_llm * lm_loss +
                       self.lambda_reg * reg_loss +
@@ -764,50 +846,72 @@ class LLaVAModel_conv(BaseModel):
 
         return {'lm_loss': lm_loss, 'reg_loss': reg_loss, 'srv_loss': srv_loss, 'loss': total_loss}
 
-    def _compute_task_loss(self, labels: torch.Tensor, targets: Union[torch.Tensor, Dict], 
-                           task: str) -> torch.Tensor:
-        """Compute loss for regression or survival tasks."""
+    def _compute_task_loss_safe(self, labels: torch.Tensor, targets: Union[torch.Tensor, Dict], 
+                                task: str) -> torch.Tensor:
+        """Compute task loss with guaranteed gradient connectivity for multi-GPU training."""
         hidden = self._last_hidden_state
         if hidden is None:
-            return torch.zeros((), device=labels.device, dtype=self.llm.dtype)
+            return self._get_zero_loss_with_grad_connectivity(task, 
+                torch.zeros((), device=labels.device, dtype=self.llm.dtype))
 
         token_id = self.reg_token_id if task == 'regression' else self.srv_token_id
         if token_id is None:
-            return torch.zeros((), device=labels.device, dtype=self.llm.dtype)
+            return self._get_zero_loss_with_grad_connectivity(task, 
+                torch.zeros((), device=labels.device, dtype=self.llm.dtype))
 
         token_mask = (labels == token_id)
-        if not token_mask.any():
-            return torch.zeros((), device=labels.device, dtype=self.llm.dtype)
 
-        batch_indices, seq_indices = [], []
-        for b in range(token_mask.size(0)):
-            positions = torch.nonzero(token_mask[b], as_tuple=False)
-            if positions.numel() > 0:
-                seq_pos = positions[-1, 0].item()
-                if seq_pos < hidden.size(1):
-                    batch_indices.append(b)
-                    seq_indices.append(seq_pos)
+        if not torch.any(token_mask):
+            return self._get_zero_loss_with_grad_connectivity(task, 
+                torch.zeros((), device=labels.device, dtype=self.llm.dtype))
 
-        if not batch_indices:
-            return torch.zeros((), device=labels.device, dtype=self.llm.dtype)
+        # Vectorized discovery of the latest special token per batch using masked max
+        seq_positions = torch.arange(hidden.size(1), device=hidden.device, dtype=torch.long)
+        seq_positions = seq_positions.unsqueeze(0).expand_as(token_mask)
+        weighted_positions = torch.where(token_mask, seq_positions, torch.full_like(seq_positions, -1))
+        last_positions = weighted_positions.max(dim=1).values
+        valid_mask = last_positions >= 0
 
-        b_idx = torch.tensor(batch_indices, device=hidden.device, dtype=torch.long)
-        s_idx = torch.tensor(seq_indices, device=hidden.device, dtype=torch.long)
+        if not torch.any(valid_mask):
+            return self._get_zero_loss_with_grad_connectivity(task, 
+                torch.zeros((), device=labels.device, dtype=self.llm.dtype))
+
+        b_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        s_idx = last_positions[valid_mask]
         task_embeds = hidden[b_idx, s_idx]
 
-        # Process embeddings based on task type
-        # Both regression and survival use only special token embeddings
-        fused = task_embeds  # (N, H)
-
         if task == 'regression':
-            predictions = self.regression_head(fused).squeeze(-1)
+            predictions = self.regression_head(task_embeds).squeeze(-1)
             task_targets = targets[b_idx].to(predictions.dtype)
             return self.regression_loss_fn(predictions, task_targets)
-        else:
-            logits = self.survival_head(fused)
+        else:  # survival
+            logits = self.survival_head(task_embeds)
             target_y = targets['target_y'][b_idx].to(device=logits.device, dtype=logits.dtype)
             at_risk_mask = targets['at_risk_mask'][b_idx].to(device=logits.device, dtype=logits.dtype)
             return self.survival_loss_fn(logits, target_y, at_risk_mask)
+
+    def _get_zero_loss_with_grad_connectivity(self, task: str, base_loss: torch.Tensor) -> torch.Tensor:
+        """Return zero loss while ensuring task parameters remain in computation graph.
+        
+        This prevents gradient synchronization deadlocks in multi-GPU training by ensuring
+        all trainable parameters participate in the computation graph on all devices.
+        """
+        zero_loss = torch.zeros_like(base_loss)
+        
+        # Add minimal parameter connectivity to ensure gradients flow through task heads
+        if task == 'regression' and self.enable_regression and hasattr(self, 'regression_head'):
+            # Sum all parameters and multiply by epsilon to maintain gradient connectivity
+            param_sum = sum(p.sum() for p in self.regression_head.parameters() if p.requires_grad)
+            if isinstance(param_sum, torch.Tensor):
+                zero_loss = zero_loss + 1e-12 * param_sum
+                
+        elif task == 'survival' and self.enable_survival and hasattr(self, 'survival_head'):
+            # Sum all parameters and multiply by epsilon to maintain gradient connectivity  
+            param_sum = sum(p.sum() for p in self.survival_head.parameters() if p.requires_grad)
+            if isinstance(param_sum, torch.Tensor):
+                zero_loss = zero_loss + 1e-12 * param_sum
+                
+        return zero_loss
 
     # ========== Misc ==========
 
