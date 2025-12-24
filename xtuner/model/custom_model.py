@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 from transformers import InstructBlipQFormerConfig
 from transformers.models.instructblip.modeling_instructblip import InstructBlipQFormerEncoder
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterable, Literal
 
 class PartialConv2d(nn.Conv2d):
     """
@@ -20,10 +20,10 @@ class PartialConv2d(nn.Conv2d):
 
         if self.multi_channel:
             weight_maskUpdater = torch.ones(self.out_channels, self.in_channels, self.kernel_size[0], self.kernel_size[1])
+            self.slide_winsize = (self.in_channels // self.groups) * self.kernel_size[0] * self.kernel_size[1]
         else:
             weight_maskUpdater = torch.ones(1, 1, self.kernel_size[0], self.kernel_size[1])
-        
-        self.slide_winsize = (self.in_channels // self.groups) * self.kernel_size[0] * self.kernel_size[1]
+            self.slide_winsize = self.kernel_size[0] * self.kernel_size[1]
         
         self.register_buffer('updater_buf', weight_maskUpdater) # Use a buffer
 
@@ -232,7 +232,7 @@ class HighResPartialConvNeXt(nn.Module):
             mask (torch.Tensor, optional): Input mask of shape (N, 1, H, W). Defaults to all ones.
         
         Returns:
-            (torch.Tensor, torch.Tensor): A tuple of (output_feature, output_mask).
+            (List[torch.Tensor], torch.Tensor): A list of stage outputs and the final mask.
         """
         if mask is None:
             mask = torch.ones(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
@@ -240,17 +240,20 @@ class HighResPartialConvNeXt(nn.Module):
         if self.input_proj is not None:
             x, mask = self.input_proj(x, mask)
 
+        stage_outputs = []
         # Iterate through stages and downsampling layers
         for i, stage in enumerate(self.stages):
             for block in stage:
                 x, mask = block(x, mask)
             
+            stage_outputs.append(x)
+
             if i < len(self.downsample_layers):
                 # Apply downsampling
                 x = self.downsample_layers[i][0](x) # LayerNorm
                 x, mask = self.downsample_layers[i][1](x, mask) # PartialConv
 
-        return x, mask
+        return stage_outputs, mask
     
 class RotaryEmbedding2D(nn.Module):
     """
@@ -693,171 +696,195 @@ class RegressionHead(nn.Module):
 
 class SurvivalHead(nn.Module):
     """
-    Head for survival prediction using discrete-time logistic hazard model.
-    
-    The model outputs K hazard probabilities for K time intervals.
-    Each hazard h_k represents P(event in interval k | survived to interval k).
+    Discrete-time logistic hazard survival head.
+
+    - Model outputs K logits -> hazards h_k = P(event in interval k | survived to start of k)
+    - Interval boundaries are given by time_intervals = [t0, t1, ..., tK]  (length K+1)
+    - Survival at end of interval k: S(t_k) = Π_{j<=k} (1 - h_j)
+
+    Risk scores:
+      - "nll_final":  -log S(t_K)  (your original)
+      - "rmst":       -RMST(t_K) where RMST ≈ Σ_k S(t_{k-1}) * (t_k - t_{k-1})
+                      (dt-weighted; recommended for non-uniform bins)
     """
-    
-    def __init__(self, in_dim: int, hidden_dim: int, num_intervals: int = 6, time_intervals: torch.Tensor = [0, 1, 2, 3, 5, 7, 10]):
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        time_intervals: Iterable[float] = (0, 1, 2, 3, 5, 7, 10),
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.num_intervals = num_intervals
-        self.time_intervals = time_intervals
+
+        t = torch.as_tensor(list(time_intervals), dtype=torch.float32)
+        if t.ndim != 1 or t.numel() < 2:
+            raise ValueError("time_intervals must be 1D with length >= 2 (boundaries).")
+        if not torch.all(t[1:] > t[:-1]):
+            raise ValueError("time_intervals must be strictly increasing.")
+
+        # registered buffer => moves with model.to(device), saved in state_dict
+        self.register_buffer("time_intervals", t)
+        self.num_intervals = int(t.numel() - 1)  # K
+
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            # nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, num_intervals),  # Output logits for each interval
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.num_intervals),  # (N, K) logits
         )
-        
-        # Better initialization
         self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize weights with improved scheme for survival prediction."""
-        for module in self.mlp.modules():
-            if isinstance(module, nn.Linear):
-                # Use Xavier/Glorot initialization with small gain for stable training
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.constant_(module.bias, 0.0)
-                nn.init.constant_(module.weight, 1.0)
+
+    def _init_weights(self) -> None:
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input features (N, in_dim)
-        Returns:
-            logits: Survival logits for each interval (N, num_intervals)
-        """
+        """Return per-interval logits. Shape: (N, K)."""
         return self.mlp(x)
-    
+
+    @torch.no_grad()
+    def predict_hazards(self, x: torch.Tensor) -> torch.Tensor:
+        """Return hazards h_k in (0,1). Shape: (N, K)."""
+        return torch.sigmoid(self.forward(x))
+
+    def _hazards_and_survival_end(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          hazards: (N, K)
+          S_end:   (N, K) = [S(t1), ..., S(tK)]
+        """
+        hazards = torch.sigmoid(self.forward(x))         # (N, K)
+        S_end = torch.cumprod(1.0 - hazards, dim=1)      # (N, K)
+        return hazards, S_end
+
+    @torch.no_grad()
     def predict_survival_probs(self, x: torch.Tensor) -> torch.Tensor:
+        """Survival at end of each interval: (N, K) = [S(t1), ..., S(tK)]."""
+        _, S_end = self._hazards_and_survival_end(x)
+        return S_end
+
+    @torch.no_grad()
+    def predict_risk_scores(
+        self,
+        x: torch.Tensor,
+        mode: Literal["rmst", "nll_final"] = "rmst",
+    ) -> torch.Tensor:
         """
-        Predict survival probabilities for each time interval.
-        
-        Args:
-            x: Input features (N, in_dim)
-        Returns:
-            survival_probs: Survival probability at end of each interval (N, num_intervals)
+        Return risk scores (N,), where larger means higher risk.
+
+        mode="rmst":
+          RMST(t_K) ≈ Σ_k S(t_{k-1}) * Δt_k,  risk = -RMST
+        mode="nll_final":
+          risk = -log S(t_K)
         """
-        logits = self.forward(x)
-        hazards = torch.sigmoid(logits)  # (N, K) hazard probabilities
-        
-        # Survival probability: S(t_k) = ∏_{j=1}^k (1 - h_j)
-        survival_probs = torch.cumprod(1 - hazards, dim=1)  # (N, K)
-        return survival_probs
-    
-    def predict_risk_scores(self, x: torch.Tensor) -> torch.Tensor:
+        hazards, S_end = self._hazards_and_survival_end(x)
+
+        if mode == "nll_final":
+            final_survival = S_end[:, -1]
+            return -torch.log(final_survival + EPS)
+
+        if mode == "rmst":
+            # dt: (K,)
+            dt = (self.time_intervals[1:] - self.time_intervals[:-1]).to(
+                device=S_end.device, dtype=S_end.dtype
+            )
+
+            # S_start: (N,K) = [S(t0)=1, S(t1), ..., S(t_{K-1})]
+            S_start = torch.cat(
+                [
+                    torch.ones(S_end.size(0), 1, device=S_end.device, dtype=S_end.dtype),
+                    S_end[:, :-1],
+                ],
+                dim=1,
+            )
+
+            rmst = (S_start * dt).sum(dim=1)  # (N,)
+            return -rmst
+
+        raise ValueError(f"Unknown mode: {mode}")
+
+    @torch.no_grad()
+    def predict_median_survival_time(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Predict risk scores (higher = higher risk).
-        
-        Args:
-            x: Input features (N, in_dim)
-        Returns:
-            risk_scores: Risk scores (N,)
+        Predict a (coarse) median survival time per sample:
+        returns the first boundary time t_k where S(t_k) < 0.5,
+        otherwise returns the last boundary t_K.
+
+        Shape: (N,)
         """
-        survival_probs = self.predict_survival_probs(x)
-        # Use negative log survival probability at final interval as risk score
-        final_survival = survival_probs[:, -1]
-        risk_scores = -torch.log(final_survival + EPS)
-        return risk_scores
-    
-    def predict_median_survival_time(self, x: torch.Tensor, 
-                                   time_intervals: torch.Tensor) -> torch.Tensor:
-        """
-        Predict median survival time for each sample.
-        
-        Args:
-            x: Input features (N, in_dim)
-            time_intervals: Time points for each interval (K,)
-        Returns:
-            median_times: Predicted median survival times (N,)
-        """
-        survival_probs = self.predict_survival_probs(x)  # (N, K)
-        
-        # Find first interval where survival probability drops below 0.5
-        below_half = survival_probs < 0.5
-        first_below = torch.argmax(below_half.float(), dim=1)
-        
-        # Handle cases where survival never drops below 0.5
-        never_below = ~below_half.any(dim=1)
-        first_below[never_below] = len(time_intervals) - 1
-        
-        median_times = time_intervals[first_below]
-        median_times = torch.as_tensor(median_times)
+        S_end = self.predict_survival_probs(x)          # (N, K)
+        below = S_end < 0.5                             # (N, K)
+        first_idx = torch.argmax(below.to(torch.int64), dim=1)  # (N,)
+
+        never = ~below.any(dim=1)                       # (N,)
+        first_idx = torch.where(
+            never,
+            torch.full_like(first_idx, self.num_intervals - 1),
+            first_idx,
+        )
+
+        # median time is the *end* boundary of that interval => t_{k+1}
+        # boundaries length is K+1, S_end index k corresponds to t_{k+1}
+        median_times = self.time_intervals[1:][first_idx]  # (N,)
         return median_times
 
 
-def logistic_hazard_loss(logits: torch.Tensor,
-                         target_y: torch.Tensor,
-                         at_risk_mask: torch.Tensor) -> torch.Tensor:
+def logistic_hazard_loss(
+    logits: torch.Tensor,
+    target_y: torch.Tensor,
+    at_risk_mask: torch.Tensor,
+) -> torch.Tensor:
     """
-    Compute logistic hazard loss for discrete-time survival prediction.
-    
-    For each individual:
-    - If event occurs in interval m: y_ij=0 for j<m, y_im=1 for j=m, mask=0 for j>m
-    - If censored in interval c: y_ij=0 for j≤c, mask=0 for j>c
-    
-    Args:
-        logits: (N, K) logits for each interval (before sigmoid)
-        target_y: (N, K) binary targets for each interval
-        at_risk_mask: (N, K) mask indicating which intervals are at risk
-        
-    Returns:
-        scalar loss: Negative log-likelihood
+    Standard discrete-time logistic hazard loss.
+
+    logits:       (N, K)
+    target_y:     (N, K) binary, y_{ik}=1 only at event interval (if event observed)
+    at_risk_mask: (N, K) 1 where that interval contributes to likelihood
     """
-    bce = F.binary_cross_entropy_with_logits(logits, target_y, reduction='none')  # (N, K)
-    loss = (bce * at_risk_mask).sum() / (at_risk_mask.sum() + EPS)
-    return loss
+    bce = F.binary_cross_entropy_with_logits(logits, target_y, reduction="none")  # (N, K)
+    return (bce * at_risk_mask).sum() / (at_risk_mask.sum() + EPS)
 
 
-def prepare_survival_targets(event_times: torch.Tensor, 
-                           event_indicators: torch.Tensor,
-                           time_intervals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def prepare_survival_targets(
+    event_times: torch.Tensor,
+    event_indicators: torch.Tensor,
+    time_intervals: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Prepare target labels and at-risk masks for discrete-time survival model.
-    
-    Args:
-        event_times: (N,) actual event/censoring times
-        event_indicators: (N,) 1 if event occurred, 0 if censored
-        time_intervals: (K+1,) interval boundaries [t0, t1, ..., tK]
-        
-    Returns:
-        target_y: (N, K) binary targets for each interval
-        at_risk_mask: (N, K) mask indicating at-risk status
+    Prepare target_y and at_risk_mask for the discrete-time hazard model.
+
+    time_intervals: (K+1,) boundaries [t0, t1, ..., tK]
     """
-    N = len(event_times)
-    K = len(time_intervals) - 1
+    if time_intervals.ndim != 1 or time_intervals.numel() < 2:
+        raise ValueError("time_intervals must be 1D with length >= 2 (boundaries).")
+
+    N = int(event_times.numel())
+    K = int(time_intervals.numel() - 1)
     device = event_times.device
-    
+
     target_y = torch.zeros(N, K, device=device)
     at_risk_mask = torch.zeros(N, K, device=device)
-    
+
+    # interval index m in [0, K-1] such that t in (t_m, t_{m+1}] (approximately)
+    # Using searchsorted on upper boundaries time_intervals[1:]
     for i in range(N):
         t_i = event_times[i]
-        delta_i = event_indicators[i]
-        
-        # Find which interval the event/censoring falls into
-        interval_idx = torch.searchsorted(time_intervals[1:], t_i, right=False)
-        interval_idx = torch.clamp(interval_idx, 0, K-1)
-        
-        if delta_i == 1:  # Event occurred
-            # At risk and no event for j < interval_idx
-            at_risk_mask[i, :interval_idx] = 1
-            target_y[i, :interval_idx] = 0
-            
-            # Event occurs in interval_idx
-            if interval_idx < K:
-                at_risk_mask[i, interval_idx] = 1
-                target_y[i, interval_idx] = 1
-                
-        else:  # Censored
-            # At risk and no event for j <= interval_idx
-            at_risk_mask[i, :interval_idx+1] = 1
-            target_y[i, :interval_idx+1] = 0
-    
+        d_i = event_indicators[i].item()
+
+        m = torch.searchsorted(time_intervals[1:], t_i, right=False)
+        m = torch.clamp(m, 0, K - 1).item()
+
+        if d_i == 1:  # event observed in interval m
+            at_risk_mask[i, :m] = 1.0
+            target_y[i, :m] = 0.0
+            at_risk_mask[i, m] = 1.0
+            target_y[i, m] = 1.0
+        else:  # censored in interval m => contribute through m with y=0
+            at_risk_mask[i, : m + 1] = 1.0
+            target_y[i, : m + 1] = 0.0
+
     return target_y, at_risk_mask

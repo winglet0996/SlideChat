@@ -143,14 +143,6 @@ def encode_fn(example,
     # Prepare the result dictionary with tokenized data
     result = {'input_ids': input_ids, 'labels': labels}
     
-    # # Preserve regression_targets if present
-    # if 'regression_targets' in example and example['regression_targets'] is not None:
-    #     result['regression_targets'] = example['regression_targets']
-    
-    # # Preserve survival_targets if present  
-    # if 'survival_targets' in example and example['survival_targets'] is not None:
-    #     result['survival_targets'] = example['survival_targets']
-    
     return result
 
 
@@ -353,6 +345,55 @@ class PadToGrid:
         # Permute feature grid to (C, H, W) and add channel dim to mask to get (1, H, W)
         return feature_grid.permute(2, 0, 1), mask_grid.unsqueeze(0)
 
+
+class CenterFixedSizeCrop:
+    """
+    Performs a center crop with a fixed output size.
+    Crucially, it applies the *same* crop to both the feature grid and its mask
+    to maintain their correspondence.
+    If the image is smaller than the crop size, it is padded first.
+    """
+    def __init__(self, crop_size):
+        if isinstance(crop_size, int):
+            self.crop_size = (crop_size, crop_size)
+        else:
+            self.crop_size = crop_size
+
+    def __call__(self, sample):
+        """
+        Args:
+            sample (tuple): A tuple containing (grid, mask).
+                            - grid (torch.Tensor): A feature grid of shape (C, H, W).
+                            - mask (torch.Tensor): A mask of shape (1, H, W).
+        Returns:
+            tuple: A tuple containing the cropped (grid, mask).
+        """
+        grid, mask = sample
+        
+        _, h, w = grid.shape
+        th, tw = self.crop_size
+        
+        # Pad if needed
+        if h < th or w < tw:
+            pad_h = max(0, th - h)
+            pad_w = max(0, tw - w)
+            # Pad right and bottom
+            grid = torch.nn.functional.pad(grid, (0, pad_w, 0, pad_h), value=0)
+            mask = torch.nn.functional.pad(mask, (0, pad_w, 0, pad_h), value=0)
+            
+        # Update h, w after padding
+        _, h, w = grid.shape
+            
+        # Center Crop
+        i = (h - th) // 2
+        j = (w - tw) // 2
+        
+        cropped_grid = grid[:, i:i+th, j:j+tw]
+        cropped_mask = mask[:, i:i+th, j:j+tw]
+        
+        return cropped_grid, cropped_mask
+
+
 class RandomVariableCrop:
     """
     Performs a random crop with a variable output size.
@@ -382,6 +423,47 @@ class RandomVariableCrop:
         cropped_mask = mask[:, top:top + h, left:left + w]
         
         return cropped_grid, cropped_mask
+
+
+class RandomVariableCropWithLimit:
+    """
+    Performs a random crop with a variable output size, with an upper limit on the total number of patches.
+    1. Applies RandomVariableCrop.
+    2. If the resulting number of patches exceeds max_patch_num, crops again to meet the limit.
+    """
+    def __init__(self, scale=(0.7, 1.0), ratio=(0.2, 5.0), max_patch_num=20000):
+        self.scale = scale
+        self.ratio = ratio
+        self.max_patch_num = max_patch_num
+
+    def __call__(self, sample):
+        grid, mask = sample
+        
+        # 1. Variable Crop
+        top, left, h, w = transforms.RandomResizedCrop.get_params(grid, self.scale, self.ratio)
+        grid = grid[:, top:top + h, left:left + w]
+        mask = mask[:, top:top + h, left:left + w]
+        
+        # 2. Check limit and crop again if needed
+        _, h, w = grid.shape
+        if h * w > self.max_patch_num:
+            # Calculate new dimensions to fit max_patch_num while maintaining aspect ratio
+            current_ratio = w / h
+            new_h = int(np.sqrt(self.max_patch_num / current_ratio))
+            new_w = int(new_h * current_ratio)
+            
+            # Ensure we don't exceed current dimensions
+            new_h = min(new_h, h)
+            new_w = min(new_w, w)
+            
+            # Random crop to new size
+            i = torch.randint(0, h - new_h + 1, size=(1, )).item()
+            j = torch.randint(0, w - new_w + 1, size=(1, )).item()
+            
+            grid = grid[:, i:i+new_h, j:j+new_w]
+            mask = mask[:, i:i+new_h, j:j+new_w]
+            
+        return grid, mask
 
 def load_wsi_feature(wsi_file, max_patch_num, transform=None):
     with h5py.File(wsi_file, 'r') as f:

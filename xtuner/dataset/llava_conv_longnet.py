@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 
 from xtuner.registry import BUILDER
 from .huggingface import process_hf_dataset
-from .utils import load_image, load_wsi_feature, PadToGrid, RandomVariableCrop
+from .utils import load_image, load_wsi_feature, PadToGrid, RandomVariableCrop, CenterFixedSizeCrop, RandomVariableCropWithLimit
 from torchvision import transforms
 
 import pandas as pd
@@ -44,22 +44,36 @@ class LLaVADataset_conv_longnet(Dataset):
                  max_length=None,
                  mode=None,
                  max_patch_num=None,
-                 input_ids_with_output=True):
+                 input_ids_with_output=True,
+                 crop_size=96):
         super().__init__()
 
         self.max_patch_num = max_patch_num
         self.per_image_length = per_image_length
         self.mode = mode
+        self.crop_size = crop_size
         if max_patch_num is None:
             if mode == 'train':
-                self.transform = transforms.Compose([
-                    PadToGrid(),
-                    RandomVariableCrop(scale=(0.7, 1.0), ratio=(0.2, 5.0))
-                ])
+                if self.crop_size is not None:
+                    self.transform = transforms.Compose([
+                        PadToGrid(),
+                        RandomVariableCropWithLimit(scale=(0.25, 0.5), ratio=(0.8, 1.2), max_patch_num=9216)
+                    ])
+                else:
+                    self.transform = transforms.Compose([
+                        PadToGrid(),
+                        RandomVariableCrop(scale=(0.25, 0.5), ratio=(0.8, 1.2))
+                    ])
             else:
-                self.transform = transforms.Compose([
-                    PadToGrid(),
-                ])
+                if self.crop_size is not None:
+                    self.transform = transforms.Compose([
+                        PadToGrid(),
+                        CenterFixedSizeCrop(crop_size=self.crop_size)
+                    ])
+                else:
+                    self.transform = transforms.Compose([
+                        PadToGrid(),
+                    ])
         else:
             self.transform = None
         assert offline_processed_text_folder or (data_path and tokenizer)
@@ -128,33 +142,49 @@ class LLaVADataset_conv_longnet(Dataset):
         return len(self.text_data)
 
     def __getitem__(self, index):
-        data_dict = self.text_data[index]
-        # image manipulation
-        if data_dict.get('image', None) is not None:
-            image_list = data_dict['image']
-            if isinstance(image_list, str):
-                image_list = [image_list]
-            feats = []
-            masks = []
-            for image_file in image_list:
-                if image_file.endswith('.h5'):
-                    result = load_wsi_feature(
-                        image_file,
-                        max_patch_num=self.max_patch_num,
-                        transform=self.transform,
-                    )
-                    if isinstance(result, tuple) and len(result) == 2:
-                        feat, mask = result
-                    else:
-                        feat = result
-                        mask = None
-                else:
-                    image = load_image(image_file)
-                    feat = image
-                    mask = None
-                feats.append(feat)
-                masks.append(mask)
-            data_dict['features'] = feats
-            data_dict['masks'] = masks
-            data_dict['image_file'] = image_list
-        return data_dict
+        max_retries = 20
+        for _ in range(max_retries):
+            try:
+                data_dict = self.text_data[index]
+                # image manipulation
+                if data_dict.get('image', None) is not None:
+                    image_list = data_dict['image']
+                    if isinstance(image_list, str):
+                        image_list = [image_list]
+                    feats = []
+                    masks = []
+                    for image_file in image_list:
+                        if image_file.endswith('.h5'):
+                            result = load_wsi_feature(
+                                image_file,
+                                max_patch_num=self.max_patch_num,
+                                transform=self.transform,
+                            )
+                            if isinstance(result, tuple) and len(result) == 2:
+                                feat, mask = result
+                            else:
+                                feat = result
+                                mask = None
+                        else:
+                            image = load_image(image_file)
+                            feat = image
+                            mask = None
+                        feats.append(feat)
+                        masks.append(mask)
+                    
+                    # Check if we successfully loaded all images
+                    if len(feats) != len(image_list):
+                        raise FileNotFoundError(f"Expected {len(image_list)} images, but loaded {len(feats)}")
+                        
+                    data_dict['features'] = feats
+                    data_dict['masks'] = masks
+                    data_dict['image_file'] = image_list
+                
+                return data_dict
+            
+            except (FileNotFoundError, OSError, Exception) as e:
+                print_log(f"Warning: Failed to load sample {index} (image missing or corrupt): {e}. Trying next sample.", 
+                          logger='current', level=logging.WARNING)
+                index = (index + 1) % len(self.text_data)
+        
+        raise RuntimeError(f"Failed to load any valid sample after {max_retries} retries starting from index {index}")

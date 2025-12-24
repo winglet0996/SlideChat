@@ -9,7 +9,7 @@ from mmengine.visualization import Visualizer, WandbVisBackend
 
 from torch.optim import AdamW
 from sophia import SophiaG 
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
+from transformers import (AutoModelForCausalLM, AutoModelForVision2Seq, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
@@ -38,14 +38,14 @@ if setting == 'alignment':
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=64,
+        r=32,
         lora_alpha=64,
-        lora_dropout=0.1,
+        lora_dropout=0.2,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask/iter_249000.pth'
+    ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
     # ckpt_path = None
     lr = 2e-5
     freeze_llm = True
@@ -62,28 +62,30 @@ resume = False
 
 # cat = 'Diagnosis'
 
-llm_name_or_path = 'Qwen/Qwen3-8B'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mixed_train_no-knowledge_balanced_200000.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mixed_test_no-knowledge_eval_10000.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mixed_test_no-knowledge.json'
-test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_balanced_100.json'
+llm_name_or_path = 'Qwen/Qwen3-VL-8B-Instruct'
+# train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_eval_100.json'
+# val_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_eval_100.json'
+# test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_eval_100.json'
+train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
+val_data_path = '/home/xiaozhou/data/project/TCGA/baseline/tcga_test/tcga_aligned_all.json'
+# test_data_path = '/home/xiaozhou/data/project/TCGA/baseline/tcga_test/tcga_aligned_all.json'
+test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all_10000.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask/'
-vis_name = f'qwen3_8b_conv_{setting}_multitask'
+work_dir = f'/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask_mcqa_srv/'
+vis_name = f'qwen3_8b_conv_{setting}_multitask_mcqa_srv'
 
 val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_results_iter_best_r2_val'
+test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 500  # More frequent saves for alignment debugging
+save_steps = 2500  # More frequent saves for alignment debugging
 save_total_limit = 3  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1000  # More frequent evaluation for alignment debugging
-
+evaluation_freq = 2500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -134,7 +136,7 @@ if resume:
         
 del _get_latest_valid_deepspeed_checkpoint
 
-max_length = 32768
+max_length = 256000
 max_patch_num = None
 max_new_tokens = 1
 repetition_penalty = 1.0
@@ -144,8 +146,8 @@ sample_type='wsi' # 'wsi'or'image'
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 1
-dataloader_num_workers = 4
+accumulative_counts = 8
+dataloader_num_workers = 16
 optim_type = SophiaG
 betas = (0.9, 0.999)
 rho = 0.01
@@ -172,10 +174,11 @@ model = dict(
     freeze_llm=freeze_llm,
     hidden_size=4096,
     llm=dict(
-        type=AutoModelForCausalLM.from_pretrained,
+        type=AutoModelForVision2Seq.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
         torch_dtype=torch.float16,
+        attn_implementation='flash_attention_2',
         # quantization_config=dict(
         #     type=BitsAndBytesConfig,
         #     load_in_4bit=True,
@@ -195,17 +198,18 @@ model = dict(
         # repetition_penalty=repetition_penalty
     ),
     llm_lora=llm_lora,
-    enable_regression = True,
-    enable_survival = True,
-    reg_token = '<REG>',
-    srv_token = '<SRV>',
-    lambda_llm = 1,
-    lambda_reg = 1,
-    lambda_srv = 1,
+    enable_regression=True,
+    enable_survival=True,
+    reg_token='<REG>',
+    srv_token='<SRV>',
+    lambda_llm=1.0,
+    lambda_reg=1.0,
+    lambda_srv=1.0,
     vision_conv_cfg={
-        "depths": [3,9,3],
+        "in_chans": 768,
+        "depths": [3, 9, 3],
         "dims": [768, 1024, 2048],
-        "drop_path_rate": 0.1,
+        "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
     )
@@ -231,7 +235,7 @@ train_dataloader = dict(
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=train_llava_dataset,
-    sampler=dict(type=InfiniteSampler, shuffle=True),
+    sampler=dict(type=DefaultSampler, shuffle=True),
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
@@ -375,7 +379,7 @@ visualizer = None
 #         dict(
 #             type=WandbVisBackend,
 #             init_kwargs=dict(
-#                 project='pathoverse_multitask_conv',
+#                 project='pathoverse_multitask_conv_mcqa_srv',
 #                 name=vis_name
 #             )
 #         )

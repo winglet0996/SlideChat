@@ -13,6 +13,21 @@ def masked_collated_fn(instances: Sequence[Dict],
                        pad_index: int = DEFAULT_PAD_TOKEN_INDEX,
                        return_hf_format: bool = False,
                        use_varlen_attn: bool = False):
+    # Defensive: a few datasets/map_fns may return None for broken samples.
+    # MMEngine's loops cannot handle model outputs being None, so fail fast
+    # with a clear error rather than crashing later in _update_losses.
+    if instances is None:
+        raise RuntimeError('masked_collated_fn received instances=None (dataloader yielded None batch).')
+    if any(inst is None for inst in instances):
+        bad = [i for i, inst in enumerate(instances) if inst is None]
+        raise RuntimeError(
+            f'masked_collated_fn received None sample(s) at batch positions {bad}. '
+            'This usually means the dataset/map_fn returned None for a corrupt/missing file. '
+            'Fix the data (or change the dataset to skip invalid samples) and rerun.'
+        )
+    if len(instances) == 0:
+        raise RuntimeError('masked_collated_fn received an empty batch (len(instances)==0).')
+
     seq_parallel_world_size = get_sequence_parallel_world_size()
 
     input_ids, labels = [], []
@@ -124,8 +139,31 @@ def masked_collated_fn(instances: Sequence[Dict],
         }
 
     if has_image:
-        features = torch.stack(features)
-        masks = torch.stack(masks) if masks[0] is not None else None
+        # Pad features and masks to the max size in the batch
+        max_h = max(f.shape[1] for f in features)
+        max_w = max(f.shape[2] for f in features)
+
+        padded_features = []
+        for f in features:
+            pad_h = max_h - f.shape[1]
+            pad_w = max_w - f.shape[2]
+            if pad_h > 0 or pad_w > 0:
+                f = torch.nn.functional.pad(f, (0, pad_w, 0, pad_h), value=0.0)
+            padded_features.append(f)
+        features = torch.stack(padded_features)
+
+        if masks[0] is not None:
+            padded_masks = []
+            for m in masks:
+                pad_h = max_h - m.shape[1]
+                pad_w = max_w - m.shape[2]
+                if pad_h > 0 or pad_w > 0:
+                    m = torch.nn.functional.pad(m, (0, pad_w, 0, pad_h), value=0.0)
+                padded_masks.append(m)
+            masks = torch.stack(padded_masks)
+        else:
+            masks = None
+
         data_dict['features'] = features
         if masks is not None:
             data_dict['masks'] = masks
@@ -152,17 +190,42 @@ def masked_collated_fn(instances: Sequence[Dict],
 
     # stack survival targets 
     if any(t is not None for t in survival_targets):
-        # Filter out None values and stack the valid ones
-        valid_survival_targets = [t for t in survival_targets if t is not None]
-        if valid_survival_targets:
-            # Assume survival_targets have 'target_y' and 'at_risk_mask' keys
-            target_y_list = [t['target_y'] for t in valid_survival_targets]
-            at_risk_mask_list = [t['at_risk_mask'] for t in valid_survival_targets]
+        # Get first valid target to determine shape/type
+        first_valid = next(t for t in survival_targets if t is not None)
+        
+        def get_zero_element(elem):
+            if isinstance(elem, torch.Tensor):
+                return torch.zeros_like(elem)
+            elif isinstance(elem, np.ndarray):
+                return np.zeros_like(elem)
+            else:
+                return np.zeros(len(elem), dtype=np.float32)
+
+        zero_target_y = get_zero_element(first_valid['target_y'])
+        zero_at_risk_mask = get_zero_element(first_valid['at_risk_mask'])
+
+        target_y_list = []
+        at_risk_mask_list = []
+
+        for t in survival_targets:
+            if t is not None:
+                target_y_list.append(t['target_y'])
+                at_risk_mask_list.append(t['at_risk_mask'])
+            else:
+                target_y_list.append(zero_target_y)
+                at_risk_mask_list.append(zero_at_risk_mask)
+
+        if isinstance(target_y_list[0], torch.Tensor):
+            target_y_tensor = torch.stack(target_y_list)
+            at_risk_mask_tensor = torch.stack(at_risk_mask_list)
+        else:
+            target_y_tensor = torch.tensor(np.array(target_y_list), dtype=torch.float32)
+            at_risk_mask_tensor = torch.tensor(np.array(at_risk_mask_list), dtype=torch.float32)
             
-            data_dict['survival_targets'] = {
-                'target_y': torch.tensor(target_y_list, dtype=torch.float32),
-                'at_risk_mask': torch.tensor(at_risk_mask_list, dtype=torch.float32)
-            }
+        data_dict['survival_targets'] = {
+            'target_y': target_y_tensor,
+            'at_risk_mask': at_risk_mask_tensor
+        }
 
     if return_hf_format:
         return data_dict

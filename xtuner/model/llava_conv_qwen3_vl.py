@@ -2,25 +2,221 @@
 import math
 from collections import OrderedDict
 from typing import Optional, Dict, Any, List, Tuple, Union
-
+import functools
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmengine import print_log
 from mmengine.config import Config, ConfigDict
 from mmengine.model import BaseModel
 from mmengine.dist import is_main_process
 from peft import get_peft_model, prepare_model_for_kbit_training
-from transformers import (AddedToken, AutoConfig, GenerationConfig, StoppingCriteriaList)
+from transformers import (AddedToken, AutoConfig, GenerationConfig, StoppingCriteriaList, Qwen3VLConfig, AutoModelForCausalLM)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel, Qwen3VLForConditionalGeneration, Qwen3VLTextModel
 from transformers.integrations import is_deepspeed_zero3_enabled
 
+def patch_qwen3_vl_deepstack():
+    """Patch Qwen3-VL to support sparse DeepStack injection and None-safe processing."""
+    # Make _deepstack_process no-op when visual_embeds is None
+    old_process = Qwen3VLTextModel._deepstack_process
+    @functools.wraps(old_process)
+    def new_process(self, hidden_states, visual_pos_masks, visual_embeds):
+        return old_process(self, hidden_states, visual_pos_masks, visual_embeds) if visual_embeds is not None else hidden_states
+    Qwen3VLTextModel._deepstack_process = new_process
+
+    def patch_forward(cls):
+        old_fwd = cls.forward
+        # Do NOT use functools.wraps here to ensure transformers.generate sees the new signature
+        def new_fwd(self, *args, visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs):
+            v_mask = visual_pos_masks if visual_pos_masks is not None else kwargs.get('visual_pos_masks', None)
+            v_embeds = deepstack_visual_embeds if deepstack_visual_embeds is not None else kwargs.get('deepstack_visual_embeds', None)
+
+            if isinstance(self, Qwen3VLModel):
+                # Intercept language_model call to inject our features
+                old_lm_fwd = self.language_model.forward
+                def patched_lm_fwd(*la, **lk):
+                    if v_mask is not None: lk['visual_pos_masks'] = v_mask
+                    if v_embeds is not None: lk['deepstack_visual_embeds'] = v_embeds
+                    return old_lm_fwd(*la, **lk)
+                self.language_model.forward = patched_lm_fwd
+                
+                # Pop from kwargs to avoid multiple values for keyword argument in old_fwd
+                # but only for the Model call where we manually inject into language_model
+                kwargs.pop('visual_pos_masks', None)
+                kwargs.pop('deepstack_visual_embeds', None)
+                
+                try:
+                    return old_fwd(self, *args, **kwargs)
+                finally:
+                    self.language_model.forward = old_lm_fwd
+            else:
+                # For Qwen3VLForConditionalGeneration, ensure they are in kwargs for the Model call
+                if v_mask is not None: kwargs['visual_pos_masks'] = v_mask
+                if v_embeds is not None: kwargs['deepstack_visual_embeds'] = v_embeds
+                return old_fwd(self, *args, **kwargs)
+        
+        new_fwd.__doc__ = old_fwd.__doc__
+        new_fwd.__module__ = old_fwd.__module__
+        new_fwd.__name__ = old_fwd.__name__
+        cls.forward = new_fwd
+
+    patch_forward(Qwen3VLModel)
+    patch_forward(Qwen3VLForConditionalGeneration)
+
+patch_qwen3_vl_deepstack()
+
+AutoModelForCausalLM.register(Qwen3VLConfig, Qwen3VLForConditionalGeneration)
+
 from xtuner.registry import BUILDER
-from xtuner.utils import StopWordStoppingCriteria, IGNORE_INDEX
+from xtuner.utils import StopWordStoppingCriteria, IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from .modules import ProjectorConfig, ProjectorModel, dispatch_modules
 from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names, get_peft_model_state_dict, 
                     guess_load_checkpoint, make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
 from .custom_model import HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, AttentionPooling, RegressionHead, SurvivalHead
+
+
+def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values, 
+                                    labels=None, attention_mask=None, 
+                                    position_ids=None, past_key_values=None,
+                                    image_grid_thw=None,
+                                    deepstack_pixel_values=None,
+                                    **kwargs):
+    """
+    Custom multimodal preparation for Qwen3-VL that also returns visual_pos_masks.
+    Supports hierarchical DeepStack visual features.
+    """
+    if pixel_values is None or len(pixel_values) == 0:
+        return {
+            'input_ids': input_ids,
+            'position_ids': position_ids,
+            'attention_mask': attention_mask,
+            'past_key_values': past_key_values,
+            'inputs_embeds': None,
+            'labels': labels,
+            'visual_pos_masks': None,
+            'image_grid_thw': None,
+            'deepstack_visual_embeds': None
+        }
+
+    # remove the padding using attention_mask
+    input_ids_list = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
+    labels_list = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
+
+    new_inputs_embeds = []
+    new_labels = []
+    new_visual_masks = []
+    new_position_ids = []
+    all_deepstack_embeds = []
+    new_image_grid_thw = []
+    
+    cur_image_idx = 0
+    for batch_idx, cur_input_ids in enumerate(input_ids_list):
+        num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+        if num_images == 0:
+            cur_inputs_embeds = llm.get_input_embeddings()(cur_input_ids)
+            new_inputs_embeds.append(cur_inputs_embeds)
+            new_labels.append(labels_list[batch_idx])
+            new_visual_masks.append(torch.zeros(cur_inputs_embeds.shape[0], dtype=torch.bool, device=cur_inputs_embeds.device))
+            # Text position IDs: (3, seq_len)
+            seq_len = cur_inputs_embeds.shape[0]
+            new_position_ids.append(torch.arange(seq_len, device=cur_inputs_embeds.device).view(1, -1).expand(3, -1))
+            continue
+
+        image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+        
+        cur_new_inputs_embeds = []
+        cur_new_labels = []
+        cur_new_visual_mask = []
+        cur_new_position_ids = []
+        
+        st_idx = 0
+        for i in range(len(image_token_indices) - 1):
+            # Text part
+            text_ids = cur_input_ids[image_token_indices[i] + 1 : image_token_indices[i+1]]
+            if text_ids.shape[0] > 0:
+                text_len = text_ids.shape[0]
+                cur_new_inputs_embeds.append(llm.get_input_embeddings()(text_ids))
+                cur_new_labels.append(labels_list[batch_idx][image_token_indices[i] + 1 : image_token_indices[i+1]])
+                cur_new_visual_mask.append(torch.zeros(text_len, dtype=torch.bool, device=text_ids.device))
+                # Text position IDs: (3, text_len)
+                cur_new_position_ids.append(torch.arange(text_len, device=text_ids.device).view(1, -1).expand(3, -1) + st_idx)
+                st_idx += text_len
+            
+            # Image part
+            if i < len(image_token_indices) - 2:
+                cur_pixel_values = pixel_values[cur_image_idx]
+                if image_grid_thw is not None:
+                    grid_thw = image_grid_thw[cur_image_idx]
+                    new_image_grid_thw.append(grid_thw)
+                    
+                    # Calculate 3D position IDs for Qwen3-VL
+                    # Since pixel_values are already projected/merged features, 
+                    # we use the grid dimensions directly without further spatial merging.
+                    t, h, w = grid_thw
+                    llm_grid_t, llm_grid_h, llm_grid_w = t.item(), h.item(), w.item()
+                    
+                    t_index = torch.arange(llm_grid_t, device=cur_input_ids.device).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                    h_index = torch.arange(llm_grid_h, device=cur_input_ids.device).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                    w_index = torch.arange(llm_grid_w, device=cur_input_ids.device).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                    cur_new_position_ids.append(torch.stack([t_index, h_index, w_index]) + st_idx)
+                    st_idx += llm_grid_t * llm_grid_h * llm_grid_w
+                
+                if deepstack_pixel_values is not None:
+                    # Collect all stages for this image, preserving None for sparse layers
+                    all_deepstack_embeds.append([v[cur_image_idx] if v is not None else None for v in deepstack_pixel_values])
+                else:
+                    all_deepstack_embeds.append([cur_pixel_values])
+
+                cur_image_idx += 1
+                cur_new_inputs_embeds.append(cur_pixel_values)
+                cur_new_labels.append(torch.full((cur_pixel_values.shape[0],), IGNORE_INDEX, device=cur_pixel_values.device, dtype=labels.dtype))
+                cur_new_visual_mask.append(torch.ones(cur_pixel_values.shape[0], dtype=torch.bool, device=cur_pixel_values.device))
+
+        new_inputs_embeds.append(torch.cat(cur_new_inputs_embeds))
+        new_labels.append(torch.cat(cur_new_labels))
+        new_visual_masks.append(torch.cat(cur_new_visual_mask))
+        new_position_ids.append(torch.cat(cur_new_position_ids, dim=1))
+
+    # Pad
+    max_len = max(x.shape[0] for x in new_inputs_embeds)
+    batch_size = len(new_inputs_embeds)
+
+    final_inputs_embeds = torch.zeros((batch_size, max_len, new_inputs_embeds[0].shape[-1]), dtype=new_inputs_embeds[0].dtype, device=new_inputs_embeds[0].device)
+    final_labels = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
+    final_attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=new_inputs_embeds[0].device)
+    final_visual_pos_masks = torch.zeros((batch_size, max_len), dtype=torch.bool, device=new_inputs_embeds[0].device)
+    final_position_ids = torch.zeros((3, batch_size, max_len), dtype=torch.long, device=new_inputs_embeds[0].device)
+
+    for i, (emb, lbl, vmask, pids) in enumerate(zip(new_inputs_embeds, new_labels, new_visual_masks, new_position_ids)):
+        cur_len = emb.shape[0]
+        final_inputs_embeds[i, :cur_len] = emb
+        final_labels[i, :cur_len] = lbl
+        final_attention_mask[i, :cur_len] = True
+        final_visual_pos_masks[i, :cur_len] = vmask
+        final_position_ids[:, i, :cur_len] = pids
+
+    # Prepare DeepStack embeds: List[Tensor] where each tensor is (total_num_images * seq_len, hidden_dim)
+    if all_deepstack_embeds:
+        num_stages = len(all_deepstack_embeds[0])
+        deepstack_visual_embeds = []
+        for s in range(num_stages):
+            # Collect only non-None tensors for this stage
+            stage_tensors = [img_stages[s] for img_stages in all_deepstack_embeds if img_stages[s] is not None]
+            deepstack_visual_embeds.append(torch.cat(stage_tensors, dim=0) if stage_tensors else None)
+    else:
+        deepstack_visual_embeds = None
+
+    return {
+        'inputs_embeds': final_inputs_embeds,
+        'labels': final_labels,
+        'attention_mask': final_attention_mask,
+        'visual_pos_masks': final_visual_pos_masks,
+        'deepstack_visual_embeds': deepstack_visual_embeds,
+        'image_grid_thw': torch.stack(new_image_grid_thw) if new_image_grid_thw else None,
+        'position_ids': final_position_ids 
+    }
 
 
 def convert_state_dict_to_hf(state_dict: Dict[str, torch.Tensor], 
@@ -62,9 +258,9 @@ class LLaVAModel_conv(BaseModel):
     # Supported model configurations for flash attention
     SUPPORT_CONFIGS = {
         'SDPA': ('LlamaConfig', 'GemmaConfig', 'MistralConfig', 'MixtralConfig', 
-                 'Qwen2Config', 'Qwen2MoeConfig', 'Starcoder2Config', 'Phi3Config'),
+                 'Qwen2Config', 'Qwen2MoeConfig', 'Starcoder2Config', 'Phi3Config', 'Qwen3VLConfig'),
         'FLASH2': ('InternLM2Config', 'LlamaConfig', 'GemmaConfig', 'MistralConfig', 
-                   'MixtralConfig', 'Qwen2Config', 'Qwen2MoeConfig', 'Starcoder2Config', 'Phi3Config')
+                   'MixtralConfig', 'Qwen2Config', 'Qwen2MoeConfig', 'Starcoder2Config', 'Phi3Config', 'Qwen3VLConfig')
     }
 
     def __init__(self, llm, tokenizer, freeze_llm: bool = True, visual_select_layer: int = -2,
@@ -76,7 +272,8 @@ class LLaVAModel_conv(BaseModel):
                  enable_survival: bool = True, srv_token: str = '<SRV>',
                  num_survival_intervals: int = 6,
                  lambda_llm: float = 0.1, lambda_reg: float = 1.0, lambda_srv: float = 1.0,
-                 vision_conv_cfg: Optional[Dict] = None):
+                 vision_conv_cfg: Optional[Dict] = None,
+                 deepstack_visual_indexes: List[int] = [8, 16, 24]):
         """
         Multi-modal LLaVA model with regression and survival prediction capabilities.
         Regression relies solely on special token embeddings processed by LLM.
@@ -94,15 +291,14 @@ class LLaVAModel_conv(BaseModel):
             lambda_llm=lambda_llm,
             lambda_reg=lambda_reg,
             lambda_srv=lambda_srv,
-            vision_conv_cfg=vision_conv_cfg
+            vision_conv_cfg=vision_conv_cfg,
+            deepstack_visual_indexes=deepstack_visual_indexes
         )
 
         # Initialize model components
         self._init_llm(llm, max_position_embeddings)
         self._init_vision_components()
         self._init_projector(projector_depth)
-
-        # Setup tokenizer and special tokens
         self._setup_tokenizer_and_tokens(tokenizer, enable_regression, enable_survival)
 
         # Initialize prediction modules if needed
@@ -126,7 +322,8 @@ class LLaVAModel_conv(BaseModel):
 
     def _init_attributes(self, freeze_llm: bool, enable_regression: bool, reg_token: str,
                          enable_survival: bool, srv_token: str, num_survival_intervals: int,
-                         lambda_llm: float, lambda_reg: float, lambda_srv: float, vision_conv_cfg: Optional[Dict]) -> None:
+                         lambda_llm: float, lambda_reg: float, lambda_srv: float, vision_conv_cfg: Optional[Dict],
+                         deepstack_visual_indexes: List[int]) -> None:
         """Initialize core model attributes."""
         self.freeze_llm = freeze_llm
         self.enable_regression = enable_regression
@@ -144,6 +341,7 @@ class LLaVAModel_conv(BaseModel):
         self.reg_token_id = None
         self.srv_token_id = None
         self.vision_conv_cfg = vision_conv_cfg
+        self.deepstack_visual_indexes = deepstack_visual_indexes
 
     def _init_llm(self, llm, max_position_embeddings: Optional[int]) -> None:
         """Initialize the language model."""
@@ -151,7 +349,13 @@ class LLaVAModel_conv(BaseModel):
             if isinstance(llm, dict):
                 llm = self._dispatch_lm_model_cfg(llm, max_position_embeddings)
             self.llm = self._build_from_cfg_or_module(llm)
-        self.llm.config.use_cache = False
+        
+        # Handle composite configs for use_cache
+        if hasattr(self.llm.config, 'use_cache'):
+            self.llm.config.use_cache = False
+        if hasattr(self.llm.config, 'text_config'):
+            self.llm.config.text_config.use_cache = False
+
         dispatch_modules(self.llm)
 
     def _init_vision_components(self) -> None:
@@ -168,20 +372,29 @@ class LLaVAModel_conv(BaseModel):
         self.conv = HighResPartialConvNeXt(
             **default_conv_cfg
         ).to(self.llm.dtype)
-        self.pos_emb_2d = PositionalEmbedding2DSinusoidal(
-            d_model=self.conv.dims[-1],
-            scale_mode='learned',
-            init_pe_scale=0.1
-        ).to(self.llm.dtype)
+
+    def _get_llm_hidden_size(self) -> int:
+        """Get the hidden size of the LLM, handling both standard and composite configs."""
+        if hasattr(self.llm.config, 'hidden_size'):
+            return self.llm.config.hidden_size
+        if hasattr(self.llm.config, 'text_config'):
+            return getattr(self.llm.config.text_config, 'hidden_size')
+        raise AttributeError("Could not determine hidden_size from LLM config")
 
     def _init_projector(self, depth: int = 2) -> None:
         """Initialize the vision-language projector."""
-        projector_config = ProjectorConfig(
-            visual_hidden_size=self.conv.dims[-1],
-            llm_hidden_size=self.llm.config.hidden_size,
-            depth=depth
-        )
-        self.projector = ProjectorModel(projector_config).to(self.llm.dtype)
+        self.projectors = nn.ModuleList()
+        llm_hidden_size = self._get_llm_hidden_size()
+        for dim in self.conv.dims:
+            projector_config = ProjectorConfig(
+                visual_hidden_size=dim,
+                llm_hidden_size=llm_hidden_size,
+                depth=depth
+            )
+            self.projectors.append(ProjectorModel(projector_config).to(self.llm.dtype))
+        
+        # For backward compatibility and easy access to the main projector
+        self.projector = self.projectors[-1]
 
     def _setup_tokenizer_and_tokens(self, tokenizer, enable_regression: bool, enable_survival: bool) -> None:
         """Setup tokenizer and add special tokens efficiently."""
@@ -268,7 +481,7 @@ class LLaVAModel_conv(BaseModel):
 
     def _init_prediction_modules(self) -> None:
         """Initialize prediction-specific modules."""
-        llm_hidden = self.llm.config.hidden_size
+        llm_hidden = self._get_llm_hidden_size()
 
         # Regression head using only special token embeddings
         if self.enable_regression:
@@ -313,13 +526,19 @@ class LLaVAModel_conv(BaseModel):
         self.llm = prepare_model_for_kbit_training(self.llm, use_activation_checkpointing)
 
         if lora_config.target_modules is None:
-            lora_config.target_modules = find_all_linear_names(self.llm)
+            # For Qwen3-VL, we must avoid targeting 'proj' which matches Conv3d in visual encoder.
+            # Searching only in language_model avoids finding 'proj' from vision blocks.
+            target_model = getattr(self.llm, 'model', self.llm)
+            target_model = getattr(target_model, 'language_model', target_model)
+            lora_config.target_modules = find_all_linear_names(target_model)
 
         self.llm = get_peft_model(self.llm, lora_config)
 
     def _freeze_llm_with_exceptions(self) -> None:
         """Freeze LLM parameters while keeping task-critical components trainable."""
-        if not (self.enable_regression or self.enable_survival):
+        if self.use_llm_lora:
+            # PEFT handles freezing the base model automatically.
+            # Manual freezing here could accidentally disable LoRA adapters.
             return
             
         self.llm.requires_grad_(False)
@@ -361,12 +580,10 @@ class LLaVAModel_conv(BaseModel):
 
         # Vision components are trainable by default
         conv_params = sum(p.numel() for p in self.conv.parameters())
-        proj_params = sum(p.numel() for p in self.projector.parameters())
-        pos_params = sum(p.numel() for p in self.pos_emb_2d.parameters())
+        proj_params = sum(p.numel() for p in self.projectors.parameters())
         trainable_params.extend([
             f"conv: {conv_params:,}",
-            f"projector: {proj_params:,}", 
-            f"pos_emb_2d: {pos_params:,}"
+            f"projectors: {proj_params:,}"
         ])
 
         if is_main_process():
@@ -397,7 +614,8 @@ class LLaVAModel_conv(BaseModel):
         else:
             self.llm.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-        self.projector.enable_input_require_grads()
+        for projector in self.projectors:
+            projector.enable_input_require_grads()
         self.gradient_checkpointing_enable()
 
     def _load_pretrained_weights(self, pretrained_pth: str) -> None:
@@ -436,12 +654,14 @@ class LLaVAModel_conv(BaseModel):
     def gradient_checkpointing_enable(self) -> None:
         """Enable gradient checkpointing for memory efficiency."""
         self.llm.gradient_checkpointing_enable()
-        self.projector.gradient_checkpointing_enable()
+        for projector in self.projectors:
+            projector.gradient_checkpointing_enable()
 
     def gradient_checkpointing_disable(self) -> None:
         """Disable gradient checkpointing."""
         self.llm.gradient_checkpointing_disable()
-        self.projector.gradient_checkpointing_disable()
+        for projector in self.projectors:
+            projector.gradient_checkpointing_disable()
 
     activation_checkpointing_enable = gradient_checkpointing_enable
     activation_checkpointing_disable = gradient_checkpointing_disable
@@ -455,32 +675,97 @@ class LLaVAModel_conv(BaseModel):
         state_dict = super().state_dict(*args, **kwargs)
         to_return = OrderedDict()
 
-        # Save LLM weights (LoRA or full)
+        # 1. Save LLM weights (LoRA or full)
         if self.use_llm_lora:
+            # get_peft_model_state_dict filters keys with 'lora_'
+            # Note: xtuner's get_peft_model_state_dict preserves the 'llm.' prefix if present in state_dict
             to_return.update(get_peft_model_state_dict(self.llm, state_dict=state_dict))
         elif not self.freeze_llm:
             to_return.update({k: v for k, v in state_dict.items() if 'llm.' in k})
 
-        # Save vision and projection components
-        vision_keys = ['projector.', 'conv.', 'pos_emb_2d.']
+        # 2. Save vision and projection components
+        vision_keys = ['projectors.', 'projector.', 'conv.']
         to_return.update({k: v for k, v in state_dict.items() 
                           if any(key in k for key in vision_keys)})
 
-        # Save prediction components + embeddings for new tokens
+        # 3. Save prediction components
         if self.enable_regression or self.enable_survival:
             pred_keys = ['regression_head.', 'survival_head.']
             to_return.update({k: v for k, v in state_dict.items() 
                               if any(key in k for key in pred_keys)})
-            embedding_keys = ['embed_tokens.weight', 'tok_embeddings.weight', 'lm_head.weight']
-            for emb_key in embedding_keys:
-                matching_keys = [k for k in state_dict.keys() if k.endswith(emb_key)]
-                for k in matching_keys:
+            
+        # 4. CRITICAL: Always save embeddings and lm_head if they were trainable
+        # This ensures special tokens and their predictions are preserved.
+        embedding_keys = ['embed_tokens.weight', 'tok_embeddings.weight', 'lm_head.weight']
+        for emb_key in embedding_keys:
+            matching_keys = [k for k in state_dict.keys() if k.endswith(emb_key)]
+            for k in matching_keys:
+                if k.startswith('llm.'):
                     to_return[k] = state_dict[k]
 
         return to_return
 
-    def _project_vision_features(self, features: torch.Tensor, masks: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Project vision features through conv, positional embedding, and final projector."""
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = False):
+        """
+        Custom load_state_dict with explicit and safe key remapping between
+        LoRA and non-LoRA (full/alignment) checkpoints.
+
+        Supported paths:
+        1) non-LoRA ckpt  -> LoRA model
+        2) LoRA ckpt      -> non-LoRA model
+        3) LoRA ckpt      -> LoRA model (direct, no remap)
+        4) non-LoRA ckpt  -> non-LoRA model (direct)
+        """
+        new_state_dict = {}
+
+        is_lora_model = bool(self.use_llm_lora)
+        is_lora_ckpt = any(
+            k.startswith("llm.") and "base_model.model" in k
+            for k in state_dict
+        )
+
+        mapped_count = 0
+        llm_keys_count = 0
+
+        for k, v in state_dict.items():
+            new_key = k
+
+            if k.startswith("llm."):
+                llm_keys_count += 1
+
+                # Case 1: non-LoRA ckpt -> LoRA model
+                if is_lora_model and not is_lora_ckpt:
+                    new_key = k.replace("llm.", "llm.base_model.model.", 1)
+                    mapped_count += 1
+
+                # Case 2: LoRA ckpt -> non-LoRA model
+                elif not is_lora_model and is_lora_ckpt:
+                    new_key = k.replace("llm.base_model.model.", "llm.", 1)
+                    mapped_count += 1
+
+                # Case 3 & 4:
+                #   LoRA ckpt -> LoRA model
+                #   non-LoRA ckpt -> non-LoRA model
+                # Keys are already correct; no remapping needed.
+
+            new_state_dict[new_key] = v
+
+        if is_main_process():
+            mode = "LoRA" if is_lora_model else "Full/Alignment"
+            ckpt_type = "LoRA" if is_lora_ckpt else "Full/Alignment"
+
+            print_log(
+                f"[WeightLoading] Loaded {len(state_dict)} keys | "
+                f"LLM: {llm_keys_count} | Remapped: {mapped_count} | "
+                f"Checkpoint: {ckpt_type} -> Model: {mode}",
+                "current",
+            )
+
+        return super().load_state_dict(new_state_dict, strict=strict)
+
+    def _project_vision_features(self, features: torch.Tensor, masks: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Project vision features through conv and hierarchical projectors.
+        Returns (list_of_projected_features, grid_thw)."""
         conv_input = features.to(self.llm.dtype)
         B, C, H, W = conv_input.shape
 
@@ -488,12 +773,24 @@ class LLaVAModel_conv(BaseModel):
                 if masks is None else masks.to(conv_input.device, dtype=conv_input.dtype))
 
         stage_outputs, updated_mask = self.conv(conv_input, mask)
-        conv_output = stage_outputs[-1]
-
-        conv_output = self.pos_emb_2d(conv_output)
-        _, C_new, H_new, W_new = conv_output.shape
-        feat_to_proj = conv_output.permute(0, 2, 3, 1).view(B, H_new * W_new, C_new)
-        return self.projector(feat_to_proj.to(self.llm.dtype))
+        
+        # Final resolution
+        final_feat = stage_outputs[-1]
+        _, _, H_final, W_final = final_feat.shape
+        
+        projected_stages = []
+        for i, (feat, projector) in enumerate(zip(stage_outputs, self.projectors)):
+            # Downsample to final resolution if needed
+            if feat.shape[2:] != (H_final, W_final):
+                feat = F.adaptive_avg_pool2d(feat, (H_final, W_final))
+            
+            # Project
+            feat_to_proj = feat.permute(0, 2, 3, 1).reshape(B, H_final * W_final, -1)
+            projected_stages.append(projector(feat_to_proj.to(self.llm.dtype)))
+            
+        grid_thw = torch.tensor([[1, H_final, W_final]] * B, device=conv_input.device, dtype=torch.long)
+        
+        return projected_stages, grid_thw
 
     @staticmethod
     def _get_torch_dtype() -> torch.dtype:
@@ -537,16 +834,24 @@ class LLaVAModel_conv(BaseModel):
 
     def _prepare_for_long_context_training(self, cfg, llm_cfg, max_position_embeddings: int) -> Tuple[Any, Any]:
         """Configure model for long context training with RoPE scaling."""
-        orig_rope_scaling = getattr(llm_cfg, 'rope_scaling', None) or {'factor': 1}
-        orig_ctx_len = getattr(llm_cfg, 'max_position_embeddings', None)
+        # Handle composite configs like Qwen3VLConfig
+        target_cfg = llm_cfg
+        if hasattr(llm_cfg, 'text_config'):
+            target_cfg = llm_cfg.text_config
+
+        orig_rope_scaling = getattr(target_cfg, 'rope_scaling', None) or {'factor': 1}
+        orig_ctx_len = getattr(target_cfg, 'max_position_embeddings', None)
 
         if orig_ctx_len:
             orig_ctx_len *= orig_rope_scaling.get('factor', 1)
             if max_position_embeddings > orig_ctx_len:
                 scaling_factor = float(math.ceil(max_position_embeddings / orig_ctx_len))
-                llm_cfg.rope_scaling = {'type': 'linear', 'factor': scaling_factor}
+                target_cfg.rope_scaling = {'type': 'linear', 'factor': scaling_factor}
 
         llm_cfg.attn_implementation = 'flash_attention_2'
+        if hasattr(llm_cfg, 'text_config'):
+            llm_cfg.text_config.attn_implementation = 'flash_attention_2'
+
         cfg.config = llm_cfg
         return cfg, llm_cfg
 
@@ -577,8 +882,21 @@ class LLaVAModel_conv(BaseModel):
                                     else None)
 
         # Process vision features
-        projected_features = self._project_vision_features(data['features'], data.get('masks'))
-        data['pixel_values'] = projected_features
+        projected_stages, grid_thw = self._project_vision_features(data['features'], data.get('masks'))
+        
+        # Map multi-stage features to specific LLM layers (e.g., 8, 16, 24)
+        ds_indexes = self.deepstack_visual_indexes
+        num_layers = self.llm.config.text_config.num_hidden_layers
+
+        # Build sparse list aligned to total LLM layers; only target indices receive features
+        deepstack_embeds = [None] * num_layers
+        for idx, feat in zip(ds_indexes, projected_stages):
+            if idx < num_layers:
+                deepstack_embeds[idx] = feat
+
+        data['pixel_values'] = projected_stages[-1]  # Main feature
+        data['deepstack_pixel_values'] = deepstack_embeds  # Sparse deepstack features
+        data['image_grid_thw'] = grid_thw
         data.pop('features', None)
         data.pop('masks', None)
 
@@ -586,14 +904,19 @@ class LLaVAModel_conv(BaseModel):
             self._strip_assistant_targets(data)
 
         # Prepare multimodal inputs
-        data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
+        is_qwen3_vl = getattr(self.llm.config, 'model_type', None) == 'qwen3_vl'
+        if is_qwen3_vl:
+            data = prepare_inputs_labels_for_qwen3_vl(llm=self.llm, **data)
+        else:
+            data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
         if mode == 'loss':
             return self.compute_loss(data, data_samples, regression_targets, survival_targets)
 
         elif mode == 'predict':
             # Filter fields required by generation
-            gen_data = {k: data[k] for k in ['inputs_embeds', 'attention_mask', 'position_ids'] if k in data}
+            gen_fields = ['inputs_embeds', 'attention_mask', 'position_ids', 'visual_pos_masks', 'deepstack_visual_embeds', 'image_grid_thw']
+            gen_data = {k: data[k] for k in gen_fields if k in data}
             return self.predict(gen_data, data_samples, regression_targets, survival_targets)
 
         elif mode == 'tensor':
@@ -732,7 +1055,10 @@ class LLaVAModel_conv(BaseModel):
                 has_survival=has_survival,
                 prefix_inputs_embeds=prefix_inputs_embeds,
                 prefix_attention_mask=prefix_attention_mask,
-                prefix_position_ids=prefix_position_ids
+                prefix_position_ids=prefix_position_ids,
+                visual_pos_masks=data.get('visual_pos_masks'),
+                deepstack_visual_embeds=data.get('deepstack_visual_embeds'),
+                image_grid_thw=data.get('image_grid_thw')
             )
 
         finally:
@@ -745,7 +1071,10 @@ class LLaVAModel_conv(BaseModel):
                                        has_survival: List[bool],
                                        prefix_inputs_embeds: torch.Tensor,
                                        prefix_attention_mask: torch.Tensor,
-                                       prefix_position_ids: Optional[torch.Tensor] = None) -> List[Dict[str, Any]]:
+                                       prefix_position_ids: Optional[torch.Tensor] = None,
+                                       visual_pos_masks: Optional[torch.Tensor] = None,
+                                       deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
+                                       image_grid_thw: Optional[torch.Tensor] = None) -> List[Dict[str, Any]]:
         """Compute task predictions at generated special-token positions using only token embeddings.
         
         The visual context is already encoded through the language model's cross-attention mechanism
@@ -786,13 +1115,29 @@ class LLaVAModel_conv(BaseModel):
             else:
                 full_position_ids = None
 
+            # Prepare visual masks for full sequence
+            full_visual_pos_masks = None
+            if visual_pos_masks is not None:
+                gen_vmask = torch.zeros((B, Lg), dtype=torch.bool, device=device)
+                full_visual_pos_masks = torch.cat([visual_pos_masks.to(device), gen_vmask], dim=1)
+
             # Forward through base model to get last hidden state for the full sequence
             # Get hidden states from full sequence (vision + generated tokens)
-            outputs = self.llm(inputs_embeds=full_inputs_embeds,
-                               attention_mask=full_attention_mask,
-                               position_ids=full_position_ids,
-                               output_hidden_states=True,
-                               return_dict=True)
+            llm_kwargs = {
+                'inputs_embeds': full_inputs_embeds,
+                'attention_mask': full_attention_mask,
+                'position_ids': full_position_ids,
+                'output_hidden_states': True,
+                'return_dict': True
+            }
+            if full_visual_pos_masks is not None:
+                llm_kwargs['visual_pos_masks'] = full_visual_pos_masks
+            if deepstack_visual_embeds is not None:
+                llm_kwargs['deepstack_visual_embeds'] = deepstack_visual_embeds
+            if image_grid_thw is not None:
+                llm_kwargs['image_grid_thw'] = image_grid_thw
+
+            outputs = self.llm(**llm_kwargs)
             hidden = outputs.hidden_states[-1]  # (B, Lp+Lg, H)
 
         # For each batch, locate generated special-token positions and predict
@@ -804,7 +1149,7 @@ class LLaVAModel_conv(BaseModel):
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                        fused = self._fuse_with_vision(embed, b, 'regression')  # Shape depends on mode
+                        fused = self._fuse_token_with_vision(embed, b, 'regression')  # Shape depends on mode
                         pred = self.regression_head(fused).squeeze(-1).item()
                         data_samples[b]['regression_prediction'] = float(pred)
                         prev = data_samples[b].get('prediction_text', '')
@@ -817,7 +1162,7 @@ class LLaVAModel_conv(BaseModel):
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                        fused = self._fuse_with_vision(embed, b, 'survival')  # (1, 2H)
+                        fused = self._fuse_token_with_vision(embed, b, 'survival')  # (1, 2H)
                         logits = self.survival_head(fused)
                         survival_probs = self.survival_head.predict_survival_probs(fused)
                         risk_score = float(self.survival_head.predict_risk_scores(fused).squeeze(0).item())
@@ -842,7 +1187,7 @@ class LLaVAModel_conv(BaseModel):
                         ).strip()
         return data_samples
 
-    def _fuse_with_vision(self, token_embed: torch.Tensor, b: int, task_type: str = 'survival') -> torch.Tensor:
+    def _fuse_token_with_vision(self, token_embed: torch.Tensor, b: int, task_type: str = 'survival') -> torch.Tensor:
         """Process token embedding for regression or survival tasks."""
         # Both regression and survival use only the special token embedding
         return token_embed.unsqueeze(0)  # (1, H)
@@ -863,7 +1208,7 @@ class LLaVAModel_conv(BaseModel):
         self._last_hidden_state = None
 
         # Get last hidden state - force output_hidden_states=True for LoRA compatibility
-        input_kwargs = {k: data[k] for k in ['input_ids', 'inputs_embeds', 'attention_mask', 'position_ids'] if k in data}
+        input_kwargs = {k: data[k] for k in ['input_ids', 'inputs_embeds', 'attention_mask', 'position_ids', 'visual_pos_masks', 'deepstack_visual_embeds', 'image_grid_thw'] if k in data}
         outputs = self.llm(**input_kwargs, output_hidden_states=True, return_dict=True)
         last_hidden = outputs.hidden_states[-1]
 

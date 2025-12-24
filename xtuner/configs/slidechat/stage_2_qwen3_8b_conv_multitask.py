@@ -45,8 +45,8 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask/iter_249000.pth'
-    # ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask/iter_249000.pth'
+    ckpt_path = None
     lr = 2e-5
     freeze_llm = True
     max_epochs = 5
@@ -58,19 +58,19 @@ if setting == 'full_param':
     ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
-resume = True
+resume = False
 
 # cat = 'Diagnosis'
 
-llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mixed_train_no-knowledge_balanced_200000.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mixed_test_no-knowledge_eval_10000.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mixed_test_no-knowledge.json'
+llm_name_or_path = 'Qwen/Qwen3-8B'
+train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_balanced_10000.json'
+val_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_balanced_100.json'
+test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_balanced_100.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask/'
+work_dir = f'/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask/'
 vis_name = f'qwen3_8b_conv_{setting}_multitask'
 
 val_output_path = work_dir + 'val_results'
@@ -81,7 +81,7 @@ save_steps = 500  # More frequent saves for alignment debugging
 save_total_limit = 3  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1000  # More frequent evaluation for alignment debugging
+evaluation_freq = 10  # More frequent evaluation for alignment debugging
 
 image_path_list = None
 
@@ -201,6 +201,13 @@ model = dict(
     lambda_llm = 1,
     lambda_reg = 1,
     lambda_srv = 1,
+    vision_conv_cfg={
+        "in_chans": 1536,
+        "depths": [3,9,3],
+        "dims": [768, 1024, 2048],
+        "drop_path_rate": 0.1,
+        "num_downsamples": 2,
+    }
     )
 
 #######################################################################
@@ -224,7 +231,7 @@ train_dataloader = dict(
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=train_llava_dataset,
-    sampler=dict(type=InfiniteSampler, shuffle=True),
+    sampler=dict(type=DefaultSampler, shuffle=True),
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
@@ -362,18 +369,18 @@ env_cfg = dict(
 
 # set visualizer
 visualizer = None
-visualizer = dict(
-    type=Visualizer,
-    vis_backends=[
-        dict(
-            type=WandbVisBackend,
-            init_kwargs=dict(
-                project='pathoverse_multitask_conv',
-                name=vis_name
-            )
-        )
-    ]
-)
+# visualizer = dict(
+#     type=Visualizer,
+#     vis_backends=[
+#         dict(
+#             type=WandbVisBackend,
+#             init_kwargs=dict(
+#                 project='pathoverse_multitask_conv',
+#                 name=vis_name
+#             )
+#         )
+#     ]
+# )
 
 # set log level
 log_level = 'INFO'

@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from typing import Any, Sequence, Dict, List, Optional, Union
 from scipy import stats
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import f1_score, roc_auc_score, balanced_accuracy_score
 from collections import defaultdict
 
 from mmengine.evaluator import BaseMetric
@@ -238,6 +238,15 @@ class PathologyMetric(BaseMetric):
             return
         
         correct = (pred_choice == target_choice)
+
+        # Optional: capture model-side choice logits for AUROC (binary K=2)
+        choice_logits = None
+        if isinstance(sample, dict):
+            choice_logits = (sample.get('mcqa_choice_logits')
+                             or sample.get('choice_logits')
+                             or sample.get('mcqa_logits'))
+        if choice_logits is not None and not isinstance(choice_logits, dict):
+            choice_logits = None
         
         self.results.append({
             'task_type': 'mcqa',
@@ -248,7 +257,8 @@ class PathologyMetric(BaseMetric):
             'pred_choice': pred_choice,
             'target_choice': target_choice,
             'category': metadata['category'],
-            'correct': correct
+            'correct': correct,
+            'choice_logits': choice_logits
         })
 
     def _process_text_sample(self, sample: Dict, input_str: str, pred_str: str,
@@ -476,29 +486,41 @@ class PathologyMetric(BaseMetric):
             return None
 
     def _get_survival_data(self, batch_data: Dict[str, Any], idx: int) -> Optional[Dict[str, float]]:
-        """Extract survival time and event from discretized survival_targets.
-
-        Uses the interval index derived from target_y/at_risk_mask and maps
-        it to a continuous time via interval midpoints.
-        """
-        st = batch_data.get('survival_targets')
+        """Prefer continuous survival_times/survival_events; fallback to survival_targets if needed."""
+        # 1) Best: use continuous labels if provided
+        times = batch_data.get("survival_times", None)
+        events = batch_data.get("survival_events", None)
+        if times is not None and events is not None:
+            try:
+                t = times[idx] if isinstance(times, (list, tuple)) else times[idx]
+                e = events[idx] if isinstance(events, (list, tuple)) else events[idx]
+                # torch / numpy / python scalar all ok
+                if isinstance(t, torch.Tensor):
+                    t = float(t.detach().cpu().item())
+                else:
+                    t = float(t)
+                if isinstance(e, torch.Tensor):
+                    e = float(e.detach().cpu().item())
+                else:
+                    e = float(e)
+                return {"time": t, "event": e}
+            except Exception:
+                pass  # fallback below
+        # 2) Fallback: reconstruct from discretized survival_targets (less ideal)
+        st = batch_data.get("survival_targets", None)
         if st is None:
             return None
-
-        # Lazy init survival metrics if needed
-        if self.survival_metrics is None and self._survival_intervals is not None:
+        if self.survival_metrics is None:
+            # if still not initialized, set default/fallback intervals
+            if self._survival_intervals is None:
+                self._survival_intervals = np.array([0, 1, 2, 3, 5, 7, 10], dtype=float)
             self.survival_metrics = SurvivalMetrics(self._survival_intervals)
-
-        target_y = st['target_y'][idx]
-        at_risk_mask = st['at_risk_mask'][idx]
-
-        # Convert to numpy for indexing
+        target_y = st["target_y"][idx]
+        at_risk_mask = st["at_risk_mask"][idx]
         if isinstance(target_y, torch.Tensor):
             target_y = target_y.detach().cpu().numpy()
         if isinstance(at_risk_mask, torch.Tensor):
             at_risk_mask = at_risk_mask.detach().cpu().numpy()
-
-        # Event occurs in the interval where target_y == 1, else censored at last at-risk interval
         if (target_y > 0.5).any():
             k = int(np.argmax(target_y))
             event = 1.0
@@ -506,17 +528,9 @@ class PathologyMetric(BaseMetric):
             at_risk_indices = np.where(at_risk_mask > 0.5)[0]
             k = int(at_risk_indices.max()) if len(at_risk_indices) > 0 else 0
             event = 0.0
-
-        # Ensure k is within valid range for interval_endpoints
-        if self.survival_metrics is not None:
-            k = min(k, len(self.survival_metrics.interval_endpoints) - 1)
-            # Map interval index to time using interval right endpoints (ensures within bounds)
-            time = float(self.survival_metrics.interval_endpoints[k])
-        else:
-            # Fallback if survival_metrics not initialized yet
-            time = float(k + 1)  # Simple fallback
-        
-        return {'time': time, 'event': event}
+        k = min(k, len(self.survival_metrics.interval_endpoints) - 1)
+        time = float(self.survival_metrics.interval_endpoints[k])  # right endpoint
+        return {"time": time, "event": event}
 
     def _extract_filename_from_image_file(self, image_file_batch: Any, idx: int) -> str:
         """Extract filename from image file batch."""
@@ -603,14 +617,24 @@ class PathologyMetric(BaseMetric):
         self._text_metrics_table = table
         return metrics
 
+    def _extract_choices_block(self, input_text: str) -> str:
+        """Extract the raw <CHOICES>...</CHOICES> block from an input string."""
+        if not input_text:
+            return ""
+        for pattern in [
+            r'<CHOICES>(.*?)</CHOICES>',
+            r'<CHOICES>(.*?)(?:assistant|$)',
+        ]:
+            match = re.search(pattern, input_text, re.DOTALL | re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
 
     def _extract_choices_from_input(self, input_text: str) -> frozenset:
         """Extract actual choice content from MCQA input text."""
-        match = re.search(r'<CHOICES>(.*?)</CHOICES>', input_text, re.DOTALL | re.IGNORECASE)
-        if not match:
-            match = re.search(r'<CHOICES>(.*?)(?:assistant|$)', input_text, re.DOTALL | re.IGNORECASE)
-        if match:
-            choices_text = match.group(1).strip()
+        choices_text = self._extract_choices_block(input_text)
+        if choices_text:
             # Extract choice content after A), B), C), etc.
             choice_contents = re.findall(r'^[A-Z]\)\s*(.+?)$', choices_text, re.MULTILINE)
             return frozenset(c.strip() for c in choice_contents)
@@ -625,12 +649,8 @@ class PathologyMetric(BaseMetric):
         choice_letter = choice_letter.strip().upper()
         
         # Extract choices block
-        match = re.search(r'<CHOICES>(.*?)</CHOICES>', input_text, re.DOTALL | re.IGNORECASE)
-        if not match:
-            match = re.search(r'<CHOICES>(.*?)(?:assistant|$)', input_text, re.DOTALL | re.IGNORECASE)
-        
-        if match:
-            choices_text = match.group(1).strip()
+        choices_text = self._extract_choices_block(input_text)
+        if choices_text:
             # Try multiple patterns to match the choice
             patterns = [
                 rf'^{re.escape(choice_letter)}\)\s*(.+?)$',  # A) content
@@ -650,14 +670,35 @@ class PathologyMetric(BaseMetric):
         # Fallback: return original letter if mapping fails
         return choice_letter
 
+    def _infer_num_choices(self, input_text: str) -> int:
+        """Infer number of options (K) for a MCQA question from its input."""
+        block = self._extract_choices_block(input_text)
+        if not block:
+            return 0
+        raw_letters = re.findall(r'^\s*([A-E])[\)\.:]', block, flags=re.MULTILINE | re.IGNORECASE)
+        letters = {self._extract_mcqa_choice(x) for x in raw_letters}
+        letters.discard('')
+        if letters:
+            return len(letters)
+        # Fallback: count extracted contents
+        contents = self._extract_choices_from_input(input_text)
+        return len(contents)
+
     def _compute_mcqa_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute MCQA balanced accuracy metrics per category and overall."""
+        """Compute MCQA metrics per category.
+
+        Rules:
+                - If K=2: compute weighted-F1, BACC, and AUROC (if choice logits exist) + ACC.
+                - If K>2:
+                    - If all questions share the same global choice set (same choice contents): compute weighted-F1 + BACC + ACC.
+                    - Otherwise: ACC only.
+        """
         if not results:
             self._mcqa_metrics_table = []
             return {}
         
         # Group by category: collect predictions, targets, and inputs
-        category_groups = defaultdict(lambda: {'preds': [], 'targets': [], 'inputs': []})
+        category_groups = defaultdict(lambda: {'preds': [], 'targets': [], 'inputs': [], 'choice_logits': []})
         
         for res in results:
             pred_choice = res.get('pred_choice', '')
@@ -669,42 +710,206 @@ class PathologyMetric(BaseMetric):
                 category_groups[category]['preds'].append(pred_choice)
                 category_groups[category]['targets'].append(target_choice)
                 category_groups[category]['inputs'].append(input_text)
+                category_groups[category]['choice_logits'].append(res.get('choice_logits'))
         
-        # Compute per-category balanced accuracy
+        # Compute per-category metrics
         engine_metrics = {}
         table = []
-        category_metrics = []  # Store (bacc, sample_count) for weighted average
+
+        # Overall summaries (kept simple and explicit)
+        total_correct = 0
+        total_samples = 0
+        auroc_weighted = []  # (auroc, n)
+        wf1_weighted = []    # (weighted_f1, n)
+        bacc_weighted = []   # (bacc, n)
 
         for cat in sorted(category_groups.keys()):
             group = category_groups[cat]
             if len(group['preds']) > 0:
-                # Check if all samples have same choice set
+                sample_count = len(group['preds'])
+                total_samples += sample_count
+                cat_correct = int(np.sum([p == t for p, t in zip(group['preds'], group['targets'])]))
+                total_correct += cat_correct
+                acc = float(cat_correct / sample_count) if sample_count > 0 else 0.0
+
+                # Infer option count K (best-effort; fall back to observed label space)
+                ks = [self._infer_num_choices(inp) for inp in group['inputs']]
+                known_ks = [k for k in ks if k > 0]
+                observed_labels = sorted({x for x in (group['targets'] + group['preds']) if x})
+                if known_ks:
+                    is_binary = all(k == 2 for k in known_ks)
+                    has_multichoice = any(k > 2 for k in known_ks)
+                else:
+                    is_binary = (len(observed_labels) == 2)
+                    has_multichoice = False
+
+                # If any sample indicates K>2, do not treat as binary
+                all_binary = bool(is_binary and not has_multichoice)
+
+                safe_cat = self._make_safe_key(cat, fallback='unknown')
+
+                if all_binary:
+                    # Weighted-F1 + BACC on observed labels
+                    weighted_f1 = None
+                    bacc = None
+                    if observed_labels:
+                        try:
+                            weighted_f1 = float(f1_score(group['targets'], group['preds'], average='weighted', labels=observed_labels))
+                        except Exception:
+                            weighted_f1 = 0.0
+                        try:
+                            bacc = float(balanced_accuracy_score(group['targets'], group['preds']))
+                        except Exception:
+                            bacc = None
+
+                    # AUROC: use logits for the two labels when available (pos label defaults to 'A' if present)
+                    auroc = None
+                    if len(observed_labels) == 2:
+                        pos_label = 'A' if 'A' in observed_labels else observed_labels[0]
+                        neg_label = observed_labels[1] if observed_labels[0] == pos_label else observed_labels[0]
+                        y_true, y_score = [], []
+                        for t, logits in zip(group['targets'], group['choice_logits']):
+                            if t not in (pos_label, neg_label):
+                                continue
+                            if not isinstance(logits, dict) or pos_label not in logits or neg_label not in logits:
+                                continue
+                            try:
+                                y_true.append(1 if t == pos_label else 0)
+                                y_score.append(float(logits[pos_label]) - float(logits[neg_label]))
+                            except Exception:
+                                continue
+                        if len(set(y_true)) >= 2 and len(y_true) >= 2:
+                            try:
+                                auroc = float(roc_auc_score(y_true, y_score))
+                            except Exception:
+                                auroc = None
+
+                    # Emit metrics
+                    engine_metrics[f'eval/mcqa_{safe_cat}_acc'] = acc
+                    if isinstance(weighted_f1, (float, int)):
+                        engine_metrics[f'eval/mcqa_{safe_cat}_weighted_f1'] = float(weighted_f1)
+                        wf1_weighted.append((float(weighted_f1), sample_count))
+                    if isinstance(bacc, (float, int)):
+                        engine_metrics[f'eval/mcqa_{safe_cat}_bacc'] = float(bacc)
+                        bacc_weighted.append((float(bacc), sample_count))
+                    if auroc is not None:
+                        engine_metrics[f'eval/mcqa_{safe_cat}_auroc'] = float(auroc)
+                        auroc_weighted.append((float(auroc), sample_count))
+
+                    table.append({
+                        'category': cat,
+                        'metrics': {
+                            'primary': 'AUROC',
+                            'auroc': float(auroc) if auroc is not None else None,
+                            'weighted_f1': float(weighted_f1) if isinstance(weighted_f1, (float, int)) else None,
+                            'bacc': float(bacc) if isinstance(bacc, (float, int)) else None,
+                            'acc': acc,
+                            'K': 2,
+                            'has_choice_logits': auroc is not None,
+                        },
+                        'count': sample_count
+                    })
+                    continue
+
+                # K>2 path: check whether all samples share the same choice set
                 choice_sets = [self._extract_choices_from_input(inp) for inp in group['inputs']]
                 unique_choice_sets = set(choice_sets)
-                
-                if len(unique_choice_sets) == 1 and unique_choice_sets != {frozenset()}:
-                    # Map letters to actual choice content before computing BACC
-                    mapped_preds = [self._map_choice_to_content(group['preds'][i], group['inputs'][i]) for i in range(len(group['preds']))]
-                    mapped_targets = [self._map_choice_to_content(group['targets'][i], group['inputs'][i]) for i in range(len(group['targets']))]
-                    bacc = balanced_accuracy_score(mapped_targets, mapped_preds)
-                else:
-                    # Use standard ACC when choice sets differ
-                    bacc = np.mean([p == t for p, t in zip(group['preds'], group['targets'])])
-                
-                sample_count = len(group['preds'])
-                category_metrics.append((bacc, sample_count))
-                
-                safe_cat = self._make_safe_key(cat, fallback='unknown')
-                engine_metrics[f'eval/mcqa_{safe_cat}_balanced_accuracy'] = float(bacc)
-                table.append({'category': cat, 'metrics': {'balanced_accuracy': float(bacc)}, 'count': sample_count})
-        
-        # Overall: weighted average of per-category BACC/ACC
-        if category_metrics:
-            total_samples = sum(count for _, count in category_metrics)
-            overall_weighted_acc = sum(bacc * count for bacc, count in category_metrics) / total_samples if total_samples > 0 else 0.0
-            
-            engine_metrics['eval/mcqa_overall_balanced_accuracy'] = float(overall_weighted_acc)
-            table.append({'category': 'Overall', 'metrics': {'balanced_accuracy': float(overall_weighted_acc)}, 'count': total_samples})
+                has_global_label_space = (len(unique_choice_sets) == 1 and unique_choice_sets != {frozenset()})
+
+                if has_global_label_space:
+                    global_choices = sorted(list(next(iter(unique_choice_sets))))
+                    idx_map = {c: i for i, c in enumerate(global_choices)}
+                    mapped_preds, mapped_targets = [], []
+                    mapping_failed = False
+
+                    for i in range(sample_count):
+                        mp = self._map_choice_to_content(group['preds'][i], group['inputs'][i])
+                        mt = self._map_choice_to_content(group['targets'][i], group['inputs'][i])
+                        if mp not in idx_map or mt not in idx_map:
+                            mapping_failed = True
+                            break
+                        mapped_preds.append(idx_map[mp])
+                        mapped_targets.append(idx_map[mt])
+
+                    if not mapping_failed and mapped_targets:
+                        try:
+                            weighted_f1 = float(f1_score(mapped_targets, mapped_preds, average='weighted'))
+                        except Exception:
+                            weighted_f1 = 0.0
+                        try:
+                            bacc = float(balanced_accuracy_score(mapped_targets, mapped_preds))
+                        except Exception:
+                            bacc = None
+
+                        engine_metrics[f'eval/mcqa_{safe_cat}_weighted_f1'] = float(weighted_f1)
+                        wf1_weighted.append((float(weighted_f1), sample_count))
+                        if isinstance(bacc, (float, int)):
+                            engine_metrics[f'eval/mcqa_{safe_cat}_bacc'] = float(bacc)
+                            bacc_weighted.append((float(bacc), sample_count))
+                        engine_metrics[f'eval/mcqa_{safe_cat}_acc'] = acc
+                        table.append({
+                            'category': cat,
+                            'metrics': {
+                                'primary': 'Weighted-F1',
+                                'weighted_f1': float(weighted_f1),
+                                'bacc': float(bacc) if isinstance(bacc, (float, int)) else None,
+                                'acc': acc,
+                                'K': (max(known_ks) if known_ks else (len(global_choices) if global_choices else None)),
+                                'global_label_space': True,
+                            },
+                            'count': sample_count
+                        })
+                        continue
+
+                # Fallback: ACC only
+                engine_metrics[f'eval/mcqa_{safe_cat}_acc'] = acc
+                table.append({
+                    'category': cat,
+                    'metrics': {
+                        'primary': 'ACC',
+                        'acc': acc,
+                        'K': max(known_ks) if known_ks else None,
+                        'global_label_space': False,
+                    },
+                    'count': sample_count
+                })
+
+        # Overall metrics
+        overall_acc = float(total_correct / total_samples) if total_samples > 0 else 0.0
+        engine_metrics['eval/mcqa_overall_acc'] = overall_acc
+
+        overall_auroc = None
+        if auroc_weighted:
+            denom = sum(n for _, n in auroc_weighted)
+            if denom > 0:
+                overall_auroc = float(sum(v * n for v, n in auroc_weighted) / denom)
+                engine_metrics['eval/mcqa_overall_auroc'] = overall_auroc
+
+        overall_weighted_f1 = None
+        if wf1_weighted:
+            denom = sum(n for _, n in wf1_weighted)
+            if denom > 0:
+                overall_weighted_f1 = float(sum(v * n for v, n in wf1_weighted) / denom)
+                engine_metrics['eval/mcqa_overall_weighted_f1'] = overall_weighted_f1
+
+        overall_bacc = None
+        if bacc_weighted:
+            denom = sum(n for _, n in bacc_weighted)
+            if denom > 0:
+                overall_bacc = float(sum(v * n for v, n in bacc_weighted) / denom)
+                engine_metrics['eval/mcqa_overall_bacc'] = overall_bacc
+
+        table.append({
+            'category': 'Overall',
+            'metrics': {
+                'primary': 'ACC',
+                'acc': overall_acc,
+                'auroc_weighted': overall_auroc,
+                'weighted_f1_weighted': overall_weighted_f1,
+                'bacc_weighted': overall_bacc,
+            },
+            'count': total_samples
+        })
 
         self._mcqa_metrics_table = table
         
@@ -935,6 +1140,11 @@ class PathologyMetric(BaseMetric):
             self._save_json_file(results, merged_path, f"{len(results)} {task_type} results")
             self._save_project_results(results, task_type)
 
+            # Save MCQA metric summary table for easy inspection
+            if task_type == 'mcqa' and hasattr(self, '_mcqa_metrics_table'):
+                summary_path = os.path.join(self.output_dir, 'mcqa_metrics_summary.json')
+                self._save_json_file(self._mcqa_metrics_table, summary_path, 'MCQA metric summary')
+
     def _save_project_results(self, results: List[Dict], task_type: str) -> None:
         """Persist results split by project, adding per-category files for survival."""
         project_results = defaultdict(list)
@@ -1034,23 +1244,39 @@ class PathologyMetric(BaseMetric):
         print_log("-" * 120, 'current')
 
     def _print_mcqa_summary(self) -> None:
-        """Print MCQA balanced accuracy metrics per category."""
+        """Print MCQA metrics per category with the selected primary metric."""
         table = getattr(self, '_mcqa_metrics_table', None)
         if not table:
             return
 
         print_log("\nMULTI-CHOICE QA RESULTS (Per Category):", 'current')
-        print_log("-" * 80, 'current')
-        print_log(f"{'Category':<30} {'Balanced Acc':<15} {'Count':<10}", 'current')
-        print_log("-" * 80, 'current')
+        print_log("-" * 120, 'current')
+        print_log(f"{'Category':<30} {'Primary':<12} {'AUROC':<12} {'W-F1':<12} {'BACC':<12} {'ACC':<12} {'K':<6} {'Count':<10}", 'current')
+        print_log("-" * 120, 'current')
 
         for row in table:
-            bacc = row.get('metrics', {}).get('balanced_accuracy', 0.0)
+            metrics = row.get('metrics', {})
+            primary = metrics.get('primary', 'ACC')
+            auroc = metrics.get('auroc', metrics.get('auroc_weighted', None))
+            # New preferred keys; fall back to legacy names if present
+            weighted_f1 = metrics.get('weighted_f1', metrics.get('weighted_f1_weighted', None))
+            if weighted_f1 is None:
+                weighted_f1 = metrics.get('macro_f1', metrics.get('macro_f1_weighted', None))
+            bacc = metrics.get('bacc', metrics.get('bacc_weighted', None))
+            acc = metrics.get('acc', 0.0)
+            k = metrics.get('K', '')
             count = row.get('count', 0)
             category = row.get('category', 'Unknown')
-            print_log(f"{category:<30} {bacc:<15.4f} {count:<10}", 'current')
+            auroc_s = f"{auroc:<12.4f}" if isinstance(auroc, (float, int)) else f"{'-':<12}"
+            wf1_s = f"{weighted_f1:<12.4f}" if isinstance(weighted_f1, (float, int)) else f"{'-':<12}"
+            bacc_s = f"{bacc:<12.4f}" if isinstance(bacc, (float, int)) else f"{'-':<12}"
+            k_s = str(k) if k is not None else ''
+            print_log(
+                f"{category:<30} {str(primary):<12} {auroc_s} {wf1_s} {bacc_s} {acc:<12.4f} {k_s:<6} {count:<10}",
+                'current'
+            )
 
-        print_log("-" * 80, 'current')
+        print_log("-" * 120, 'current')
 
     def _print_regression_summary(self) -> None:
         """Print regression metrics per category."""

@@ -309,7 +309,8 @@ class LLaVAModel_conv_longnet(BaseModel):
             mask = masks.to(conv_input.device, dtype=conv_input.dtype)
         
         # Pass through HighResPartialConvNeXt
-        conv_output, updated_mask = self.conv(conv_input, mask)
+        stage_outputs, updated_mask = self.conv(conv_input, mask)
+        conv_output = stage_outputs[-1]
         
         # Apply 2D rotary positional embedding
         conv_output = self.rotary_emb(conv_output)

@@ -4,11 +4,14 @@ import json
 import logging
 import os
 import warnings
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-# Set a different port for distributed training to avoid EADDRINUSE error
+# os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+# os.environ['RANK'] = '0'
+# os.environ['WORLD_SIZE'] = '1'
+# os.environ['LOCAL_RANK'] = '0'
+# os.environ['MASTER_ADDR'] = 'localhost'
 # if 'MASTER_PORT' not in os.environ:
-#     os.environ['MASTER_PORT'] = '29501'
+#     os.environ['MASTER_PORT'] = '29508'
 import os.path as osp
 from functools import partial
 from types import FunctionType
@@ -65,9 +68,9 @@ def parse_args():
     parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
     
-    # args.config = '/mnt/petrelfs/zhouxiao/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py'
-    # args.deepspeed = '/mnt/petrelfs/zhouxiao/project/TCGA/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
-    # args.work_dir = '/home/ps/pathology/codes/project/TCGA/train_s2'
+    # args.config = '/home/xiaozhou/data/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl.py'
+    # args.deepspeed = '/home/xiaozhou/data/project/TCGA/SlideChat/xtuner/configs/deepspeed/deepspeed_zero2.json'
+    # args.work-dir = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv'
    
     return args
 

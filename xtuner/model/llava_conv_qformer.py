@@ -387,7 +387,8 @@ class LLaVAModel_conv_qformer(BaseModel):
             mask = masks.to(device, dtype=dtype)
         
         # Pass through HighResPartialConvNeXt
-        conv_output, updated_mask = self.conv(conv_input, mask)
+        stage_outputs, updated_mask = self.conv(conv_input, mask)
+        conv_output = stage_outputs[-1]
         
         # Add positional embedding
         conv_output = self.pos_emb_2d(conv_output)

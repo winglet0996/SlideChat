@@ -1,13 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import os
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-# Set a different port for distributed training to avoid EADDRINUSE error
+# os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+# os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+# # Set a different port for distributed training to avoid EADDRINUSE error
 # if 'MASTER_PORT' not in os.environ:
-    # os.environ['MASTER_PORT'] = '29501'
+#     os.environ['MASTER_PORT'] = '29565'
 import os.path as osp
 from types import FunctionType
+from types import MethodType
 from collections import OrderedDict
 import torch
 
@@ -18,7 +19,6 @@ from mmengine.runner import Runner
 from xtuner.configs import cfgs_name_path
 from xtuner.registry import MAP_FUNC
 
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test model")
@@ -42,8 +42,8 @@ def parse_args():
         help="job launcher",
     )
     args = parser.parse_args()
-    # args.config = '/home/ps/pathology/codes/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py'
-    # args.checkpoint = '/mnt/sda/pathology/codes/project/TCGA/train_s2_regression_qwen3_8b_conv_lora/iter_600.pth/mp_rank_00_model_states.pt'
+    # args.config = '/home/xiaozhou/data/project/TCGA/SlideChat/xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask.py'
+    # args.checkpoint = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask/best_eval_reg_overall_r2_iter_31000.pth'
 
     return args
 
@@ -90,6 +90,41 @@ def main():
 
     # only pretrained weights
     runner = RUNNERS.build(cfg)
+
+    # Debug: MMEngine will crash with a cryptic error if model.test_step returns None.
+    # Wrap it so we can print the offending batch metadata (often a corrupt/missing sample).
+    _orig_test_step = runner.model.test_step
+
+    def _debug_test_step(self, data_batch, *args, **kwargs):
+        try:
+            outputs = _orig_test_step(data_batch, *args, **kwargs)
+        except Exception as e:
+            try:
+                meta = {}
+                if isinstance(data_batch, dict):
+                    d = data_batch.get('data', {}) if isinstance(data_batch.get('data', None), dict) else {}
+                    for k in ['image_file', 'category', 'project']:
+                        if k in d:
+                            meta[k] = d.get(k)
+                runner.logger.error(f'test_step exception. batch_meta={meta}')
+            except Exception:
+                pass
+            raise
+
+        if outputs is None:
+            meta = {}
+            if isinstance(data_batch, dict):
+                d = data_batch.get('data', {}) if isinstance(data_batch.get('data', None), dict) else {}
+                for k in ['image_file', 'category', 'project']:
+                    if k in d:
+                        meta[k] = d.get(k)
+            raise RuntimeError(
+                f'model.test_step returned None. batch_meta={meta}. '
+                'This usually means the dataloader produced an invalid/empty batch or the model predict path bailed out.'
+            )
+        return outputs
+
+    runner.model.test_step = MethodType(_debug_test_step, runner.model)
 
     try:
         checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)

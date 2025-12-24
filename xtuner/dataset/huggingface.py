@@ -292,7 +292,7 @@ def process_hf_dataset(dataset,
                        with_image_token=False,
                        per_image_length=None,
                        max_patch_num=None,
-                       map_num_proc=1,
+                       map_num_proc=None,
                        reg_token=None,
                        srv_token=None):
     """Post-process the dataset loaded from the Hugging Face Hub, or a local
