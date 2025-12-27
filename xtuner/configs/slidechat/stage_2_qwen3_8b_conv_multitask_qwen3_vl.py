@@ -9,7 +9,7 @@ from mmengine.visualization import Visualizer, WandbVisBackend
 
 from torch.optim import AdamW
 from sophia import SophiaG 
-from transformers import (AutoModelForCausalLM, AutoModelForVision2Seq, AutoTokenizer,
+from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
@@ -45,8 +45,9 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
+    ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_multitask_mcqa_srv/iter_750.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
-    ckpt_path = None
+    # ckpt_path = None
     lr = 2e-5
     freeze_llm = True
     max_epochs = 5
@@ -63,12 +64,12 @@ resume = False
 # cat = 'Diagnosis'
 
 llm_name_or_path = 'Qwen/Qwen3-VL-8B-Instruct'
-train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_eval_100.json'
-val_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_eval_100.json'
-test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_test_no-knowledge_eval_100.json'
-# train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
-# val_data_path = '/home/xiaozhou/data/project/TCGA/baseline/tcga_test/tcga_aligned_all.json'
-# test_data_path = '/home/xiaozhou/data/project/TCGA/baseline/tcga_test/tcga_aligned_all.json'
+# train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge_eval_10000.json'
+# val_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all_2000.json'
+# test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all_2000.json'
+train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
+val_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all.json'
+test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
@@ -90,7 +91,7 @@ image_path_list = None
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
-def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=16):
+def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
     import os
     import glob
     import re
@@ -125,7 +126,7 @@ def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=16):
     return None
 
 if resume:
-    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=16)
+    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8)
     
     if latest_valid_ckpt:
         ckpt_path = latest_valid_ckpt
@@ -144,9 +145,9 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 1  # per_device
-accumulative_counts = 1
-dataloader_num_workers = 16
+batch_size = 6  # per_device
+accumulative_counts = 8
+dataloader_num_workers = 8
 optim_type = SophiaG
 betas = (0.9, 0.999)
 rho = 0.01
@@ -372,18 +373,18 @@ env_cfg = dict(
 
 # set visualizer
 visualizer = None
-# visualizer = dict(
-#     type=Visualizer,
-#     vis_backends=[
-#         dict(
-#             type=WandbVisBackend,
-#             init_kwargs=dict(
-#                 project='pathoverse_multitask_conv_mcqa_srv',
-#                 name=vis_name
-#             )
-#         )
-#     ]
-# )
+visualizer = dict(
+    type=Visualizer,
+    vis_backends=[
+        dict(
+            type=WandbVisBackend,
+            init_kwargs=dict(
+                project='pathoverse_multitask_conv_mcqa_srv',
+                name=vis_name
+            )
+        )
+    ]
+)
 
 # set log level
 log_level = 'INFO'

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 from transformers import InstructBlipQFormerConfig
 from transformers.models.instructblip.modeling_instructblip import InstructBlipQFormerEncoder
 from typing import Optional, Tuple, Iterable, Literal

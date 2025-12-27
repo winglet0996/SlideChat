@@ -9,7 +9,7 @@ from mmengine.visualization import Visualizer, WandbVisBackend
 
 from torch.optim import AdamW
 from sophia import SophiaG 
-from transformers import (AutoModelForCausalLM, AutoModelForVision2Seq, AutoTokenizer,
+from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
@@ -69,7 +69,7 @@ llm_name_or_path = 'Qwen/Qwen3-VL-8B-Instruct'
 train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
 val_data_path = '/home/xiaozhou/data/project/TCGA/baseline/tcga_test/tcga_aligned_all.json'
 # test_data_path = '/home/xiaozhou/data/project/TCGA/baseline/tcga_test/tcga_aligned_all.json'
-test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all_10000.json'
+test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all_2000_srv.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None

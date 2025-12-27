@@ -2,7 +2,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 
 import torch.nn as nn
-from timm.models.layers import drop_path
+from timm.layers import drop_path
 
 
 class DropPath(nn.Module):

@@ -381,6 +381,37 @@ class LLaVAModel_conv(BaseModel):
             return getattr(self.llm.config.text_config, 'hidden_size')
         raise AttributeError("Could not determine hidden_size from LLM config")
 
+    def _get_language_model_norm(self):
+        """Get the final RMSNorm layer from the language model.
+        
+        This is needed because hidden_states[-1] from output_hidden_states=True
+        are PRE-normalization. The model internally applies RMSNorm before lm_head.
+        We need to apply the same normalization for regression/survival heads.
+        
+        Handles both:
+        - Direct model: self.llm.model.language_model.norm
+        - PEFT-wrapped: self.llm.base_model.model.model.language_model.norm
+        """
+        # Try different paths for PEFT and non-PEFT models
+        paths_to_try = [
+            # PEFT-wrapped Qwen3-VL
+            lambda: self.llm.base_model.model.model.language_model.norm,
+            # Non-PEFT Qwen3-VL
+            lambda: self.llm.model.language_model.norm,
+            # Alternative PEFT path
+            lambda: self.llm.model.model.language_model.norm,
+        ]
+        
+        for get_norm in paths_to_try:
+            try:
+                norm = get_norm()
+                if norm is not None:
+                    return norm
+            except AttributeError:
+                continue
+        
+        return None
+
     def _init_projector(self, depth: int = 2) -> None:
         """Initialize the vision-language projector."""
         self.projectors = nn.ModuleList()
@@ -1106,12 +1137,26 @@ class LLaVAModel_conv(BaseModel):
             full_attention_mask = torch.cat([prefix_attention_mask.to(device), gen_attn], dim=1)  # (B, Lp+Lg)
 
             # Position IDs (optional). If prefix provided, continue monotonically; else omit.
+            # For Qwen3-VL, position_ids has shape (3, B, Lp) for 3D M-RoPE (temporal, height, width)
             if prefix_position_ids is not None:
                 prefix_position_ids = prefix_position_ids.to(device)
-                last_pos = prefix_position_ids[:, -1].unsqueeze(1)  # (B, 1)
-                incr = torch.arange(1, Lg + 1, device=device).view(1, -1)  # (1, Lg)
-                gen_pos = last_pos + incr  # (B, Lg)
-                full_position_ids = torch.cat([prefix_position_ids, gen_pos], dim=1)  # (B, Lp+Lg)
+                
+                # Check if this is Qwen3-VL style 3D position IDs (3, B, L) or standard 2D (B, L)
+                if prefix_position_ids.dim() == 3 and prefix_position_ids.size(0) == 3:
+                    # Qwen3-VL: position_ids shape is (3, B, Lp)
+                    # For generated text tokens, all 3 dimensions should increment monotonically from last position
+                    last_pos = prefix_position_ids[:, :, -1:].max(dim=0, keepdim=False)[0]  # (B, 1) - use max across 3 dims
+                    incr = torch.arange(1, Lg + 1, device=device).view(1, -1)  # (1, Lg)
+                    gen_pos = last_pos + incr  # (B, Lg)
+                    # Expand to (3, B, Lg) - text tokens use same position for all 3 dimensions
+                    gen_pos_3d = gen_pos.unsqueeze(0).expand(3, -1, -1)  # (3, B, Lg)
+                    full_position_ids = torch.cat([prefix_position_ids, gen_pos_3d], dim=2)  # (3, B, Lp+Lg)
+                else:
+                    # Standard 2D position_ids (B, L)
+                    last_pos = prefix_position_ids[:, -1].unsqueeze(1)  # (B, 1)
+                    incr = torch.arange(1, Lg + 1, device=device).view(1, -1)  # (1, Lg)
+                    gen_pos = last_pos + incr  # (B, Lg)
+                    full_position_ids = torch.cat([prefix_position_ids, gen_pos], dim=1)  # (B, Lp+Lg)
             else:
                 full_position_ids = None
 
@@ -1213,7 +1258,10 @@ class LLaVAModel_conv(BaseModel):
         last_hidden = outputs.hidden_states[-1]
 
         # Compute LM loss (causal shift)
-        logits = self.llm.lm_head(last_hidden)
+        # CRITICAL: Use outputs.logits directly, NOT self.llm.lm_head(last_hidden)!
+        # Qwen3-VL applies RMSNorm to hidden states before lm_head internally.
+        # Using raw hidden states produces incorrect logits (off by ~150 in magnitude).
+        logits = outputs.logits
         labels = data.get('labels', None)
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
@@ -1224,7 +1272,15 @@ class LLaVAModel_conv(BaseModel):
         else:
             lm_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
-        self._last_hidden_state = last_hidden
+        # For regression/survival heads, we also need to apply RMSNorm to be consistent
+        # with how the lm_head receives hidden states. This ensures the task heads 
+        # receive properly normalized features.
+        norm = self._get_language_model_norm()
+        if norm is not None:
+            self._last_hidden_state = norm(last_hidden)
+        else:
+            # Fallback for models without this structure
+            self._last_hidden_state = last_hidden
 
         # One-time token debug
         if not hasattr(self, '_logged_token_stats'):
