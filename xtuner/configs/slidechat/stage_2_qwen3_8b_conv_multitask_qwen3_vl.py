@@ -45,7 +45,7 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_multitask_mcqa_srv/iter_750.pth'
+    ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_2500.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
     # ckpt_path = None
     lr = 2e-5
@@ -59,7 +59,7 @@ if setting == 'full_param':
     ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
-resume = False
+resume = True
 
 # cat = 'Diagnosis'
 
@@ -174,7 +174,7 @@ model = dict(
     freeze_llm=freeze_llm,
     hidden_size=4096,
     llm=dict(
-        type=AutoModelForVision2Seq.from_pretrained,
+        type=AutoModelForImageTextToText.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
         torch_dtype=torch.float16,
