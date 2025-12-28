@@ -31,7 +31,7 @@ Requires-Dist: SentencePiece
 Requires-Dist: tiktoken
 Requires-Dist: torch
 Requires-Dist: torchvision
-Requires-Dist: transformers!=4.38.0,!=4.38.1,!=4.38.2,<=4.42.4,>=4.36.0
+Requires-Dist: transformers
 Requires-Dist: transformers_stream_generator
 Provides-Extra: all
 Requires-Dist: bitsandbytes>=0.40.0.post4; extra == "all"
@@ -47,7 +47,7 @@ Requires-Dist: SentencePiece; extra == "all"
 Requires-Dist: tiktoken; extra == "all"
 Requires-Dist: torch; extra == "all"
 Requires-Dist: torchvision; extra == "all"
-Requires-Dist: transformers!=4.38.0,!=4.38.1,!=4.38.2,<=4.42.4,>=4.36.0; extra == "all"
+Requires-Dist: transformers; extra == "all"
 Requires-Dist: transformers_stream_generator; extra == "all"
 Requires-Dist: deepspeed>=0.12.3; extra == "all"
 Requires-Dist: mpi4py-mpich; extra == "all"
@@ -66,7 +66,7 @@ Requires-Dist: SentencePiece; extra == "deepspeed"
 Requires-Dist: tiktoken; extra == "deepspeed"
 Requires-Dist: torch; extra == "deepspeed"
 Requires-Dist: torchvision; extra == "deepspeed"
-Requires-Dist: transformers!=4.38.0,!=4.38.1,!=4.38.2,<=4.42.4,>=4.36.0; extra == "deepspeed"
+Requires-Dist: transformers; extra == "deepspeed"
 Requires-Dist: transformers_stream_generator; extra == "deepspeed"
 Requires-Dist: deepspeed>=0.12.3; extra == "deepspeed"
 Requires-Dist: mpi4py-mpich; extra == "deepspeed"
@@ -84,7 +84,7 @@ Requires-Dist: SentencePiece; extra == "modelscope"
 Requires-Dist: tiktoken; extra == "modelscope"
 Requires-Dist: torch; extra == "modelscope"
 Requires-Dist: torchvision; extra == "modelscope"
-Requires-Dist: transformers!=4.38.0,!=4.38.1,!=4.38.2,<=4.42.4,>=4.36.0; extra == "modelscope"
+Requires-Dist: transformers; extra == "modelscope"
 Requires-Dist: transformers_stream_generator; extra == "modelscope"
 Requires-Dist: modelscope; extra == "modelscope"
 Dynamic: author

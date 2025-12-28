@@ -843,7 +843,7 @@ class LLaVAModel_conv(BaseModel):
         """Configure QLoRA with DeepSpeed ZeRO3."""
         if is_deepspeed_zero3_enabled() and hasattr(cfg, 'quantization_config'):
             torch_dtype = self._get_torch_dtype()
-            cfg.torch_dtype = torch_dtype
+            cfg.dtype = torch_dtype
             cfg.quantization_config.bnb_4bit_compute_dtype = torch_dtype
             cfg.quantization_config.bnb_4bit_quant_storage = torch_dtype
         return cfg
@@ -854,9 +854,9 @@ class LLaVAModel_conv(BaseModel):
         torch_dtype = self._get_torch_dtype()
 
         if getattr(cfg, 'attn_implementation', None) == 'flash_attention_2':
-            cfg.torch_dtype = torch_dtype
+            cfg.dtype = torch_dtype
         elif SUPPORT_FLASH2 and cls_name in self.SUPPORT_CONFIGS['FLASH2']:
-            cfg.torch_dtype = torch_dtype
+            cfg.dtype = torch_dtype
             cfg.attn_implementation = 'flash_attention_2'
         elif SUPPORT_FLASH1 and cls_name in self.SUPPORT_CONFIGS['SDPA']:
             cfg.attn_implementation = 'sdpa'

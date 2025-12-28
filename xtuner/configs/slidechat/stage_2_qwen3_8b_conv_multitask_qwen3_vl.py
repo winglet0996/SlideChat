@@ -33,7 +33,7 @@ if setting == 'alignment':
     freeze_llm = True
     lr = 1e-4  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    max_epochs = 1
+    max_epochs = 10
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -45,12 +45,12 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_2500.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_multitask_mcqa_srv_debug/iter_1180.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
     # ckpt_path = None
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 5
+    max_epochs = 50
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -59,33 +59,33 @@ if setting == 'full_param':
     ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
-resume = True
+resume = False
 
 # cat = 'Diagnosis'
 
-llm_name_or_path = 'Qwen/Qwen3-VL-8B-Instruct'
-# train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge_eval_10000.json'
-# val_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all_2000.json'
-# test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all_2000.json'
-train_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
-val_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all.json'
-test_data_path = '/home/xiaozhou/data/project/TCGA/dataset_pp/tcga_aligned_all.json'
+llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-8B-Instruct'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_mutation_tp53.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_mutation_tp53.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_mutation_tp53.json'
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_all.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_all.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask_mcqa_srv/'
-vis_name = f'qwen3_8b_conv_{setting}_multitask_mcqa_srv'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask_mcqa_srv_debug/'
+vis_name = f'qwen3_8b_conv_{setting}_multitask_mcqa_srv_debug'
 
 val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 2500  # More frequent saves for alignment debugging
+save_steps = 500  # More frequent saves for alignment debugging
 save_total_limit = 3  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 2500  # More frequent evaluation for alignment debugging
+evaluation_freq = 500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -138,7 +138,7 @@ del _get_latest_valid_deepspeed_checkpoint
 
 max_length = 256000
 max_patch_num = None
-max_new_tokens = 1
+max_new_tokens = 3
 repetition_penalty = 1.0
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
@@ -146,7 +146,7 @@ sample_type='wsi' # 'wsi'or'image'
 
 # Scheduler & Optimizer
 batch_size = 6  # per_device
-accumulative_counts = 8
+accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = SophiaG
 betas = (0.9, 0.999)
@@ -177,7 +177,7 @@ model = dict(
         type=AutoModelForImageTextToText.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         attn_implementation='flash_attention_2',
         # quantization_config=dict(
         #     type=BitsAndBytesConfig,
@@ -373,18 +373,18 @@ env_cfg = dict(
 
 # set visualizer
 visualizer = None
-visualizer = dict(
-    type=Visualizer,
-    vis_backends=[
-        dict(
-            type=WandbVisBackend,
-            init_kwargs=dict(
-                project='pathoverse_multitask_conv_mcqa_srv',
-                name=vis_name
-            )
-        )
-    ]
-)
+# visualizer = dict(
+#     type=Visualizer,
+#     vis_backends=[
+#         dict(
+#             type=WandbVisBackend,
+#             init_kwargs=dict(
+#                 project='pathoverse_multitask_conv_mcqa_srv',
+#                 name=vis_name
+#             )
+#         )
+#     ]
+# )
 
 # set log level
 log_level = 'INFO'

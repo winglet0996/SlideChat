@@ -50,6 +50,7 @@ xtuner/configs/slidechat/stage_1_qwen3_8b_longnet.py
 xtuner/configs/slidechat/stage_2.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_no_knowledge.py
