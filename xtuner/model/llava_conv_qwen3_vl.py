@@ -21,7 +21,17 @@ def patch_qwen3_vl_deepstack():
     old_process = Qwen3VLTextModel._deepstack_process
     @functools.wraps(old_process)
     def new_process(self, hidden_states, visual_pos_masks, visual_embeds):
-        return old_process(self, hidden_states, visual_pos_masks, visual_embeds) if visual_embeds is not None else hidden_states
+        if visual_embeds is None or visual_pos_masks is None:
+            return hidden_states
+        
+        if visual_pos_masks.shape[1] != hidden_states.shape[1]:
+            # Handle generation case where hidden_states is sliced but visual_pos_masks is not
+            visual_pos_masks = visual_pos_masks[:, -hidden_states.shape[1]:]
+            
+        if not visual_pos_masks.any():
+            return hidden_states
+            
+        return old_process(self, hidden_states, visual_pos_masks, visual_embeds)
     Qwen3VLTextModel._deepstack_process = new_process
 
     def patch_forward(cls):
