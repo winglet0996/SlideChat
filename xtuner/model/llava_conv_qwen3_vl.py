@@ -92,6 +92,7 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
                                     position_ids=None, past_key_values=None,
                                     image_grid_thw=None,
                                     deepstack_pixel_values=None,
+                                    padding_side='right',
                                     **kwargs):
     """
     Custom multimodal preparation for Qwen3-VL that also returns visual_pos_masks.
@@ -201,11 +202,18 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
 
     for i, (emb, lbl, vmask, pids) in enumerate(zip(new_inputs_embeds, new_labels, new_visual_masks, new_position_ids)):
         cur_len = emb.shape[0]
-        final_inputs_embeds[i, :cur_len] = emb
-        final_labels[i, :cur_len] = lbl
-        final_attention_mask[i, :cur_len] = True
-        final_visual_pos_masks[i, :cur_len] = vmask
-        final_position_ids[:, i, :cur_len] = pids
+        if padding_side == 'right':
+            final_inputs_embeds[i, :cur_len] = emb
+            final_labels[i, :cur_len] = lbl
+            final_attention_mask[i, :cur_len] = True
+            final_visual_pos_masks[i, :cur_len] = vmask
+            final_position_ids[:, i, :cur_len] = pids
+        else:
+            final_inputs_embeds[i, -cur_len:] = emb
+            final_labels[i, -cur_len:] = lbl
+            final_attention_mask[i, -cur_len:] = True
+            final_visual_pos_masks[i, -cur_len:] = vmask
+            final_position_ids[:, i, -cur_len:] = pids
 
     # Prepare DeepStack embeds: List[Tensor] where each tensor is (total_num_images * seq_len, hidden_dim)
     if all_deepstack_embeds:
@@ -457,6 +465,13 @@ class LLaVAModel_conv(BaseModel):
         if enable_survival:
             self.srv_token_id = self.tokenizer.convert_tokens_to_ids(self.srv_token)
             self._init_token_embedding(self.srv_token_id, 'survival')
+
+        # Ensure pad_token_id is set for the model to avoid defaulting to 0 ('!' in Qwen)
+        if getattr(self.llm.config, 'pad_token_id', None) is None:
+            if self.tokenizer.pad_token_id is not None:
+                self.llm.config.pad_token_id = self.tokenizer.pad_token_id
+            elif self.tokenizer.eos_token_id is not None:
+                self.llm.config.pad_token_id = self.tokenizer.eos_token_id
 
         # Enable training for new special tokens while allowing broader gradient flow
         if enable_regression or enable_survival:
@@ -946,8 +961,9 @@ class LLaVAModel_conv(BaseModel):
 
         # Prepare multimodal inputs
         is_qwen3_vl = getattr(self.llm.config, 'model_type', None) == 'qwen3_vl'
+        padding_side = 'left' if mode == 'predict' else 'right'
         if is_qwen3_vl:
-            data = prepare_inputs_labels_for_qwen3_vl(llm=self.llm, **data)
+            data = prepare_inputs_labels_for_qwen3_vl(llm=self.llm, padding_side=padding_side, **data)
         else:
             data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
@@ -1068,7 +1084,8 @@ class LLaVAModel_conv(BaseModel):
                 if first_step_logits is not None and i < first_step_logits.size(0):
                     logits_row = first_step_logits[i]
                     choice_logits = {}
-                    for letter in ['A', 'B', 'C', 'D', 'E']:
+                    # Support A-Z for broader MCQA compatibility
+                    for letter in "ABCDEFGHIJ": 
                         tid = _choice_token_id(letter)
                         if tid is None:
                             continue
@@ -1194,6 +1211,14 @@ class LLaVAModel_conv(BaseModel):
 
             outputs = self.llm(**llm_kwargs)
             hidden = outputs.hidden_states[-1]  # (B, Lp+Lg, H)
+
+            # Apply RMSNorm to hidden states - same as training path (compute_loss)
+            # hidden_states[-1] are PRE-normalization; the model applies RMSNorm before lm_head.
+            # Regression/survival heads were trained on normalized hidden states,
+            # so we must apply the same normalization at inference time.
+            norm = self._get_language_model_norm()
+            if norm is not None:
+                hidden = norm(hidden)
 
         # For each batch, locate generated special-token positions and predict
         for b in range(B):

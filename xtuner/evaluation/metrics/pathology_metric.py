@@ -96,7 +96,26 @@ class PathologyMetric(BaseMetric):
             # Load training data if path is provided
         for i, sample in enumerate(data_samples):
             # Decode input and predictions
-            input_str = self._decode_full_input(batch_data['input_ids'][i])
+            # We only want the prompt part for the 'input' field in results.
+            # The prompt is where labels are -100.
+            labels = batch_data['labels'][i]
+            input_ids = batch_data['input_ids'][i]
+            attn_mask = batch_data['attention_mask'][i] if batch_data['attention_mask'] is not None else None
+
+            # Find where the answer starts (first non-ignore label)
+            non_ignore_mask = (labels != -100)
+            if non_ignore_mask.any():
+                answer_start = non_ignore_mask.nonzero()[0].item()
+            else:
+                answer_start = len(input_ids)
+            
+            # Extract prompt part and filter out padding using attention_mask
+            prompt_ids = input_ids[:answer_start]
+            if attn_mask is not None:
+                prompt_attn_mask = attn_mask[:answer_start].to(torch.bool)
+                prompt_ids = prompt_ids[prompt_attn_mask]
+
+            input_str = self._decode_full_input(prompt_ids)
             
             # Handle different sample structures
             pred_str = self._extract_prediction_text(sample)
@@ -105,7 +124,7 @@ class PathologyMetric(BaseMetric):
             metadata = self._extract_sample_metadata(batch_data, i)
             
             # Determine task type and process accordingly
-            task_type = self._determine_task_type(metadata, pred_str, sample)
+            task_type = self._determine_task_type(metadata, pred_str, sample, input_str)
             
             if task_type == 'survival':
                 self._process_survival_sample(sample, input_str, pred_str, metadata)
@@ -126,6 +145,7 @@ class PathologyMetric(BaseMetric):
         return {
             'input_ids': data_batch['data']['input_ids'],
             'labels': data_batch['data']['labels'],
+            'attention_mask': data_batch['data'].get('attention_mask', None),
             'category': data_batch['data'].get('category', None),
             'image_file': data_batch['data'].get('image_file', None),
             'regression_targets': data_batch['data'].get('regression_targets', None),
@@ -177,18 +197,28 @@ class PathologyMetric(BaseMetric):
         
         return metadata
 
-    def _determine_task_type(self, metadata: Dict[str, Any], pred_str: str, sample: Dict) -> str:
+    def _determine_task_type(self, metadata: Dict[str, Any], pred_str: str, sample: Dict, input_str: str = "") -> str:
         """Determine task type using explicit model fields and category."""
         if 'survival_prediction' in sample:
             return 'survival'
         if 'regression_prediction' in sample:
             return 'regression'
-        # Check category field for text task
+            
         category = metadata.get('category', '').lower()
-        if 'text' in category:
+        
+        # 1. Check for explicit task markers in category
+        if 'mcqa' in category:
+            return 'mcqa'
+        if any(kw in category for kw in ['text', 'caption', 'report', 'diagnosis', 'generation']):
             return 'text'
-        # Default to MCQA
-        return 'mcqa'
+            
+        # 2. Check for MCQA markers in input or target
+        target_str = metadata.get('target_str', '') or ""
+        if '<CHOICES>' in input_str or self._extract_mcqa_choice(target_str):
+            return 'mcqa'
+            
+        # Default to text for safety if it doesn't look like MCQA
+        return 'text'
 
     def _process_survival_sample(self, sample: Dict, input_str: str, pred_str: str, 
                                metadata: Dict[str, Any]) -> None:
@@ -234,10 +264,13 @@ class PathologyMetric(BaseMetric):
         pred_choice = self._extract_mcqa_choice(pred_str)
         target_choice = self._extract_mcqa_choice(metadata['target_str'] or "")
         
-        if not pred_choice or not target_choice:
+        # If target_choice is empty, it's likely not an MCQA task or ground truth is broken
+        if not target_choice:
             return
         
-        correct = (pred_choice == target_choice)
+        # If pred_choice is empty, it's a model failure to follow format, count as incorrect
+        # but DO NOT drop the sample from evaluation
+        correct = (pred_choice == target_choice) if pred_choice else False
 
         # Optional: capture model-side choice logits for AUROC (binary K=2)
         choice_logits = None
@@ -366,21 +399,41 @@ class PathologyMetric(BaseMetric):
         return safe or fallback
 
     def _extract_mcqa_choice(self, text: str) -> str:
-        """Extract choice letter from MCQA response."""
+        """Extract choice letter from MCQA response.
+        
+        Supports formats like:
+        - "A"
+        - "A) Positive"
+        - "A: Positive"
+        - "A. Positive"
+        - "<SRV>1" (returns as is)
+        """
         if not text:
             return ""
         
-        text = text.strip().upper()
+        text = text.strip()
         
-        # Direct single letter match
-        if len(text) == 1 and text in 'ABCDE':
+        # Handle special tokens <SRV> and <REG> as single tokens
+        if text.startswith(('<SRV>', '<REG>')):
             return text
+            
+        # Direct single letter match
+        if len(text) == 1 and text.isalpha():
+            return text.upper()
         
         # Extract from patterns like "A)", "A:", "A."
-        for pattern in [r'^([A-E])[):\.]', r'([A-E])[):\.]', r'^([A-E])']:
-            match = re.search(pattern, text)
+        # We look for a letter followed by punctuation or space at the start
+        # or a letter followed by punctuation anywhere.
+        patterns = [
+            r'^([A-Z])[\)\.\:\s]',  # "A)", "A.", "A:", "A " at start
+            r'([A-Z])[\)\.\:]',     # "A)", "A.", "A:" anywhere
+            r'^([A-Z])$',           # "A" at start and end
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return match.group(1)
+                return match.group(1).upper()
         
         return ""
 
@@ -541,7 +594,11 @@ class PathologyMetric(BaseMetric):
             if isinstance(image_file_batch, (list, tuple)):
                 filename = image_file_batch[idx] if idx < len(image_file_batch) else f"sample_{idx}"
             else:
-                filename = str(image_file_batch)
+                filename = image_file_batch
+            
+            # Handle list of filenames (e.g. from multi-image datasets)
+            if isinstance(filename, (list, tuple)) and len(filename) > 0:
+                filename = filename[0]
             
             return os.path.basename(str(filename)) if filename else f"sample_{idx}"
         except (IndexError, TypeError):

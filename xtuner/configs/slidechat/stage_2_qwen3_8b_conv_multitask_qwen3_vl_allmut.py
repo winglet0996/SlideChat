@@ -33,8 +33,8 @@ if setting == 'alignment':
     freeze_llm = True
     lr = 5e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
-    max_epochs = 50
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_25790.pth'
+    max_epochs = 1
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -46,7 +46,7 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_srv/iter_250.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_alignment_multitask_mcqa_srv_allmut_full_choice/iter_250.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
     # ckpt_path = None
     lr = 1e-5
@@ -65,12 +65,12 @@ resume = False
 # cat = 'Diagnosis'
 
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-8B-Instruct'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_os.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os.json'
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_3mut_50000.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_3mut_50000.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_3mut_50000.json'
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_mutation_apc.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_mutation_apc.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_mutation_apc.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_train.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
 
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_all.json'
@@ -79,8 +79,8 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_t
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask_srv/'
-# vis_name = f'qwen3_4b_conv_{setting}_multitask_mcqa_srv'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_conv_{setting}_multitask_mcqa_srv_allmut_full_choice/'
+# vis_name = f'qwen3_8b_conv_{setting}_multitask_mcqa_srv_allmut_full_choice'
 vis_name = None
 
 
@@ -160,7 +160,7 @@ del _get_latest_valid_deepspeed_checkpoint
 max_length = 256000
 max_patch_num = None
 max_new_tokens = 16
-repetition_penalty = 1.0
+repetition_penalty = 1.2
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
 
