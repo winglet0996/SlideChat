@@ -34,6 +34,15 @@ from xtuner.registry import BUILDER, MAP_FUNC
 from xtuner.tools.utils import (auto_dtype_of_deepspeed_config,
                                 get_seed_from_checkpoint)
 
+import socket, torch
+print(
+    f"HOST={socket.gethostname()} | "
+    f"RANK={os.environ.get('RANK')} | "
+    f"LOCAL_RANK={os.environ.get('LOCAL_RANK')} | "
+    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} | "
+    f"DEVICE={torch.cuda.current_device()}"
+)
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM')
     parser.add_argument('--config', default=None, help='config file name or path.')

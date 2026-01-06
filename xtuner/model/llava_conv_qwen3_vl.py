@@ -448,6 +448,9 @@ class LLaVAModel_conv(BaseModel):
     def _setup_tokenizer_and_tokens(self, tokenizer, enable_regression: bool, enable_survival: bool) -> None:
         """Setup tokenizer and add special tokens efficiently."""
         self.tokenizer = BUILDER.build(tokenizer)
+        
+        # Store original vocab size before adding special tokens
+        self._original_vocab_size = len(self.tokenizer)
 
         # Add special tokens in batch
         special_tokens = []
@@ -483,9 +486,38 @@ class LLaVAModel_conv(BaseModel):
         if not new_token_ids:
             return
 
-        # Consolidated gradient management for new special tokens
-        self._configure_parameter_gradients()
+        # Register gradient hook to only train new token embeddings
+        self._register_embedding_grad_hook()
         print_log("[SelectiveTraining] Configured gradient flow for special token learning", 'current')
+
+    def _register_embedding_grad_hook(self) -> None:
+        """Register gradient hook to zero out gradients for original vocabulary.
+        
+        Qwen3-VL uses tied weights (embed_tokens.weight is lm_head.weight),
+        so a single hook on embedding handles both input and output projections.
+        """
+        embedding = self.llm.get_input_embeddings()
+        if embedding is None or not hasattr(embedding, 'weight'):
+            return
+        
+        old_vocab_size = self._original_vocab_size
+        
+        def _zero_old_token_grad(grad: torch.Tensor) -> torch.Tensor:
+            """Zero out gradients for original vocabulary tokens."""
+            grad[:old_vocab_size] = 0
+            return grad
+        
+        # Remove existing hook if any (for re-initialization scenarios)
+        if hasattr(self, '_embedding_grad_hook_handle'):
+            self._embedding_grad_hook_handle.remove()
+        
+        # Single hook suffices for Qwen3-VL's tied weights
+        self._embedding_grad_hook_handle = embedding.weight.register_hook(_zero_old_token_grad)
+        
+        new_vocab_size = len(self.tokenizer)
+        num_new_tokens = new_vocab_size - old_vocab_size
+        print_log(f"[EmbeddingGradHook] Registered: old_vocab={old_vocab_size}, "
+                  f"new_vocab={new_vocab_size}, trainable_tokens={num_new_tokens}", 'current')
 
     def _add_special_tokens(self, tokens: List[str]) -> None:
         """Add special tokens and resize embeddings properly."""
@@ -604,17 +636,17 @@ class LLaVAModel_conv(BaseModel):
         """Centralized parameter gradient configuration for consistent multi-GPU behavior."""
         trainable_params = []
         
-        # Enable embeddings for special token learning
-        if hasattr(self.llm, 'get_input_embeddings'):
-            embed_layer = self.llm.get_input_embeddings()
-            if embed_layer is not None and hasattr(embed_layer, 'weight'):
-                embed_layer.weight.requires_grad = True
+        # Enable embeddings for special token learning (gradient hook handles selective training)
+        # Qwen3-VL uses tied weights, so enabling embedding also enables lm_head
+        embed_layer = self.llm.get_input_embeddings() if hasattr(self.llm, 'get_input_embeddings') else None
+        if embed_layer is not None and hasattr(embed_layer, 'weight'):
+            embed_layer.weight.requires_grad = True
+            if hasattr(self, '_original_vocab_size'):
+                num_new = len(self.tokenizer) - self._original_vocab_size
+                hidden_dim = embed_layer.weight.size(1)
+                trainable_params.append(f"embed+lm_head (tied, new tokens): {num_new * hidden_dim:,}")
+            else:
                 trainable_params.append(f"embeddings: {embed_layer.weight.numel():,}")
-
-        # Enable lm_head for special token prediction
-        if hasattr(self.llm, 'lm_head') and hasattr(self.llm.lm_head, 'weight'):
-            self.llm.lm_head.weight.requires_grad = True
-            trainable_params.append(f"lm_head: {self.llm.lm_head.weight.numel():,}")
 
         # Enable LoRA parameters if applicable
         if self.use_llm_lora:
@@ -681,7 +713,15 @@ class LLaVAModel_conv(BaseModel):
 
     def _setup_generation(self, generation_kwargs: Optional[Dict], stop_words: Optional[List[str]]) -> None:
         """Setup generation configuration and stopping criteria."""
-        self.generation_config = GenerationConfig(**(generation_kwargs or {}))
+        gen_kwargs = generation_kwargs.copy() if generation_kwargs else {}
+        
+        # Ensure eos_token_id is set from tokenizer if not specified
+        if 'eos_token_id' not in gen_kwargs and self.tokenizer.eos_token_id is not None:
+            gen_kwargs['eos_token_id'] = self.tokenizer.eos_token_id
+        if 'pad_token_id' not in gen_kwargs and self.tokenizer.pad_token_id is not None:
+            gen_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
+            
+        self.generation_config = GenerationConfig(**gen_kwargs)
 
         # Set generation config on all relevant models
         for model in [self.llm, getattr(self.llm, 'base_model', None), 
@@ -1029,6 +1069,13 @@ class LLaVAModel_conv(BaseModel):
 
             # 1) Text generation (depends on generated special tokens)
             with torch.no_grad():
+                # Capture raw logits before masking (top_p/top_k) for accurate AUROC
+                captured_logits = []
+                def capture_logits_processor(input_ids, scores):
+                    if not captured_logits:
+                        captured_logits.append(scores.detach().cpu())
+                    return scores
+
                 gen_out = self.llm.generate(
                     **data,
                     generation_config=self.generation_config,
@@ -1036,6 +1083,7 @@ class LLaVAModel_conv(BaseModel):
                     bos_token_id=self.tokenizer.bos_token_id,
                     return_dict_in_generate=True,
                     output_scores=True,
+                    logits_processor=[capture_logits_processor]
                 )
 
             # HF generate may return a tensor or a GenerateOutput depending on model/version
@@ -1072,8 +1120,9 @@ class LLaVAModel_conv(BaseModel):
                 cache[letter] = token_id
                 return token_id
 
-            first_step_logits = None
-            if gen_scores is not None and isinstance(gen_scores, (list, tuple)) and len(gen_scores) > 0:
+            # Use captured raw logits for first step if available (avoids top_p masking)
+            first_step_logits = captured_logits[0] if captured_logits else None
+            if first_step_logits is None and gen_scores is not None and len(gen_scores) > 0:
                 first_step_logits = gen_scores[0]  # (B, vocab)
 
             for i, gen_id in enumerate(generate_ids):
@@ -1085,7 +1134,7 @@ class LLaVAModel_conv(BaseModel):
                     logits_row = first_step_logits[i]
                     choice_logits = {}
                     # Support A-Z for broader MCQA compatibility
-                    for letter in "ABCDEFGHIJ": 
+                    for letter in "ABCDE": 
                         tid = _choice_token_id(letter)
                         if tid is None:
                             continue

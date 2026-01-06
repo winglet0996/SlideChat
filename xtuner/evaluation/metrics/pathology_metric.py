@@ -204,18 +204,18 @@ class PathologyMetric(BaseMetric):
         if 'regression_prediction' in sample:
             return 'regression'
             
+        # 1. Check for MCQA markers in input or target (most reliable)
+        target_str = metadata.get('target_str', '') or ""
+        if '<CHOICES>' in input_str or self._extract_mcqa_choice(target_str):
+            return 'mcqa'
+
         category = metadata.get('category', '').lower()
         
-        # 1. Check for explicit task markers in category
+        # 2. Check for explicit task markers in category
         if 'mcqa' in category:
             return 'mcqa'
         if any(kw in category for kw in ['text', 'caption', 'report', 'diagnosis', 'generation']):
             return 'text'
-            
-        # 2. Check for MCQA markers in input or target
-        target_str = metadata.get('target_str', '') or ""
-        if '<CHOICES>' in input_str or self._extract_mcqa_choice(target_str):
-            return 'mcqa'
             
         # Default to text for safety if it doesn't look like MCQA
         return 'text'
@@ -832,7 +832,16 @@ class PathologyMetric(BaseMetric):
                                 continue
                             try:
                                 y_true.append(1 if t == pos_label else 0)
-                                y_score.append(float(logits[pos_label]) - float(logits[neg_label]))
+                                # Use a robust difference that handles -inf to avoid NaN and allow ranking
+                                l_pos, l_neg = float(logits[pos_label]), float(logits[neg_label])
+                                if l_pos == -float('inf') and l_neg == -float('inf'):
+                                    y_score.append(0.0)
+                                elif l_pos == -float('inf'):
+                                    y_score.append(-10000.0)
+                                elif l_neg == -float('inf'):
+                                    y_score.append(10000.0)
+                                else:
+                                    y_score.append(l_pos - l_neg)
                             except Exception:
                                 continue
                         if len(set(y_true)) >= 2 and len(y_true) >= 2:
