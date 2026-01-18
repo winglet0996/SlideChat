@@ -188,43 +188,32 @@ def masked_collated_fn(instances: Sequence[Dict],
         data_dict['regression_targets'] = torch.tensor(
             regression_targets, dtype=torch.float32).squeeze(-1)
 
-    # stack survival targets 
+    # stack survival targets (new format: [time, event] list)
     if any(t is not None for t in survival_targets):
-        # Get first valid target to determine shape/type
-        first_valid = next(t for t in survival_targets if t is not None)
+        survival_times = []
+        survival_events = []
         
-        def get_zero_element(elem):
-            if isinstance(elem, torch.Tensor):
-                return torch.zeros_like(elem)
-            elif isinstance(elem, np.ndarray):
-                return np.zeros_like(elem)
-            else:
-                return np.zeros(len(elem), dtype=np.float32)
-
-        zero_target_y = get_zero_element(first_valid['target_y'])
-        zero_at_risk_mask = get_zero_element(first_valid['at_risk_mask'])
-
-        target_y_list = []
-        at_risk_mask_list = []
-
         for t in survival_targets:
             if t is not None:
-                target_y_list.append(t['target_y'])
-                at_risk_mask_list.append(t['at_risk_mask'])
+                # Handle [time, event] format from JSON
+                if isinstance(t, (list, tuple)) and len(t) == 2:
+                    survival_times.append(float(t[0]))
+                    survival_events.append(float(t[1]))
+                # Handle dict format (legacy support)
+                elif isinstance(t, dict):
+                    survival_times.append(float(t.get('time', 0.0)))
+                    survival_events.append(float(t.get('event', 0.0)))
+                else:
+                    # Fallback: treat as invalid
+                    survival_times.append(float('nan'))
+                    survival_events.append(float('nan'))
             else:
-                target_y_list.append(zero_target_y)
-                at_risk_mask_list.append(zero_at_risk_mask)
-
-        if isinstance(target_y_list[0], torch.Tensor):
-            target_y_tensor = torch.stack(target_y_list)
-            at_risk_mask_tensor = torch.stack(at_risk_mask_list)
-        else:
-            target_y_tensor = torch.tensor(np.array(target_y_list), dtype=torch.float32)
-            at_risk_mask_tensor = torch.tensor(np.array(at_risk_mask_list), dtype=torch.float32)
-            
+                survival_times.append(float('nan'))
+                survival_events.append(float('nan'))
+        
         data_dict['survival_targets'] = {
-            'target_y': target_y_tensor,
-            'at_risk_mask': at_risk_mask_tensor
+            'time': torch.tensor(survival_times, dtype=torch.float32),
+            'event': torch.tensor(survival_events, dtype=torch.float32)
         }
 
     if return_hf_format:

@@ -664,227 +664,102 @@ class AttentionPooling(nn.Module):
 
 
 class RegressionHead(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int):
+    def __init__(self, in_dim: int):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            # nn.LayerNorm(hidden_dim),  # Add layer normalization
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),           # Add dropout for regularization
-            nn.Linear(hidden_dim, 1),
-        )
-        
-        # Better initialization
+        # Simplified to a single linear layer
+        self.head = nn.Linear(in_dim, 1)
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with improved scheme for regression tasks."""
-        for module in self.mlp.modules():
-            if isinstance(module, nn.Linear):
-                # Use Xavier/Glorot initialization with small gain for stable training
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, nn.LayerNorm):
-                # Initialize layer norm parameters
-                nn.init.constant_(module.bias, 0.0)
-                nn.init.constant_(module.weight, 1.0)
+        """Initialize weights with small gain for stable training."""
+        nn.init.xavier_uniform_(self.head.weight, gain=0.1)
+        if self.head.bias is not None:
+            nn.init.constant_(self.head.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+        return self.head(x)
 
 
 class SurvivalHead(nn.Module):
     """
-    Discrete-time logistic hazard survival head.
-
-    - Model outputs K logits -> hazards h_k = P(event in interval k | survived to start of k)
-    - Interval boundaries are given by time_intervals = [t0, t1, ..., tK]  (length K+1)
-    - Survival at end of interval k: S(t_k) = Π_{j<=k} (1 - h_j)
-
-    Risk scores:
-      - "nll_final":  -log S(t_K)  (your original)
-      - "rmst":       -RMST(t_K) where RMST ≈ Σ_k S(t_{k-1}) * (t_k - t_{k-1})
-                      (dt-weighted; recommended for non-uniform bins)
+    Cox proportional hazards survival head.
+    
+    Outputs a single risk score (log-hazard) per sample.
+    Higher risk score = higher risk of event.
     """
 
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        time_intervals: Iterable[float] = (0, 1, 2, 3, 5, 7, 10),
-        dropout: float = 0.1,
-    ):
+    def __init__(self, in_dim: int):
         super().__init__()
-
-        t = torch.as_tensor(list(time_intervals), dtype=torch.float32)
-        if t.ndim != 1 or t.numel() < 2:
-            raise ValueError("time_intervals must be 1D with length >= 2 (boundaries).")
-        if not torch.all(t[1:] > t[:-1]):
-            raise ValueError("time_intervals must be strictly increasing.")
-
-        # registered buffer => moves with model.to(device), saved in state_dict
-        self.register_buffer("time_intervals", t)
-        self.num_intervals = int(t.numel() - 1)  # K
-
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.num_intervals),  # (N, K) logits
-        )
+        # Simplified to a single linear layer
+        self.head = nn.Linear(in_dim, 1)
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for m in self.mlp.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
+        # Use gain=1.0 for better initial risk score differentiation
+        nn.init.xavier_uniform_(self.head.weight, gain=1.0)
+        if self.head.bias is not None:
+            nn.init.constant_(self.head.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return per-interval logits. Shape: (N, K)."""
-        return self.mlp(x)
+        """Return risk scores. Shape: (N,)."""
+        return self.head(x).squeeze(-1)
 
     @torch.no_grad()
-    def predict_hazards(self, x: torch.Tensor) -> torch.Tensor:
-        """Return hazards h_k in (0,1). Shape: (N, K)."""
-        return torch.sigmoid(self.forward(x))
-
-    def _hazards_and_survival_end(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          hazards: (N, K)
-          S_end:   (N, K) = [S(t1), ..., S(tK)]
-        """
-        hazards = torch.sigmoid(self.forward(x))         # (N, K)
-        S_end = torch.cumprod(1.0 - hazards, dim=1)      # (N, K)
-        return hazards, S_end
-
-    @torch.no_grad()
-    def predict_survival_probs(self, x: torch.Tensor) -> torch.Tensor:
-        """Survival at end of each interval: (N, K) = [S(t1), ..., S(tK)]."""
-        _, S_end = self._hazards_and_survival_end(x)
-        return S_end
-
-    @torch.no_grad()
-    def predict_risk_scores(
-        self,
-        x: torch.Tensor,
-        mode: Literal["rmst", "nll_final"] = "rmst",
-    ) -> torch.Tensor:
-        """
-        Return risk scores (N,), where larger means higher risk.
-
-        mode="rmst":
-          RMST(t_K) ≈ Σ_k S(t_{k-1}) * Δt_k,  risk = -RMST
-        mode="nll_final":
-          risk = -log S(t_K)
-        """
-        hazards, S_end = self._hazards_and_survival_end(x)
-
-        if mode == "nll_final":
-            final_survival = S_end[:, -1]
-            return -torch.log(final_survival + EPS)
-
-        if mode == "rmst":
-            # dt: (K,)
-            dt = (self.time_intervals[1:] - self.time_intervals[:-1]).to(
-                device=S_end.device, dtype=S_end.dtype
-            )
-
-            # S_start: (N,K) = [S(t0)=1, S(t1), ..., S(t_{K-1})]
-            S_start = torch.cat(
-                [
-                    torch.ones(S_end.size(0), 1, device=S_end.device, dtype=S_end.dtype),
-                    S_end[:, :-1],
-                ],
-                dim=1,
-            )
-
-            rmst = (S_start * dt).sum(dim=1)  # (N,)
-            return -rmst
-
-        raise ValueError(f"Unknown mode: {mode}")
-
-    @torch.no_grad()
-    def predict_median_survival_time(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Predict a (coarse) median survival time per sample:
-        returns the first boundary time t_k where S(t_k) < 0.5,
-        otherwise returns the last boundary t_K.
-
-        Shape: (N,)
-        """
-        S_end = self.predict_survival_probs(x)          # (N, K)
-        below = S_end < 0.5                             # (N, K)
-        first_idx = torch.argmax(below.to(torch.int64), dim=1)  # (N,)
-
-        never = ~below.any(dim=1)                       # (N,)
-        first_idx = torch.where(
-            never,
-            torch.full_like(first_idx, self.num_intervals - 1),
-            first_idx,
-        )
-
-        # median time is the *end* boundary of that interval => t_{k+1}
-        # boundaries length is K+1, S_end index k corresponds to t_{k+1}
-        median_times = self.time_intervals[1:][first_idx]  # (N,)
-        return median_times
+    def predict_risk_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """Return risk scores (N,), where larger means higher risk."""
+        return self.forward(x)
 
 
-def logistic_hazard_loss(
-    logits: torch.Tensor,
-    target_y: torch.Tensor,
-    at_risk_mask: torch.Tensor,
+def cox_ph_loss(
+    theta: torch.Tensor,
+    time: torch.Tensor,
+    event: torch.Tensor,
+    valid_mask: torch.Tensor = None,
+    eps: float = 1e-12
 ) -> torch.Tensor:
     """
-    Standard discrete-time logistic hazard loss.
-
-    logits:       (N, K)
-    target_y:     (N, K) binary, y_{ik}=1 only at event interval (if event observed)
-    at_risk_mask: (N, K) 1 where that interval contributes to likelihood
+    Cox proportional hazards partial likelihood loss.
+    
+    Args:
+        theta: (N,) or (N,1) risk score (log-risk), any real
+        time:  (N,) follow-up time, higher=later
+        event: (N,) 1=event happened, 0=censored
+        valid_mask: (N,) bool, True=use this sample
+        eps: small value for numerical stability
+        
+    Returns:
+        Scalar loss value (negative partial log-likelihood)
     """
-    bce = F.binary_cross_entropy_with_logits(logits, target_y, reduction="none")  # (N, K)
-    return (bce * at_risk_mask).sum() / (at_risk_mask.sum() + EPS)
+    theta = theta.view(-1)
+    time = time.view(-1)
+    event = event.view(-1).float()
 
+    if valid_mask is None:
+        valid_mask = torch.ones_like(time, dtype=torch.bool)
+    else:
+        valid_mask = valid_mask.view(-1).bool()
 
-def prepare_survival_targets(
-    event_times: torch.Tensor,
-    event_indicators: torch.Tensor,
-    time_intervals: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Prepare target_y and at_risk_mask for the discrete-time hazard model.
+    idx = torch.where(valid_mask)[0]
+    if idx.numel() < 2:
+        return torch.zeros((), device=theta.device, dtype=theta.dtype)
 
-    time_intervals: (K+1,) boundaries [t0, t1, ..., tK]
-    """
-    if time_intervals.ndim != 1 or time_intervals.numel() < 2:
-        raise ValueError("time_intervals must be 1D with length >= 2 (boundaries).")
+    theta = theta[idx]
+    time = time[idx]
+    event = event[idx]
 
-    N = int(event_times.numel())
-    K = int(time_intervals.numel() - 1)
-    device = event_times.device
+    n_events = event.sum()
+    if n_events < 1:
+        return torch.zeros((), device=theta.device, dtype=theta.dtype)
 
-    target_y = torch.zeros(N, K, device=device)
-    at_risk_mask = torch.zeros(N, K, device=device)
+    # Risk set mask: R[i,j] = (time[j] >= time[i])
+    # shape: (m, m)
+    R = (time[None, :] >= time[:, None])
 
-    # interval index m in [0, K-1] such that t in (t_m, t_{m+1}] (approximately)
-    # Using searchsorted on upper boundaries time_intervals[1:]
-    for i in range(N):
-        t_i = event_times[i]
-        d_i = event_indicators[i].item()
+    # log denom_i = log sum_{j in R_i} exp(theta_j)
+    # mask out non-risk with -inf for logsumexp
+    theta_row = theta[None, :].expand(theta.numel(), -1)
+    log_denom = torch.logsumexp(theta_row.masked_fill(~R, float("-inf")), dim=1)
 
-        m = torch.searchsorted(time_intervals[1:], t_i, right=False)
-        m = torch.clamp(m, 0, K - 1).item()
-
-        if d_i == 1:  # event observed in interval m
-            at_risk_mask[i, :m] = 1.0
-            target_y[i, :m] = 0.0
-            at_risk_mask[i, m] = 1.0
-            target_y[i, m] = 1.0
-        else:  # censored in interval m => contribute through m with y=0
-            at_risk_mask[i, : m + 1] = 1.0
-            target_y[i, : m + 1] = 0.0
-
-    return target_y, at_risk_mask
+    # negative partial log-likelihood
+    loss = -((theta - log_denom) * event).sum() / (n_events + eps)
+    return loss

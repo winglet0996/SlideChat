@@ -84,7 +84,7 @@ from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names, get_peft_model_state_dict, 
                     guess_load_checkpoint, make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, AttentionPooling, RegressionHead, SurvivalHead
+from .custom_model import HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, AttentionPooling, RegressionHead, SurvivalHead, cox_ph_loss
 
 
 def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values, 
@@ -291,7 +291,7 @@ class LLaVAModel_conv(BaseModel):
                  num_survival_intervals: int = 6,
                  lambda_llm: float = 0.1, lambda_reg: float = 1.0, lambda_srv: float = 1.0,
                  vision_conv_cfg: Optional[Dict] = None,
-                 deepstack_visual_indexes: List[int] = [8, 16, 24]):
+                 deepstack_visual_indexes: List[int] = [0, 1, 2]):
         """
         Multi-modal LLaVA model with regression and survival prediction capabilities.
         Regression relies solely on special token embeddings processed by LLM.
@@ -493,30 +493,38 @@ class LLaVAModel_conv(BaseModel):
     def _register_embedding_grad_hook(self) -> None:
         """Register gradient hook to zero out gradients for original vocabulary.
         
-        Qwen3-VL uses tied weights (embed_tokens.weight is lm_head.weight),
-        so a single hook on embedding handles both input and output projections.
+        Handles both tied and untied word embeddings (e.g., 4B vs 8B).
         """
-        embedding = self.llm.get_input_embeddings()
-        if embedding is None or not hasattr(embedding, 'weight'):
-            return
-        
         old_vocab_size = self._original_vocab_size
         
-        def _zero_old_token_grad(grad: torch.Tensor) -> torch.Tensor:
-            """Zero out gradients for original vocabulary tokens."""
-            grad[:old_vocab_size] = 0
-            return grad
+        def _get_zero_hook(name):
+            def _zero_old_token_grad(grad: torch.Tensor) -> torch.Tensor:
+                if grad is not None:
+                    # Only allow gradients for new tokens added at the end
+                    grad[:old_vocab_size] = 0
+                return grad
+            return _zero_old_token_grad
+
+        # 1. Input embeddings
+        embedding = self.llm.get_input_embeddings()
+        if embedding is not None and hasattr(embedding, 'weight'):
+            if hasattr(self, '_embedding_grad_hook_handle'):
+                self._embedding_grad_hook_handle.remove()
+            self._embedding_grad_hook_handle = embedding.weight.register_hook(_get_zero_hook('input'))
         
-        # Remove existing hook if any (for re-initialization scenarios)
-        if hasattr(self, '_embedding_grad_hook_handle'):
-            self._embedding_grad_hook_handle.remove()
-        
-        # Single hook suffices for Qwen3-VL's tied weights
-        self._embedding_grad_hook_handle = embedding.weight.register_hook(_zero_old_token_grad)
+        # 2. Output embeddings (only if not tied)
+        is_tied = getattr(self.llm.config, 'tie_word_embeddings', True)
+        if not is_tied:
+            output_layer = self.llm.get_output_embeddings()
+            if output_layer is not None and hasattr(output_layer, 'weight'):
+                if hasattr(self, '_output_grad_hook_handle'):
+                    self._output_grad_hook_handle.remove()
+                self._output_grad_hook_handle = output_layer.weight.register_hook(_get_zero_hook('output'))
         
         new_vocab_size = len(self.tokenizer)
         num_new_tokens = new_vocab_size - old_vocab_size
-        print_log(f"[EmbeddingGradHook] Registered: old_vocab={old_vocab_size}, "
+        status = "tied" if is_tied else "untied"
+        print_log(f"[EmbeddingGradHook] Registered ({status}): old_vocab={old_vocab_size}, "
                   f"new_vocab={new_vocab_size}, trainable_tokens={num_new_tokens}", 'current')
 
     def _add_special_tokens(self, tokens: List[str]) -> None:
@@ -542,8 +550,11 @@ class LLaVAModel_conv(BaseModel):
                     pass
 
     def _init_token_embedding(self, token_id: int, task_type: str) -> None:
-        """Initialize special token embedding with semantic meaning."""
+        """Initialize special token embedding with semantic meaning for both input and output."""
+        is_tied = getattr(self.llm.config, 'tie_word_embeddings', True)
         emb = self.llm.get_input_embeddings()
+        out = self.llm.get_output_embeddings() if not is_tied else None
+        
         if emb is None or not hasattr(emb, 'weight') or token_id >= emb.weight.size(0):
             return
 
@@ -559,13 +570,26 @@ class LLaVAModel_conv(BaseModel):
                 if (tid is not None and tid != self.tokenizer.unk_token_id and 0 <= tid < emb.weight.size(0)):
                     valid_ids.append(tid)
 
+            # 1. Initialize input embedding
             if valid_ids:
                 base_vec = emb.weight[valid_ids].mean(dim=0)
             else:
                 base_vec = emb.weight.mean(dim=0)
+            
+            # Use small perturbation to avoid identical embeddings if multiple tokens added
+            noise = 1e-3 * torch.randn_like(base_vec)
+            emb.weight[token_id] = 1.05 * base_vec + noise
 
-            base_vec = 1.05 * base_vec + 1e-3 * torch.randn_like(base_vec)
-            emb.weight[token_id] = base_vec
+            # 2. Initialize output head weight (only for untied models like 8B)
+            if out is not None and hasattr(out, 'weight') and token_id < out.weight.size(0):
+                if valid_ids:
+                    base_out = out.weight[valid_ids].mean(dim=0)
+                else:
+                    base_out = out.weight.mean(dim=0)
+                out.weight[token_id] = 1.05 * base_out + 1e-3 * torch.randn_like(base_out)
+                
+            print_log(f"[TokenInit] Initialized {task_type} token ({token_id}) for "
+                      f"{'tied' if is_tied else 'untied'} embeddings", 'current')
 
     def _init_prediction_modules(self) -> None:
         """Initialize prediction-specific modules."""
@@ -573,22 +597,13 @@ class LLaVAModel_conv(BaseModel):
 
         # Regression head using only special token embeddings
         if self.enable_regression:
-            self.regression_head = RegressionHead(
-                in_dim=llm_hidden, hidden_dim=llm_hidden
-            ).to(self.llm.dtype)
+            self.regression_head = RegressionHead(in_dim=llm_hidden).to(self.llm.dtype)
             self.regression_loss_fn = nn.SmoothL1Loss(beta=1.0)
 
-        # Survival head using only special token embeddings
+        # Survival head using Cox proportional hazards (outputs single risk score)
         if self.enable_survival:
-            from .custom_model import logistic_hazard_loss
-
-            self.survival_head = SurvivalHead(
-                in_dim=llm_hidden,
-                hidden_dim=llm_hidden,
-                time_intervals=(0, 1, 2, 3, 5, 7, 10),
-                dropout=0.1,
-            ).to(dtype=self.llm.dtype)
-            self.survival_loss_fn = logistic_hazard_loss
+            self.survival_head = SurvivalHead(in_dim=llm_hidden).to(dtype=self.llm.dtype)
+            self.survival_loss_fn = cox_ph_loss
 
     def _configure_training(self, llm_lora: Optional[Dict], use_activation_checkpointing: bool, freeze_llm: bool) -> None:
         """Configure training settings including LoRA and checkpointing."""
@@ -636,19 +651,33 @@ class LLaVAModel_conv(BaseModel):
         """Centralized parameter gradient configuration for consistent multi-GPU behavior."""
         trainable_params = []
         
-        # Enable embeddings for special token learning (gradient hook handles selective training)
-        # Qwen3-VL uses tied weights, so enabling embedding also enables lm_head
-        embed_layer = self.llm.get_input_embeddings() if hasattr(self.llm, 'get_input_embeddings') else None
+        # 1. Handle Embeddings and LM Head (special token learning)
+        is_tied = getattr(self.llm.config, 'tie_word_embeddings', True)
+        embed_layer = self.llm.get_input_embeddings()
+        output_layer = self.llm.get_output_embeddings()
+        
+        # Enable input embeddings
         if embed_layer is not None and hasattr(embed_layer, 'weight'):
             embed_layer.weight.requires_grad = True
-            if hasattr(self, '_original_vocab_size'):
-                num_new = len(self.tokenizer) - self._original_vocab_size
-                hidden_dim = embed_layer.weight.size(1)
+        
+        # Enable output head if not tied
+        if not is_tied and output_layer is not None and hasattr(output_layer, 'weight'):
+            output_layer.weight.requires_grad = True
+
+        # Log trainable parameters for embeddings
+        if hasattr(self, '_original_vocab_size'):
+            num_new = len(self.tokenizer) - self._original_vocab_size
+            hidden_dim = self._get_llm_hidden_size()
+            if is_tied:
                 trainable_params.append(f"embed+lm_head (tied, new tokens): {num_new * hidden_dim:,}")
             else:
-                trainable_params.append(f"embeddings: {embed_layer.weight.numel():,}")
+                trainable_params.append(f"embed+lm_head (untied, new tokens): {num_new * hidden_dim * 2:,}")
+        else:
+            total_emb = (embed_layer.weight.numel() if embed_layer is not None else 0) + \
+                        (output_layer.weight.numel() if not is_tied and output_layer is not None else 0)
+            trainable_params.append(f"embeddings: {total_emb:,}")
 
-        # Enable LoRA parameters if applicable
+        # 2. Enable LoRA parameters if applicable
         if self.use_llm_lora:
             lora_param_count = 0
             for name, param in self.llm.named_parameters():
@@ -986,7 +1015,11 @@ class LLaVAModel_conv(BaseModel):
 
         # Build sparse list aligned to total LLM layers; only target indices receive features
         deepstack_embeds = [None] * num_layers
+        
+        projected_stages = list(reversed(projected_stages)) # do the reverse
+
         for idx, feat in zip(ds_indexes, projected_stages):
+            
             if idx < num_layers:
                 deepstack_embeds[idx] = feat
 
@@ -1284,35 +1317,23 @@ class LLaVAModel_conv(BaseModel):
                         prev = data_samples[b].get('prediction_text', '')
                         data_samples[b]['prediction_text'] = f"{prev} [Regression: {pred:.4f}]".strip()
 
-            # Survival
+            # Survival (Cox-based: outputs single risk score)
             if has_survival[b] and self.enable_survival and self.srv_token_id is not None:
                 pos_in_gen = torch.nonzero(generate_ids[b] == self.srv_token_id, as_tuple=False).flatten()
                 if pos_in_gen.numel() > 0:
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                        fused = self._fuse_token_with_vision(embed, b, 'survival')  # (1, 2H)
-                        logits = self.survival_head(fused)
-                        survival_probs = self.survival_head.predict_survival_probs(fused)
+                        fused = self._fuse_token_with_vision(embed, b, 'survival')  # (1, H)
                         risk_score = float(self.survival_head.predict_risk_scores(fused).squeeze(0).item())
-                        median_time = float(
-                            self.survival_head.predict_median_survival_time(fused).squeeze(0).item()
-                        )
-                        time_intervals = self.survival_head.time_intervals.detach().cpu().float().tolist()
                         pred_dict = {
-                            "logits": logits.squeeze(0).detach().cpu().float().tolist(),
-                            "survival_probs": survival_probs.squeeze(0).detach().cpu().float().tolist(),
                             "risk_score": risk_score,
-                            "median_survival_time": median_time,
-                            "time_intervals": time_intervals,
                         }
                         data_samples[b]["survival_prediction"] = pred_dict
                         data_samples[b]["risk_score"] = risk_score
-                        data_samples[b]["survival_probs"] = pred_dict["survival_probs"]
-                        data_samples[b]["median_survival_time"] = median_time
                         prev = data_samples[b].get("prediction_text", "")
                         data_samples[b]["prediction_text"] = (
-                            f"{prev} [Risk Score: {risk_score:.4f}, Median Survival: {median_time}]"
+                            f"{prev} [Risk Score: {risk_score:.4f}]"
                         ).strip()
         return data_samples
 
@@ -1433,11 +1454,14 @@ class LLaVAModel_conv(BaseModel):
             predictions = self.regression_head(task_embeds).squeeze(-1)
             task_targets = targets[b_idx].to(predictions.dtype)
             return self.regression_loss_fn(predictions, task_targets)
-        else:  # survival
-            logits = self.survival_head(task_embeds)
-            target_y = targets['target_y'][b_idx].to(device=logits.device, dtype=logits.dtype)
-            at_risk_mask = targets['at_risk_mask'][b_idx].to(device=logits.device, dtype=logits.dtype)
-            return self.survival_loss_fn(logits, target_y, at_risk_mask)
+        else:  # survival with Cox loss
+            risk_scores = self.survival_head(task_embeds)  # (N,)
+            # targets is dict with 'time' and 'event' tensors
+            time = targets['time'][b_idx].to(device=risk_scores.device, dtype=risk_scores.dtype)
+            event = targets['event'][b_idx].to(device=risk_scores.device, dtype=risk_scores.dtype)
+            # valid_mask for Cox: exclude samples with NaN time/event
+            cox_valid = ~(torch.isnan(time) | torch.isnan(event))
+            return self.survival_loss_fn(risk_scores, time, event, cox_valid)
 
     def _get_zero_loss_with_grad_connectivity(self, task: str, base_loss: torch.Tensor) -> torch.Tensor:
         """Return zero loss while ensuring task parameters remain in computation graph.

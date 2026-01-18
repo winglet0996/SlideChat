@@ -43,7 +43,6 @@ class PathologyMetric(BaseMetric):
     def __init__(self,
                  tokenizer: Union[Dict, Any],
                  output_dir: Optional[str] = None,
-                 survival_time_intervals: Optional[List[float]] = None,
                  *args, **kwargs):
         """
         Initialize the multi-task pathology metric evaluator.
@@ -51,7 +50,6 @@ class PathologyMetric(BaseMetric):
         Args:
             tokenizer: Configuration dict for building the tokenizer, or tokenizer object directly
             output_dir: Directory to save evaluation JSON results
-            survival_time_intervals: Time intervals for survival analysis
         """
         super().__init__(*args, **kwargs)
         # Allow passing tokenizer object directly or build from config
@@ -63,9 +61,8 @@ class PathologyMetric(BaseMetric):
         self.smoothie = SmoothingFunction().method4
         self.output_dir = output_dir
         
-        # Survival metrics: lazily initialize from model outputs if intervals not specified
-        self._survival_intervals = np.array(survival_time_intervals) if survival_time_intervals is not None else None
-        self.survival_metrics = None
+        # Survival metrics (Cox-based: no discrete intervals needed)
+        self.survival_metrics = SurvivalMetrics()
 
         # Prepare output directory for JSON results only
         if self.output_dir and is_main_process():
@@ -77,23 +74,7 @@ class PathologyMetric(BaseMetric):
         """
         # Extract batch data
         batch_data = self._extract_batch_data(data_batch)
-        
-        # Lazy init survival metrics using intervals coming from the first survival prediction
-        if batch_data['survival_targets'] is not None and self.survival_metrics is None and self._survival_intervals is None:
-            for s in data_samples:
-                sp = s.get('survival_prediction') if isinstance(s, dict) else None
-                if sp and isinstance(sp, dict) and sp.get('time_intervals') is not None:
-                    try:
-                        self._survival_intervals = np.array(sp['time_intervals'], dtype=float)
-                        break
-                    except Exception:
-                        pass
-            # Fallback to simple default if nothing found yet
-            if self._survival_intervals is None:
-                self._survival_intervals = np.array([0, 1, 2, 3, 5, 7, 10], dtype=float)
-            self.survival_metrics = SurvivalMetrics(self._survival_intervals)
             
-            # Load training data if path is provided
         for i, sample in enumerate(data_samples):
             # Decode input and predictions
             # We only want the prompt part for the 'input' field in results.
@@ -539,15 +520,16 @@ class PathologyMetric(BaseMetric):
             return None
 
     def _get_survival_data(self, batch_data: Dict[str, Any], idx: int) -> Optional[Dict[str, float]]:
-        """Prefer continuous survival_times/survival_events; fallback to survival_targets if needed."""
-        # 1) Best: use continuous labels if provided
-        times = batch_data.get("survival_times", None)
-        events = batch_data.get("survival_events", None)
-        if times is not None and events is not None:
+        """Extract survival time and event from batch data (Cox format: time, event)."""
+        st = batch_data.get("survival_targets", None)
+        if st is None:
+            return None
+        
+        # New Cox format: dict with 'time' and 'event' tensors
+        if isinstance(st, dict) and 'time' in st and 'event' in st:
             try:
-                t = times[idx] if isinstance(times, (list, tuple)) else times[idx]
-                e = events[idx] if isinstance(events, (list, tuple)) else events[idx]
-                # torch / numpy / python scalar all ok
+                t = st['time'][idx]
+                e = st['event'][idx]
                 if isinstance(t, torch.Tensor):
                     t = float(t.detach().cpu().item())
                 else:
@@ -556,34 +538,14 @@ class PathologyMetric(BaseMetric):
                     e = float(e.detach().cpu().item())
                 else:
                     e = float(e)
+                # Check for NaN (invalid data)
+                if np.isnan(t) or np.isnan(e):
+                    return None
                 return {"time": t, "event": e}
             except Exception:
-                pass  # fallback below
-        # 2) Fallback: reconstruct from discretized survival_targets (less ideal)
-        st = batch_data.get("survival_targets", None)
-        if st is None:
-            return None
-        if self.survival_metrics is None:
-            # if still not initialized, set default/fallback intervals
-            if self._survival_intervals is None:
-                self._survival_intervals = np.array([0, 1, 2, 3, 5, 7, 10], dtype=float)
-            self.survival_metrics = SurvivalMetrics(self._survival_intervals)
-        target_y = st["target_y"][idx]
-        at_risk_mask = st["at_risk_mask"][idx]
-        if isinstance(target_y, torch.Tensor):
-            target_y = target_y.detach().cpu().numpy()
-        if isinstance(at_risk_mask, torch.Tensor):
-            at_risk_mask = at_risk_mask.detach().cpu().numpy()
-        if (target_y > 0.5).any():
-            k = int(np.argmax(target_y))
-            event = 1.0
-        else:
-            at_risk_indices = np.where(at_risk_mask > 0.5)[0]
-            k = int(at_risk_indices.max()) if len(at_risk_indices) > 0 else 0
-            event = 0.0
-        k = min(k, len(self.survival_metrics.interval_endpoints) - 1)
-        time = float(self.survival_metrics.interval_endpoints[k])  # right endpoint
-        return {"time": time, "event": event}
+                return None
+        
+        return None
 
     def _extract_filename_from_image_file(self, image_file_batch: Any, idx: int) -> str:
         """Extract filename from image file batch."""
@@ -1478,13 +1440,11 @@ class PathologyMetric(BaseMetric):
 
 
 class SurvivalMetrics:
-    """Survival analysis metric utilities (C-index only)."""
+    """Survival analysis metric utilities for Cox-based predictions (C-index only)."""
     
-    def __init__(self, time_intervals: np.ndarray):
-        """Initialize with time interval boundaries (len = n+1)."""
-        self.time_intervals = time_intervals
-        # Use right endpoints to ensure all times are within bounds
-        self.interval_endpoints = time_intervals[1:]
+    def __init__(self):
+        """Initialize survival metrics (no discrete intervals needed for Cox)."""
+        pass
 
     def compute_concordance_index(self,
                                   risk_scores: np.ndarray,
@@ -1496,11 +1456,10 @@ class SurvivalMetrics:
         return float(concordance_index(event_times, -risk_scores, event_indicators))
     
     def compute_all_metrics(self,
-                          _survival_probs: np.ndarray,
                           risk_scores: np.ndarray, 
                           event_times: np.ndarray,
                           event_indicators: np.ndarray) -> Dict[str, float]:
-        """Compute survival metrics usable by legacy callers (C-index only)."""
+        """Compute survival metrics (C-index only for Cox-based model)."""
         return {
             'c_index': self.compute_concordance_index(
                 risk_scores, event_times, event_indicators

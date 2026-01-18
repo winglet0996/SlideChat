@@ -16,6 +16,7 @@ from peft import LoraConfig
 from xtuner.dataset import LLaVADataset_conv_longnet
 from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
+from xtuner.dataset.samplers import CategoryProjectSampler
 from xtuner.engine.hooks import DatasetInfoHook #, EvaluateChatHook_conv_longnet, HFCheckpointHook
 from xtuner.engine.runner import TrainLoop
 from xtuner.model import LLaVAModel_conv
@@ -26,14 +27,14 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'lora'
+setting = 'alignment'
 
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
     lr = 5e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_25790.pth'
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
     max_epochs = 50
     save_best_metrics = None
 if setting == 'lora':
@@ -46,12 +47,12 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_srv/iter_200.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mut/iter_2000.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
     # ckpt_path = None
     lr = 1e-5
     freeze_llm = True
-    max_epochs = 50
+    max_epochs = 25
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -67,20 +68,21 @@ resume = False
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-4B-Instruct'
 train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_os.json'
 val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_os.json'
 test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os.json'
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_debug_50000.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_debug_50000.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_debug_50000.json'
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/PathoVerse_stage2_mcqa_train_no-knowledge.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_all.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_all.json'
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_train.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
 
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
 work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_{setting}_multitask_srv/'
-# vis_name = f'qwen3_8b_conv_{setting}_multitask_mcqa_srv_3mut_full_choice'
+# vis_name = f'qwen3_4b_conv_{setting}_multitask_mcqa_srv'
 vis_name = None
 
 
@@ -103,10 +105,10 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 save_steps = 250  # More frequent saves for alignment debugging
-save_total_limit = 1  # Keep more checkpoints for analysis
+save_total_limit = 0  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 250  # More frequent evaluation for alignment debugging
+evaluation_freq = 50  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -147,7 +149,7 @@ def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
     return None
 
 if resume:
-    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=16)
+    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=4)
     
     if latest_valid_ckpt:
         ckpt_path = latest_valid_ckpt
@@ -159,22 +161,23 @@ del _get_latest_valid_deepspeed_checkpoint
 
 max_length = 256000
 max_patch_num = None
-max_new_tokens = 16
+max_new_tokens = 32
 repetition_penalty = 1.0
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 16  # per_device
+batch_size = 32  # per_device
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = SophiaG
+# optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
-warmup_ratio = 0.03
+warmup_ratio = 0.05
 
 
 SYSTEM = ''
@@ -218,6 +221,7 @@ model = dict(
         # length_penalty=0.5,
         # repetition_penalty=repetition_penalty
     ),
+    stop_words=['<|im_end|>', '<|endoftext|>'],
     llm_lora=llm_lora,
     enable_regression=True,
     enable_survival=True,
@@ -225,10 +229,10 @@ model = dict(
     srv_token='<SRV>',
     lambda_llm=1.0,
     lambda_reg=1.0,
-    lambda_srv=1.0,
+    lambda_srv=0.1,
     vision_conv_cfg={
         "in_chans": 768,
-        "depths": [3, 9, 3],
+        "depths": [1, 3, 1],
         "dims": [768, 1024, 2048],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
@@ -256,7 +260,8 @@ train_dataloader = dict(
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=train_llava_dataset,
-    sampler=dict(type=DefaultSampler, shuffle=True),
+    sampler=dict(type=CategoryProjectSampler, batch_size=batch_size, shuffle=True),
+    # sampler=dict(type=DefaultSampler, shuffle=True),
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
@@ -322,6 +327,7 @@ optim_wrapper = dict(
     type=AmpOptimWrapper,
     optimizer=dict(
         type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
+        # type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
     clip_grad=dict(max_norm=max_norm, error_if_nonfinite=False),
     accumulative_counts=accumulative_counts,
     loss_scale='dynamic',
