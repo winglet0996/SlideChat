@@ -84,7 +84,9 @@ from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names, get_peft_model_state_dict, 
                     guess_load_checkpoint, make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, AttentionPooling, RegressionHead, SurvivalHead, cox_ph_loss
+from .custom_model import (HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, 
+                           AttentionPooling, RegressionHead, SurvivalHead, 
+                           cox_ph_loss, logistic_hazard_loss, WSIProjector)
 
 
 def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values, 
@@ -92,11 +94,19 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
                                     position_ids=None, past_key_values=None,
                                     image_grid_thw=None,
                                     deepstack_pixel_values=None,
+                                    wsi_embeddings=None,
                                     padding_side='right',
                                     **kwargs):
     """
     Custom multimodal preparation for Qwen3-VL that also returns visual_pos_masks.
-    Supports hierarchical DeepStack visual features.
+    Supports hierarchical DeepStack visual features and WSI global feature injection.
+    
+    WSI Injection Logic:
+    - wsi_embeddings: Tensor of shape (B, Num_WSI_Sources, LLM_Dim)
+    - Injected immediately BEFORE patch grid tokens (pixel_values)
+    - Uses linear/text-like Position IDs (no 3D-RoPE)
+    - Marked as visual tokens in visual_pos_masks for DeepStack
+    - Labels set to IGNORE_INDEX
     """
     if pixel_values is None or len(pixel_values) == 0:
         return {
@@ -108,8 +118,13 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
             'labels': labels,
             'visual_pos_masks': None,
             'image_grid_thw': None,
-            'deepstack_visual_embeds': None
+            'deepstack_visual_embeds': None,
+            'wsi_token_counts': None
         }
+
+    # Get WSI embeddings info for this batch
+    # wsi_embeddings shape: (B, Num_WSI_Sources, LLM_Dim) or None
+    num_wsi_tokens = wsi_embeddings.size(1) if wsi_embeddings is not None else 0
 
     # remove the padding using attention_mask
     input_ids_list = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
@@ -120,6 +135,7 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
     new_visual_masks = []
     new_position_ids = []
     all_deepstack_embeds = []
+    all_wsi_embeds_for_deepstack = []  # Track WSI embeddings for DeepStack injection
     new_image_grid_thw = []
     
     cur_image_idx = 0
@@ -155,8 +171,35 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
                 cur_new_position_ids.append(torch.arange(text_len, device=text_ids.device).view(1, -1).expand(3, -1) + st_idx)
                 st_idx += text_len
             
-            # Image part
+            # Image part (with WSI injection before patch tokens)
             if i < len(image_token_indices) - 2:
+                # === WSI EMBEDDING INJECTION (before patch tokens) ===
+                if wsi_embeddings is not None and num_wsi_tokens > 0:
+                    # Get WSI embeddings for this batch sample: (Num_WSI_Sources, LLM_Dim)
+                    cur_wsi_embeds = wsi_embeddings[batch_idx]  # (Num_WSI_Sources, LLM_Dim)
+                    wsi_seq_len = cur_wsi_embeds.size(0)
+                    
+                    # Add WSI embeddings to sequence
+                    cur_new_inputs_embeds.append(cur_wsi_embeds)
+                    
+                    # Labels: IGNORE_INDEX for WSI tokens
+                    cur_new_labels.append(torch.full((wsi_seq_len,), IGNORE_INDEX, 
+                                                     device=cur_wsi_embeds.device, dtype=labels.dtype))
+                    
+                    # Visual mask: True for WSI tokens (they are visual features)
+                    cur_new_visual_mask.append(torch.ones(wsi_seq_len, dtype=torch.bool, 
+                                                         device=cur_wsi_embeds.device))
+                    
+                    # Position IDs: Linear/text-like (no 3D-RoPE for WSI global tokens)
+                    # All 3 dimensions use the same linear increment
+                    wsi_pos = torch.arange(wsi_seq_len, device=cur_wsi_embeds.device).view(1, -1) + st_idx
+                    cur_new_position_ids.append(wsi_pos.expand(3, -1))  # (3, wsi_seq_len)
+                    st_idx += wsi_seq_len
+                    
+                    # Store WSI embeds for DeepStack injection
+                    all_wsi_embeds_for_deepstack.append(cur_wsi_embeds)
+                
+                # === PATCH GRID TOKENS ===
                 cur_pixel_values = pixel_values[cur_image_idx]
                 if image_grid_thw is not None:
                     grid_thw = image_grid_thw[cur_image_idx]
@@ -216,13 +259,30 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
             final_position_ids[:, i, -cur_len:] = pids
 
     # Prepare DeepStack embeds: List[Tensor] where each tensor is (total_num_images * seq_len, hidden_dim)
+    # Now also includes WSI embeddings concatenated at the beginning for enhanced task predictions
     if all_deepstack_embeds:
         num_stages = len(all_deepstack_embeds[0])
         deepstack_visual_embeds = []
+        
+        # Prepare WSI embeddings for DeepStack: concatenate all WSI embeds across batch
+        wsi_embeds_concat = None
+        if all_wsi_embeds_for_deepstack:
+            wsi_embeds_concat = torch.cat(all_wsi_embeds_for_deepstack, dim=0)  # (Total_WSI_Tokens, LLM_Dim)
+        
         for s in range(num_stages):
             # Collect only non-None tensors for this stage
             stage_tensors = [img_stages[s] for img_stages in all_deepstack_embeds if img_stages[s] is not None]
-            deepstack_visual_embeds.append(torch.cat(stage_tensors, dim=0) if stage_tensors else None)
+            if stage_tensors:
+                patch_embeds = torch.cat(stage_tensors, dim=0)  # (Total_Patch_Tokens, LLM_Dim)
+                
+                # Concatenate WSI embeds at the beginning of patch features for this stage
+                if wsi_embeds_concat is not None:
+                    combined = torch.cat([wsi_embeds_concat, patch_embeds], dim=0)
+                    deepstack_visual_embeds.append(combined)
+                else:
+                    deepstack_visual_embeds.append(patch_embeds)
+            else:
+                deepstack_visual_embeds.append(None)
     else:
         deepstack_visual_embeds = None
 
@@ -233,7 +293,8 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
         'visual_pos_masks': final_visual_pos_masks,
         'deepstack_visual_embeds': deepstack_visual_embeds,
         'image_grid_thw': torch.stack(new_image_grid_thw) if new_image_grid_thw else None,
-        'position_ids': final_position_ids 
+        'position_ids': final_position_ids,
+        'wsi_token_counts': num_wsi_tokens  # Number of WSI tokens injected per sample
     }
 
 
@@ -289,12 +350,28 @@ class LLaVAModel_conv(BaseModel):
                  enable_regression: bool = True, reg_token: str = '<REG>',
                  enable_survival: bool = True, srv_token: str = '<SRV>',
                  num_survival_intervals: int = 6,
+                 survival_method: str = 'cox',  # 'cox' or 'discrete'
                  lambda_llm: float = 0.1, lambda_reg: float = 1.0, lambda_srv: float = 1.0,
                  vision_conv_cfg: Optional[Dict] = None,
-                 deepstack_visual_indexes: List[int] = [0, 1, 2]):
+                 deepstack_visual_indexes: List[int] = [8, 16, 24],
+                 deepstack_reverse_injection: bool = False,
+                 wsi_feature_dims: Optional[List[int]] = None,
+                 head_scaling: Union[float, List[float]] = [0.0, 0.0, 1.0]):
         """
         Multi-modal LLaVA model with regression and survival prediction capabilities.
-        Regression relies solely on special token embeddings processed by LLM.
+        
+        Args:
+            survival_method: 'cox' for Cox proportional hazards or 'discrete' for discrete-time survival
+            num_survival_intervals: Number of intervals (K) for discrete method
+            wsi_feature_dims: List of input dimensions for each WSI encoder source.
+                              E.g., [768, 1024, 768] for three different encoders (TITAN, CONCH, UNI).
+                              If None, WSI feature injection is disabled.
+            head_scaling: Multiplier(s) for hidden layer dimension in task heads and WSI projector.
+                          - If float: applied to all (reg, srv, wsi).
+                          - If list of 3: [reg_mult, srv_mult, wsi_mult].
+                          Set to 0 for a single linear layer (most lightweight).
+            deepstack_reverse_injection: Whether to reverse the order of visual features 
+                                        injected into DeepStack (deep features to shallow layers).
         """
         super().__init__()
 
@@ -306,17 +383,26 @@ class LLaVAModel_conv(BaseModel):
             enable_survival=enable_survival,
             srv_token=srv_token,
             num_survival_intervals=num_survival_intervals,
+            survival_method=survival_method,
             lambda_llm=lambda_llm,
             lambda_reg=lambda_reg,
             lambda_srv=lambda_srv,
             vision_conv_cfg=vision_conv_cfg,
-            deepstack_visual_indexes=deepstack_visual_indexes
+            deepstack_visual_indexes=deepstack_visual_indexes,
+            deepstack_reverse_injection=deepstack_reverse_injection,
+            wsi_feature_dims=wsi_feature_dims,
+            head_scaling=head_scaling
         )
 
         # Initialize model components
         self._init_llm(llm, max_position_embeddings)
         self._init_vision_components()
         self._init_projector(projector_depth)
+        
+        # Initialize WSI projector if wsi_feature_dims is provided
+        if wsi_feature_dims:
+            self._init_wsi_projector()
+        
         self._setup_tokenizer_and_tokens(tokenizer, enable_regression, enable_survival)
 
         # Initialize prediction modules if needed
@@ -340,8 +426,12 @@ class LLaVAModel_conv(BaseModel):
 
     def _init_attributes(self, freeze_llm: bool, enable_regression: bool, reg_token: str,
                          enable_survival: bool, srv_token: str, num_survival_intervals: int,
+                         survival_method: str,
                          lambda_llm: float, lambda_reg: float, lambda_srv: float, vision_conv_cfg: Optional[Dict],
-                         deepstack_visual_indexes: List[int]) -> None:
+                         deepstack_visual_indexes: List[int],
+                         deepstack_reverse_injection: bool = False,
+                         wsi_feature_dims: Optional[List[int]] = None,
+                         head_scaling: Union[float, List[float]] = 1.0) -> None:
         """Initialize core model attributes."""
         self.freeze_llm = freeze_llm
         self.enable_regression = enable_regression
@@ -349,6 +439,7 @@ class LLaVAModel_conv(BaseModel):
         self.enable_survival = enable_survival
         self.srv_token = srv_token
         self.num_survival_intervals = num_survival_intervals
+        self.survival_method = survival_method  # 'cox' or 'discrete'
         self.lambda_llm = lambda_llm
         self.lambda_reg = lambda_reg
         self.lambda_srv = lambda_srv
@@ -360,6 +451,17 @@ class LLaVAModel_conv(BaseModel):
         self.srv_token_id = None
         self.vision_conv_cfg = vision_conv_cfg
         self.deepstack_visual_indexes = deepstack_visual_indexes
+        self.deepstack_reverse_injection = deepstack_reverse_injection
+        # WSI feature injection configuration
+        self.wsi_feature_dims = wsi_feature_dims
+        self.enable_wsi_injection = wsi_feature_dims is not None and len(wsi_feature_dims) > 0
+        
+        # Handle scaling factors: [reg_mult, srv_mult, wsi_mult]
+        if isinstance(head_scaling, (int, float)):
+            self.head_scaling = [float(head_scaling)] * 3
+        else:
+            assert len(head_scaling) == 3, f"head_scaling must be float or list of length 3, got {head_scaling}"
+            self.head_scaling = [float(x) for x in head_scaling]
 
     def _init_llm(self, llm, max_position_embeddings: Optional[int]) -> None:
         """Initialize the language model."""
@@ -444,6 +546,20 @@ class LLaVAModel_conv(BaseModel):
         
         # For backward compatibility and easy access to the main projector
         self.projector = self.projectors[-1]
+
+    def _init_wsi_projector(self) -> None:
+        """Initialize the WSI feature projector for multi-source WSI injection."""
+        llm_hidden_size = self._get_llm_hidden_size()
+        wsi_mult = self.head_scaling[2]
+        self.wsi_projector = WSIProjector(
+            wsi_input_dims=self.wsi_feature_dims,
+            llm_hidden_size=llm_hidden_size,
+            hidden_mult=wsi_mult,
+            dropout=0.1
+        ).to(self.llm.dtype)
+        
+        print_log(f"[WSIProjector] Initialized with dims={self.wsi_feature_dims} -> {llm_hidden_size}, "
+                  f"mult={wsi_mult}", 'current')
 
     def _setup_tokenizer_and_tokens(self, tokenizer, enable_regression: bool, enable_survival: bool) -> None:
         """Setup tokenizer and add special tokens efficiently."""
@@ -592,18 +708,36 @@ class LLaVAModel_conv(BaseModel):
                       f"{'tied' if is_tied else 'untied'} embeddings", 'current')
 
     def _init_prediction_modules(self) -> None:
-        """Initialize prediction-specific modules."""
+        """Initialize prediction-specific modules with scaling control."""
         llm_hidden = self._get_llm_hidden_size()
+        reg_mult, srv_mult, _ = self.head_scaling
 
         # Regression head using only special token embeddings
         if self.enable_regression:
-            self.regression_head = RegressionHead(in_dim=llm_hidden).to(self.llm.dtype)
+            self.regression_head = RegressionHead(
+                in_dim=llm_hidden, 
+                hidden_mult=reg_mult
+            ).to(self.llm.dtype)
             self.regression_loss_fn = nn.SmoothL1Loss(beta=1.0)
 
-        # Survival head using Cox proportional hazards (outputs single risk score)
+        # Survival head - supports both Cox and Discrete methods
         if self.enable_survival:
-            self.survival_head = SurvivalHead(in_dim=llm_hidden).to(dtype=self.llm.dtype)
-            self.survival_loss_fn = cox_ph_loss
+            self.survival_head = SurvivalHead(
+                in_dim=llm_hidden,
+                method=self.survival_method,
+                num_intervals=self.num_survival_intervals,
+                time_intervals=None,  # Time intervals not needed for training/C-index
+                hidden_mult=srv_mult
+            ).to(dtype=self.llm.dtype)
+            
+            # Set appropriate loss function based on method
+            if self.survival_method == 'cox':
+                self.survival_loss_fn = cox_ph_loss
+            else:
+                self.survival_loss_fn = logistic_hazard_loss
+            
+            print_log(f"[SurvivalHead] Initialized with method='{self.survival_method}', "
+                      f"num_intervals={self.num_survival_intervals}, mult={srv_mult}", 'current')
 
     def _configure_training(self, llm_lora: Optional[Dict], use_activation_checkpointing: bool, freeze_llm: bool) -> None:
         """Configure training settings including LoRA and checkpointing."""
@@ -702,6 +836,11 @@ class LLaVAModel_conv(BaseModel):
             f"conv: {conv_params:,}",
             f"projectors: {proj_params:,}"
         ])
+        
+        # WSI projector if enabled
+        if self.enable_wsi_injection and hasattr(self, 'wsi_projector'):
+            wsi_proj_params = sum(p.numel() for p in self.wsi_projector.parameters())
+            trainable_params.append(f"wsi_projector: {wsi_proj_params:,}")
 
         if is_main_process():
             print_log(f"[ParameterConfig] Trainable components: {', '.join(trainable_params)}", 'current')
@@ -808,8 +947,8 @@ class LLaVAModel_conv(BaseModel):
         elif not self.freeze_llm:
             to_return.update({k: v for k, v in state_dict.items() if 'llm.' in k})
 
-        # 2. Save vision and projection components
-        vision_keys = ['projectors.', 'projector.', 'conv.']
+        # 2. Save vision and projection components (including WSI projector)
+        vision_keys = ['projectors.', 'projector.', 'conv.', 'wsi_projector.']
         to_return.update({k: v for k, v in state_dict.items() 
                           if any(key in k for key in vision_keys)})
 
@@ -917,6 +1056,40 @@ class LLaVAModel_conv(BaseModel):
         
         return projected_stages, grid_thw
 
+    def _project_wsi_features(self, wsi_features: List[List[torch.Tensor]]) -> torch.Tensor:
+        """
+        Project WSI features from multiple sources through the WSI projector.
+        
+        Args:
+            wsi_features: List of lists, where each inner list contains tensors from
+                         different WSI encoders for one sample.
+                         Shape: [[Tensor(D1), Tensor(D2), Tensor(D3)], ...] for B samples.
+        
+        Returns:
+            Tensor of shape (B, Num_WSI_Sources, LLM_Dim) containing all projected features.
+        """
+        if not hasattr(self, 'wsi_projector') or self.wsi_projector is None:
+            return None
+        
+        B = len(wsi_features)
+        num_sources = len(wsi_features[0])
+        device = next(self.wsi_projector.parameters()).device
+        
+        # Stack features from each source across batch
+        # wsi_features: [[D1, D2, D3], [D1, D2, D3], ...] for B samples
+        source_features = []
+        for source_idx in range(num_sources):
+            # Collect this source's features across all batch samples
+            source_batch = torch.stack([
+                wsi_features[b][source_idx].to(device=device, dtype=self.llm.dtype) for b in range(B)
+            ])  # (B, D_source)
+            source_features.append(source_batch)
+        
+        # Project through WSI projector
+        projected = self.wsi_projector(source_features)  # (B, Num_WSI_Sources, LLM_Dim)
+        
+        return projected.to(self.llm.dtype)
+
     @staticmethod
     def _get_torch_dtype() -> torch.dtype:
         """Get optimal torch dtype based on hardware capabilities."""
@@ -1013,13 +1186,14 @@ class LLaVAModel_conv(BaseModel):
         ds_indexes = self.deepstack_visual_indexes
         num_layers = self.llm.config.text_config.num_hidden_layers
 
+        # Handle injection order (normal or reversed)
+        stages_to_inject = projected_stages
+        if self.deepstack_reverse_injection:
+            stages_to_inject = list(reversed(projected_stages))
+
         # Build sparse list aligned to total LLM layers; only target indices receive features
         deepstack_embeds = [None] * num_layers
-        
-        projected_stages = list(reversed(projected_stages)) # do the reverse
-
-        for idx, feat in zip(ds_indexes, projected_stages):
-            
+        for idx, feat in zip(ds_indexes, stages_to_inject):
             if idx < num_layers:
                 deepstack_embeds[idx] = feat
 
@@ -1028,6 +1202,14 @@ class LLaVAModel_conv(BaseModel):
         data['image_grid_thw'] = grid_thw
         data.pop('features', None)
         data.pop('masks', None)
+        
+        # Process WSI features if available
+        wsi_embeddings = None
+        if self.enable_wsi_injection and 'wsi_features' in data:
+            wsi_features = data.pop('wsi_features')  # List of List[Tensor]: [[D1, D2, D3], ...]
+            if wsi_features is not None and len(wsi_features) > 0:
+                wsi_embeddings = self._project_wsi_features(wsi_features)
+        data['wsi_embeddings'] = wsi_embeddings
 
         if mode == 'predict':
             self._strip_assistant_targets(data)
@@ -1312,12 +1494,14 @@ class LLaVAModel_conv(BaseModel):
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
                         fused = self._fuse_token_with_vision(embed, b, 'regression')  # Shape depends on mode
-                        pred = self.regression_head(fused).squeeze(-1).item()
-                        data_samples[b]['regression_prediction'] = float(pred)
+                        pred_out = self.regression_head(fused)
+                        pred = float(pred_out.squeeze(-1).item()) if pred_out is not None else None
+                        data_samples[b]['regression_prediction'] = pred
                         prev = data_samples[b].get('prediction_text', '')
-                        data_samples[b]['prediction_text'] = f"{prev} [Regression: {pred:.4f}]".strip()
+                        text_suffix = f"[Regression: {pred:.4f}]" if pred is not None else ""
+                        data_samples[b]['prediction_text'] = f"{prev} {text_suffix}".strip()
 
-            # Survival (Cox-based: outputs single risk score)
+            # Survival (supports both Cox and Discrete methods)
             if has_survival[b] and self.enable_survival and self.srv_token_id is not None:
                 pos_in_gen = torch.nonzero(generate_ids[b] == self.srv_token_id, as_tuple=False).flatten()
                 if pos_in_gen.numel() > 0:
@@ -1325,16 +1509,48 @@ class LLaVAModel_conv(BaseModel):
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
                         fused = self._fuse_token_with_vision(embed, b, 'survival')  # (1, H)
-                        risk_score = float(self.survival_head.predict_risk_scores(fused).squeeze(0).item())
-                        pred_dict = {
-                            "risk_score": risk_score,
-                        }
+                        
+                        # Build prediction dict based on survival method
+                        pred_dict = {}
+                        
+                        if self.survival_method == 'discrete':
+                            # Discrete method: predict survival probabilities and derive risk
+                            survival_probs_out = self.survival_head.predict_survival_probs(fused)
+                            survival_probs = survival_probs_out.squeeze(0).cpu().tolist() if survival_probs_out is not None else None
+                            
+                            risk_score_out = self.survival_head.predict_risk_scores(fused)
+                            risk_score = float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None
+                            
+                            median_time_out = self.survival_head.predict_median_survival_time(fused)
+                            median_time = float(median_time_out.squeeze(0).item()) if median_time_out is not None else None
+                            
+                            pred_dict = {
+                                "method": "discrete",
+                                "risk_score": risk_score,
+                                "survival_probs": survival_probs,
+                                "median_survival_time": median_time,
+                            }
+                            
+                            suffixes = []
+                            if risk_score is not None:
+                                suffixes.append(f"Risk: {risk_score:.4f}")
+                            if median_time is not None:
+                                suffixes.append(f"Median: {median_time:.2f}")
+                            text_suffix = f"[{', '.join(suffixes)}]" if suffixes else ""
+                        else:
+                            # Cox method: predict risk score only
+                            risk_score_out = self.survival_head.predict_risk_scores(fused)
+                            risk_score = float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None
+                            pred_dict = {
+                                "method": "cox",
+                                "risk_score": risk_score,
+                            }
+                            text_suffix = f"[Risk Score: {risk_score:.4f}]" if risk_score is not None else ""
+                        
                         data_samples[b]["survival_prediction"] = pred_dict
-                        data_samples[b]["risk_score"] = risk_score
+                        data_samples[b]["risk_score"] = pred_dict["risk_score"]
                         prev = data_samples[b].get("prediction_text", "")
-                        data_samples[b]["prediction_text"] = (
-                            f"{prev} [Risk Score: {risk_score:.4f}]"
-                        ).strip()
+                        data_samples[b]["prediction_text"] = f"{prev} {text_suffix}".strip()
         return data_samples
 
     def _fuse_token_with_vision(self, token_embed: torch.Tensor, b: int, task_type: str = 'survival') -> torch.Tensor:
@@ -1452,16 +1668,38 @@ class LLaVAModel_conv(BaseModel):
 
         if task == 'regression':
             predictions = self.regression_head(task_embeds).squeeze(-1)
-            task_targets = targets[b_idx].to(predictions.dtype)
+            # Ensure targets is on the same device before indexing
+            task_targets = targets.to(device=predictions.device)[b_idx].to(predictions.dtype)
             return self.regression_loss_fn(predictions, task_targets)
-        else:  # survival with Cox loss
-            risk_scores = self.survival_head(task_embeds)  # (N,)
-            # targets is dict with 'time' and 'event' tensors
-            time = targets['time'][b_idx].to(device=risk_scores.device, dtype=risk_scores.dtype)
-            event = targets['event'][b_idx].to(device=risk_scores.device, dtype=risk_scores.dtype)
-            # valid_mask for Cox: exclude samples with NaN time/event
-            cox_valid = ~(torch.isnan(time) | torch.isnan(event))
-            return self.survival_loss_fn(risk_scores, time, event, cox_valid)
+        else:  # survival
+            output = self.survival_head(task_embeds)
+            
+            # Robust dispatch: always match loss path to model's configured head method
+            if self.survival_method == 'discrete':
+                # Discrete head pathway
+                if isinstance(targets, dict) and 'target_y' in targets:
+                    target_y = targets['target_y'].to(device=output.device)[b_idx].to(dtype=output.dtype)
+                    at_risk_mask = targets['at_risk_mask'].to(device=output.device)[b_idx].to(dtype=output.dtype)
+                    return logistic_hazard_loss(output, target_y, at_risk_mask)
+                else:
+                    # If model is discrete but data has no bins, we cannot train
+                    raise ValueError(
+                        f"Survival method is '{self.survival_method}' but data missing 'bins'. "
+                        "Please ensure dataset includes pre-computed bins for discrete survival."
+                    )
+            else:
+                # Cox head pathway (Default)
+                # Even if data contains 'bins', we use 'time'/'event' fields for CoxPH head
+                time = targets['time'].to(device=output.device)[b_idx].to(dtype=output.dtype)
+                event = targets['event'].to(device=output.device)[b_idx].to(dtype=output.dtype)
+                
+                # Exclude samples with missing data (NaNs)
+                valid = ~(torch.isnan(time) | torch.isnan(event))
+                if not torch.any(valid):
+                    return self._get_zero_loss_with_grad_connectivity(task, 
+                        torch.zeros((), device=labels.device, dtype=self.llm.dtype))
+                
+                return cox_ph_loss(output[valid], time[valid], event[valid])
 
     def _get_zero_loss_with_grad_connectivity(self, task: str, base_loss: torch.Tensor) -> torch.Tensor:
         """Return zero loss while ensuring task parameters remain in computation graph.

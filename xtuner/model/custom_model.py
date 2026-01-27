@@ -663,18 +663,32 @@ class AttentionPooling(nn.Module):
         return output
 
 
+EPS = 1e-8  # Small epsilon to avoid division by zero
+
+
 class RegressionHead(nn.Module):
-    def __init__(self, in_dim: int):
+    def __init__(self, in_dim: int, hidden_mult: float = 0.0):
         super().__init__()
-        # Simplified to a single linear layer
-        self.head = nn.Linear(in_dim, 1)
+        if hidden_mult > 0:
+            hidden_dim = int(in_dim * hidden_mult)
+            self.head = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1)
+            )
+        else:
+            self.head = nn.Linear(in_dim, 1)
         self._init_weights()
     
     def _init_weights(self):
         """Initialize weights with small gain for stable training."""
-        nn.init.xavier_uniform_(self.head.weight, gain=0.1)
-        if self.head.bias is not None:
-            nn.init.constant_(self.head.bias, 0.0)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Use smaller gain for the final regression output
+                gain = 0.1 if m.out_features == 1 else 1.0
+                nn.init.xavier_uniform_(m.weight, gain=gain)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(x)
@@ -682,84 +696,452 @@ class RegressionHead(nn.Module):
 
 class SurvivalHead(nn.Module):
     """
-    Cox proportional hazards survival head.
+    Unified Survival Head supporting both Cox and Discrete-Time (bin-based) methods.
     
-    Outputs a single risk score (log-hazard) per sample.
-    Higher risk score = higher risk of event.
+    Methods:
+    - 'cox': Outputs a single risk score (log-hazard) per sample for Cox PH loss.
+             Higher risk score = higher risk of event.
+    - 'discrete': Outputs K hazard logits for discrete time intervals.
+                  Uses logistic hazard loss and can predict survival curves.
+    
+    Args:
+        in_dim: Input dimension (hidden state dimension)
+        method: 'cox' for Cox PH or 'discrete' for discrete-time survival
+        num_intervals: Number of time intervals (K) for discrete method (ignored for cox)
+        time_intervals: Optional tensor of K+1 time boundaries for discrete method
     """
 
-    def __init__(self, in_dim: int):
+    def __init__(
+        self,
+        in_dim: int,
+        method: Literal["cox", "discrete"] = "cox",
+        num_intervals: int = 6,
+        time_intervals: Optional[torch.Tensor] = None,
+        hidden_mult: float = 0.0,
+    ):
         super().__init__()
-        # Simplified to a single linear layer
-        self.head = nn.Linear(in_dim, 1)
+        self.method = method
+        self.num_intervals = num_intervals
+        out_dim = 1 if method == "cox" else num_intervals
+        
+        if hidden_mult > 0:
+            hidden_dim = int(in_dim * hidden_mult)
+            self.head = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, out_dim)
+            )
+        else:
+            self.head = nn.Linear(in_dim, out_dim)
+            
+        # Register time intervals for discrete method (optional, only for median prediction)
+        if time_intervals is not None:
+            self.register_buffer("time_intervals", time_intervals.float())
+        else:
+            # No time intervals - median survival prediction will not be available
+            self.register_buffer("time_intervals", None)
+        
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # Use gain=1.0 for better initial risk score differentiation
-        nn.init.xavier_uniform_(self.head.weight, gain=1.0)
-        if self.head.bias is not None:
-            nn.init.constant_(self.head.bias, 0.0)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return risk scores. Shape: (N,)."""
-        return self.head(x).squeeze(-1)
+        """
+        Forward pass.
+        
+        For cox: returns risk scores (N,)
+        For discrete: returns hazard logits (N, K)
+        """
+        logits = self.head(x)
+        if self.method == "cox":
+            return logits.squeeze(-1)  # (N,)
+        else:
+            return logits  # (N, K)
 
+    # ========== Cox-specific methods ==========
+    
     @torch.no_grad()
     def predict_risk_scores(self, x: torch.Tensor) -> torch.Tensor:
-        """Return risk scores (N,), where larger means higher risk."""
-        return self.forward(x)
+        """Return risk scores (N,), where larger means higher risk.
+        
+        For cox: directly uses the output.
+        For discrete: uses cumulative hazard as risk (sum of interval hazards).
+        """
+        if self.method == "cox":
+            return self.forward(x)
+        else:
+            # For discrete, use cumulative hazard as risk
+            return self._compute_discrete_risk_scores(x, mode="cumhaz")
+    
+    # ========== Discrete-specific methods ==========
+    
+    def predict_hazards(self, x: torch.Tensor) -> torch.Tensor:
+        """Return hazards h_k in (0,1). Shape: (N, K). Only for discrete method."""
+        if self.method != "discrete":
+            raise ValueError("predict_hazards only available for discrete method")
+        return torch.sigmoid(self.forward(x))
 
+    def _hazards_and_survival_end(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns for discrete method:
+          hazards: (N, K)
+          S_end:   (N, K) = [S(t1), ..., S(tK)]
+        """
+        hazards = torch.sigmoid(self.forward(x))         # (N, K)
+        S_end = torch.cumprod(1.0 - hazards, dim=1)      # (N, K)
+        return hazards, S_end
+
+    @torch.no_grad()
+    def predict_survival_probs(self, x: torch.Tensor) -> torch.Tensor:
+        """Survival at end of each interval: (N, K) = [S(t1), ..., S(tK)].
+        Only for discrete method."""
+        if self.method != "discrete":
+            raise ValueError("predict_survival_probs only available for discrete method")
+        _, S_end = self._hazards_and_survival_end(x)
+        return S_end
+
+    @torch.no_grad()
+    def _compute_discrete_risk_scores(
+        self,
+        x: torch.Tensor,
+        mode: Literal["cumhaz", "nll_final"] = "cumhaz",
+    ) -> torch.Tensor:
+        """
+        Return risk scores (N,), where larger means higher risk.
+
+        mode="cumhaz": Cumulative hazard = Σ_k h_k. Simple and doesn't need time_intervals.
+        mode="nll_final": risk = -log S(t_K)
+        """
+        hazards, S_end = self._hazards_and_survival_end(x)
+
+        if mode == "nll_final":
+            final_survival = S_end[:, -1]
+            return -torch.log(final_survival + EPS)
+
+        if mode == "cumhaz":
+            # Cumulative hazard: sum of hazards - higher = more risky
+            # This doesn't require time_intervals
+            cumhaz = hazards.sum(dim=1)  # (N,)
+            return cumhaz
+
+        raise ValueError(f"Unknown mode: {mode}")
+
+    @torch.no_grad()
+    def predict_median_survival_time(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Predict median survival time per sample (discrete method only):
+        returns the first boundary time t_k where S(t_k) < 0.5,
+        otherwise returns the last boundary t_K.
+
+        Shape: (N,) or None if time_intervals not available.
+        """
+        if self.method != "discrete":
+            raise ValueError("predict_median_survival_time only available for discrete method")
+        
+        if self.time_intervals is None:
+            # Cannot compute actual survival times without interval boundaries
+            return None
+        
+        S_end = self.predict_survival_probs(x)          # (N, K)
+        below = S_end < 0.5                             # (N, K)
+        first_idx = torch.argmax(below.to(torch.int64), dim=1)  # (N,)
+
+        never = ~below.any(dim=1)                       # (N,)
+        first_idx = torch.where(
+            never,
+            torch.full_like(first_idx, self.num_intervals - 1),
+            first_idx,
+        )
+
+        median_times = self.time_intervals[1:][first_idx]  # (N,)
+        return median_times
+
+
+# ========== Loss Functions ==========
 
 def cox_ph_loss(
     theta: torch.Tensor,
     time: torch.Tensor,
     event: torch.Tensor,
-    valid_mask: torch.Tensor = None,
     eps: float = 1e-12
 ) -> torch.Tensor:
     """
     Cox proportional hazards partial likelihood loss.
     
     Args:
-        theta: (N,) or (N,1) risk score (log-risk), any real
-        time:  (N,) follow-up time, higher=later
-        event: (N,) 1=event happened, 0=censored
-        valid_mask: (N,) bool, True=use this sample
-        eps: small value for numerical stability
-        
-    Returns:
-        Scalar loss value (negative partial log-likelihood)
+        theta: (N,) risk score (log-risk)
+        time:  (N,) follow-up time
+        event: (N,) 1=event, 0=censored
     """
     theta = theta.view(-1)
     time = time.view(-1)
     event = event.view(-1).float()
-
-    if valid_mask is None:
-        valid_mask = torch.ones_like(time, dtype=torch.bool)
-    else:
-        valid_mask = valid_mask.view(-1).bool()
-
-    idx = torch.where(valid_mask)[0]
-    if idx.numel() < 2:
-        return torch.zeros((), device=theta.device, dtype=theta.dtype)
-
-    theta = theta[idx]
-    time = time[idx]
-    event = event[idx]
 
     n_events = event.sum()
     if n_events < 1:
         return torch.zeros((), device=theta.device, dtype=theta.dtype)
 
     # Risk set mask: R[i,j] = (time[j] >= time[i])
-    # shape: (m, m)
     R = (time[None, :] >= time[:, None])
 
     # log denom_i = log sum_{j in R_i} exp(theta_j)
-    # mask out non-risk with -inf for logsumexp
-    theta_row = theta[None, :].expand(theta.numel(), -1)
+    M = theta.numel()
+    theta_row = theta.view(1, M).expand(M, M)
     log_denom = torch.logsumexp(theta_row.masked_fill(~R, float("-inf")), dim=1)
 
     # negative partial log-likelihood
     loss = -((theta - log_denom) * event).sum() / (n_events + eps)
     return loss
+
+
+def logistic_hazard_loss(
+    logits: torch.Tensor,
+    target_y: torch.Tensor,
+    at_risk_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Standard discrete-time logistic hazard loss.
+
+    Args:
+        logits:       (N, K) hazard logits from SurvivalHead (discrete mode)
+        target_y:     (N, K) binary, y_{ik}=1 only at event interval (if event observed)
+        at_risk_mask: (N, K) 1 where that interval contributes to likelihood
+        
+    Returns:
+        Scalar loss value
+    """
+    bce = F.binary_cross_entropy_with_logits(logits, target_y, reduction="none")  # (N, K)
+    return (bce * at_risk_mask).sum() / (at_risk_mask.sum() + EPS)
+
+
+def prepare_discrete_survival_targets(
+    event_times: torch.Tensor,
+    event_indicators: torch.Tensor,
+    time_intervals: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Prepare target_y and at_risk_mask for the discrete-time hazard model.
+
+    Args:
+        event_times: (N,) survival times
+        event_indicators: (N,) 1=event, 0=censored
+        time_intervals: (K+1,) boundaries [t0, t1, ..., tK]
+        
+    Returns:
+        target_y: (N, K) binary target
+        at_risk_mask: (N, K) mask for loss computation
+    """
+    if time_intervals.ndim != 1 or time_intervals.numel() < 2:
+        raise ValueError("time_intervals must be 1D with length >= 2 (boundaries).")
+
+    N = int(event_times.numel())
+    K = int(time_intervals.numel() - 1)
+    device = event_times.device
+
+    target_y = torch.zeros(N, K, device=device)
+    at_risk_mask = torch.zeros(N, K, device=device)
+
+    for i in range(N):
+        t_i = event_times[i]
+        d_i = event_indicators[i].item()
+
+        m = torch.searchsorted(time_intervals[1:], t_i, right=False)
+        m = torch.clamp(m, 0, K - 1).item()
+
+        if d_i == 1:  # event observed in interval m
+            at_risk_mask[i, :m] = 1.0
+            target_y[i, :m] = 0.0
+            at_risk_mask[i, m] = 1.0
+            target_y[i, m] = 1.0
+        else:  # censored in interval m => contribute through m with y=0
+            at_risk_mask[i, : m + 1] = 1.0
+            target_y[i, : m + 1] = 0.0
+
+    return target_y, at_risk_mask
+
+
+# ========== WSI Feature Projector ==========
+
+class WSIProjectorMLP(nn.Module):
+    """Single MLP projector for one WSI encoder source."""
+    
+    def __init__(self, input_dim: int, output_dim: int, hidden_mult: float = 2.0):
+        """
+        Initialize the MLP projector.
+        
+        Args:
+            input_dim: Input dimension from WSI encoder
+            output_dim: Output dimension (LLM hidden size)
+            hidden_mult: Multiplier for hidden layer dimension. 
+                         If <= 0, uses a single linear layer.
+        """
+        super().__init__()
+        
+        if hidden_mult > 0:
+            hidden_dim = int(output_dim * hidden_mult)
+            self.layers = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim)
+            )
+        else:
+            self.layers = nn.Linear(input_dim, output_dim)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Xavier uniform for better gradient flow."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            x: Input tensor of shape (B, input_dim) or (input_dim,)
+            
+        Returns:
+            Projected tensor of shape (B, output_dim) or (output_dim,)
+        """
+        return self.layers(x)
+
+
+class WSIProjector(nn.Module):
+    """
+    Multi-source WSI Feature Projector.
+    
+    Projects WSI-level features from multiple encoders (e.g., TITAN, CONCH, UNI)
+    to the LLM hidden dimension using separate MLPs for each source.
+    
+    The projected features can be used as:
+    1. Soft prompts: Inserted into the LLM input sequence before patch-level tokens
+    2. DeepStack injection: Concatenated with patch features at intermediate layers
+    
+    Args:
+        wsi_input_dims: List of input dimensions for each WSI encoder source.
+                        E.g., [768, 1024, 768] for three different encoders.
+        llm_hidden_size: LLM hidden dimension to project to.
+        hidden_mult: Multiplier for hidden layer size in each MLP.
+        dropout: Dropout rate applied after projection.
+    """
+    
+    def __init__(
+        self,
+        wsi_input_dims: list,
+        llm_hidden_size: int,
+        hidden_mult: float = 2.0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        
+        if not wsi_input_dims:
+            raise ValueError("wsi_input_dims cannot be empty")
+        
+        self.wsi_input_dims = wsi_input_dims
+        self.llm_hidden_size = llm_hidden_size
+        self.num_sources = len(wsi_input_dims)
+        
+        # Create separate MLPs for each WSI source
+        self.projectors = nn.ModuleList([
+            WSIProjectorMLP(dim, llm_hidden_size, hidden_mult)
+            for dim in wsi_input_dims
+        ])
+        
+        # Optional dropout after projection
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        # Learnable scale factors for combining projections (optional enhancement)
+        self.scale_factors = nn.Parameter(torch.ones(len(wsi_input_dims)))
+        
+    def forward(
+        self,
+        wsi_features: list,
+        normalize: bool = False,
+    ) -> torch.Tensor:
+        """
+        Project multiple WSI features to LLM hidden dimension.
+        
+        Args:
+            wsi_features: List of tensors, each of shape (B, D_i) where D_i is the
+                         dimension of the i-th WSI encoder. Length must match num_sources.
+            normalize: Whether to apply L2 normalization to each projected feature.
+            
+        Returns:
+            Tensor of shape (B, num_sources, llm_hidden_size) containing all projected features.
+        """
+        if len(wsi_features) != self.num_sources:
+            raise ValueError(
+                f"Expected {self.num_sources} WSI features, got {len(wsi_features)}"
+            )
+        
+        projected = []
+        for i, (feat, projector, scale) in enumerate(zip(wsi_features, self.projectors, self.scale_factors)):
+            # Validate input dimension
+            if feat.size(-1) != self.wsi_input_dims[i]:
+                raise ValueError(
+                    f"WSI source {i}: expected dim {self.wsi_input_dims[i]}, got {feat.size(-1)}"
+                )
+            
+            # Project
+            proj = projector(feat)  # (B, llm_hidden_size)
+            
+            # Apply scale factor
+            proj = proj * scale
+            
+            # Optional normalization
+            if normalize:
+                proj = nn.functional.normalize(proj, p=2, dim=-1)
+            
+            # Apply dropout
+            proj = self.dropout(proj)
+            
+            projected.append(proj)
+        
+        # Stack along source dimension: (B, num_sources, llm_hidden_size)
+        return torch.stack(projected, dim=1)
+    
+    def forward_single(self, wsi_feature: torch.Tensor, source_idx: int) -> torch.Tensor:
+        """
+        Project a single WSI feature from a specific source.
+        
+        Args:
+            wsi_feature: Tensor of shape (B, D_i) or (D_i,)
+            source_idx: Index of the WSI source
+            
+        Returns:
+            Projected tensor of shape (B, llm_hidden_size) or (llm_hidden_size,)
+        """
+        if source_idx < 0 or source_idx >= self.num_sources:
+            raise ValueError(f"Invalid source_idx {source_idx}, must be in [0, {self.num_sources})")
+        
+        return self.dropout(self.projectors[source_idx](wsi_feature) * self.scale_factors[source_idx])
+    
+    def get_output_sequence_length(self) -> int:
+        """Return the number of WSI tokens that will be added to the sequence."""
+        return self.num_sources
+    
+    def enable_input_require_grads(self):
+        """Enable gradient computation for inputs (needed for gradient checkpointing)."""
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        
+        for projector in self.projectors:
+            # Handle both Sequential (MLP) and Linear (Single Layer)
+            target = projector.layers[0] if isinstance(projector.layers, nn.Sequential) else projector.layers
+            target.register_forward_hook(make_inputs_require_grad)
+    
+    def extra_repr(self) -> str:
+        return (
+            f"wsi_input_dims={self.wsi_input_dims}, "
+            f"llm_hidden_size={self.llm_hidden_size}, "
+            f"num_sources={self.num_sources}"
+        )

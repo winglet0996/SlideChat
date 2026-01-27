@@ -203,23 +203,37 @@ class PathologyMetric(BaseMetric):
 
     def _process_survival_sample(self, sample: Dict, input_str: str, pred_str: str, 
                                metadata: Dict[str, Any]) -> None:
-        """Process survival prediction sample using model's survival_prediction dict."""
+        """Process survival prediction sample using model's survival_prediction dict.
+        
+        Supports both Cox and Discrete survival methods.
+        """
         survival_data = metadata['survival_data']
         if not survival_data:
             return
-        sp = sample['survival_prediction']  # dict with keys: logits, survival_probs, risk_score, median_survival_time
-        self.results.append({
+        sp = sample['survival_prediction']  # dict with keys depending on method
+        
+        # Determine method from prediction
+        method = sp.get('method', 'cox')
+        
+        result = {
             'task_type': 'survival',
             'filename': metadata['filename'],
             'project': metadata['project'],
             'input': input_str.strip(),
             'prediction': pred_str.strip(),
             'category': metadata['category'],
-            'survival_probs': sp.get('survival_probs'),
+            'method': method,
             'risk_score': sp.get('risk_score'),
             'event_time': survival_data['time'],
             'event_indicator': survival_data['event']
-        })
+        }
+        
+        # Add discrete-specific fields if available
+        if method == 'discrete':
+            result['survival_probs'] = sp.get('survival_probs')
+            result['median_survival_time'] = sp.get('median_survival_time')
+        
+        self.results.append(result)
 
     def _process_regression_sample(self, sample: Dict, input_str: str, pred_str: str,
                                  metadata: Dict[str, Any]) -> None:
@@ -519,13 +533,16 @@ class PathologyMetric(BaseMetric):
         except (IndexError, ValueError, TypeError):
             return None
 
-    def _get_survival_data(self, batch_data: Dict[str, Any], idx: int) -> Optional[Dict[str, float]]:
-        """Extract survival time and event from batch data (Cox format: time, event)."""
+    def _get_survival_data(self, batch_data: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+        """Extract survival time and event from batch data.
+        
+        Supports both Cox format (time, event) and Discrete format (time, event, method).
+        """
         st = batch_data.get("survival_targets", None)
         if st is None:
             return None
         
-        # New Cox format: dict with 'time' and 'event' tensors
+        # Format: dict with 'time' and 'event' tensors, optionally 'method'
         if isinstance(st, dict) and 'time' in st and 'event' in st:
             try:
                 t = st['time'][idx]
@@ -541,7 +558,14 @@ class PathologyMetric(BaseMetric):
                 # Check for NaN (invalid data)
                 if np.isnan(t) or np.isnan(e):
                     return None
-                return {"time": t, "event": e}
+                
+                result = {"time": t, "event": e}
+                
+                # Add method if present
+                if 'method' in st:
+                    result['method'] = st['method']
+                
+                return result
             except Exception:
                 return None
         
@@ -1113,12 +1137,19 @@ class PathologyMetric(BaseMetric):
         return all_metrics
     
     def _compute_single_project_survival_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute survival metrics per category for a single project (no overall metric).
+        """Compute survival metrics per category for a single project.
         
-        Returns per-category C-index metrics only.
+        Supports both Cox and Discrete methods.
+        Returns per-category C-index metrics (and IBS for discrete method).
         """
         # Group by category
-        category_data = defaultdict(lambda: {'risk_scores': [], 'event_times': [], 'event_indicators': []})
+        category_data = defaultdict(lambda: {
+            'risk_scores': [], 
+            'event_times': [], 
+            'event_indicators': [],
+            'survival_probs': [],
+            'method': 'cox'
+        })
         
         for res in results:
             rs = res.get('risk_score')
@@ -1132,13 +1163,19 @@ class PathologyMetric(BaseMetric):
             category_data[category]['risk_scores'].append(float(rs))
             category_data[category]['event_times'].append(float(et))
             category_data[category]['event_indicators'].append(float(ei))
+            
+            # Track survival probs for discrete method
+            sp = res.get('survival_probs')
+            if sp is not None:
+                category_data[category]['survival_probs'].append(sp)
+                category_data[category]['method'] = res.get('method', 'discrete')
 
         if not category_data:
             return {}
 
         metrics = {}
         
-        # Compute per-category C-index only (no overall)
+        # Compute per-category metrics
         for category, cat_data in category_data.items():
             if len(cat_data['risk_scores']) < 2:
                 continue  # Skip categories with insufficient data
@@ -1147,13 +1184,25 @@ class PathologyMetric(BaseMetric):
             cat_time = np.array(cat_data['event_times'], dtype=float)
             cat_event = np.array(cat_data['event_indicators'], dtype=float)
             
+            # Prepare survival probs for discrete method
+            cat_surv_probs = None
+            if cat_data['survival_probs'] and len(cat_data['survival_probs']) == len(cat_risk):
+                try:
+                    cat_surv_probs = np.array(cat_data['survival_probs'], dtype=float)
+                except Exception:
+                    cat_surv_probs = None
+            
             try:
-                cat_c_index = self.survival_metrics.compute_concordance_index(
-                    cat_risk, cat_time, cat_event)
+                cat_metrics = self.survival_metrics.compute_all_metrics(
+                    cat_risk, cat_time, cat_event,
+                    survival_probs=cat_surv_probs,
+                    method=cat_data['method']
+                )
                 safe_cat = self._make_safe_key(category)
-                metrics[f'{safe_cat}_c_index'] = float(cat_c_index)
-            except Exception as e:
-                # Silently skip categories that cannot compute C-index (e.g., no admissible pairs)
+                for metric_name, value in cat_metrics.items():
+                    metrics[f'{safe_cat}_{metric_name}'] = float(value)
+            except Exception:
+                # Silently skip categories that cannot compute metrics
                 continue
         
         return metrics
@@ -1440,28 +1489,108 @@ class PathologyMetric(BaseMetric):
 
 
 class SurvivalMetrics:
-    """Survival analysis metric utilities for Cox-based predictions (C-index only)."""
+    """Survival analysis metric utilities supporting both Cox and Discrete methods.
+    
+    Metrics computed:
+    - C-index (concordance index): Works for both Cox and Discrete methods
+    - Integrated Brier Score (IBS): Only for Discrete method with survival probabilities
+    """
     
     def __init__(self):
-        """Initialize survival metrics (no discrete intervals needed for Cox)."""
+        """Initialize survival metrics."""
         pass
 
     def compute_concordance_index(self,
                                   risk_scores: np.ndarray,
                                   event_times: np.ndarray,
                                   event_indicators: np.ndarray) -> float:
-        """Harrell's C-index via lifelines (assumed available)."""
+        """Harrell's C-index via lifelines.
+        
+        Works for both Cox (direct risk scores) and Discrete (cumhaz-based risk scores).
+        """
         from lifelines.utils import concordance_index
-        # lifelines interprets smaller values as higher risk -> negate scores
+        # lifelines interprets smaller values as lower risk -> negate scores
         return float(concordance_index(event_times, -risk_scores, event_indicators))
+    
+    def compute_integrated_brier_score(self,
+                                       survival_probs: np.ndarray,
+                                       event_times: np.ndarray,
+                                       event_indicators: np.ndarray,
+                                       time_points: Optional[np.ndarray] = None) -> Optional[float]:
+        """Compute Integrated Brier Score for discrete survival predictions.
+        
+        Args:
+            survival_probs: (N, K) array of survival probabilities at each interval
+            event_times: (N,) array of event/censoring times
+            event_indicators: (N,) array of event indicators (1=event, 0=censored)
+            time_points: Optional (K,) array of time points for evaluation.
+                        If not provided, uses evenly spaced [1, 2, ..., K].
+            
+        Returns:
+            IBS value, or None if computation fails
+        """
+        if survival_probs is None or len(survival_probs) == 0:
+            return None
+        
+        try:
+            # Use sksurv if available for proper IBS computation
+            from sksurv.metrics import integrated_brier_score
+            from sksurv.util import Surv
+            
+            # Prepare structured array for sksurv
+            y = Surv.from_arrays(event_indicators.astype(bool), event_times)
+            
+            # Use evenly spaced time points if not provided
+            if time_points is None:
+                time_points = np.arange(1, survival_probs.shape[1] + 1).astype(float)
+            
+            # Ensure time_points are within observed range
+            max_time = event_times.max()
+            time_points = time_points[time_points <= max_time]
+            
+            if len(time_points) < 2:
+                return None
+            
+            # Adjust survival_probs to match time_points
+            survival_probs_eval = survival_probs[:, :len(time_points)]
+            
+            ibs = integrated_brier_score(y, y, survival_probs_eval, time_points)
+            return float(ibs)
+        except Exception:
+            # Fallback: return None if computation fails
+            return None
     
     def compute_all_metrics(self,
                           risk_scores: np.ndarray, 
                           event_times: np.ndarray,
-                          event_indicators: np.ndarray) -> Dict[str, float]:
-        """Compute survival metrics (C-index only for Cox-based model)."""
-        return {
-            'c_index': self.compute_concordance_index(
-                risk_scores, event_times, event_indicators
+                          event_indicators: np.ndarray,
+                          survival_probs: Optional[np.ndarray] = None,
+                          method: str = 'cox') -> Dict[str, float]:
+        """Compute survival metrics based on method type.
+        
+        Args:
+            risk_scores: (N,) risk scores (higher = higher risk)
+            event_times: (N,) event/censoring times
+            event_indicators: (N,) event indicators
+            survival_probs: (N, K) survival probabilities (discrete method only)
+            method: 'cox' or 'discrete'
+            
+        Returns:
+            Dict with metric names and values
+        """
+        metrics = {}
+        
+        # C-index works for both methods
+        metrics['c_index'] = self.compute_concordance_index(
+            risk_scores, event_times, event_indicators
+        )
+        
+        # IBS only for discrete method with survival probabilities
+        if method == 'discrete' and survival_probs is not None:
+            ibs = self.compute_integrated_brier_score(
+                survival_probs, event_times, event_indicators
             )
-        }
+            if ibs is not None:
+                metrics['ibs'] = ibs
+        
+        return metrics

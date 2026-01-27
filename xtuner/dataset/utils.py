@@ -486,3 +486,84 @@ def load_wsi_feature(wsi_file, max_patch_num, transform=None):
         features = torch.from_numpy(features)
         return features
 
+
+def load_wsi_global_features(wsi_feature_paths, feature_key='feature'):
+    """
+    Load global WSI-level feature vectors from a list of H5 files.
+    
+    This function loads pre-extracted slide-level embeddings from multiple
+    WSI feature extractors (e.g., TITAN, CONCH, UNI).
+    
+    Args:
+        wsi_feature_paths: List of paths to H5 files containing WSI features.
+        feature_key: Primary key to look for in H5 files. Will also try common
+                     alternative keys if the primary key is not found.
+    
+    Returns:
+        List of 1D tensors, one for each WSI feature file.
+        
+    Example:
+        >>> paths = [
+        ...     '/path/to/wsi_feat_titan.h5',
+        ...     '/path/to/wsi_feat_conch.h5',
+        ...     '/path/to/wsi_feat_uni.h5'
+        ... ]
+        >>> features = load_wsi_global_features(paths)
+        >>> [f.shape for f in features]
+        [torch.Size([768]), torch.Size([1024]), torch.Size([768])]
+    """
+    if not wsi_feature_paths:
+        return []
+    
+    # Common key names used by different WSI feature extractors
+    possible_keys = [
+        feature_key,
+        'feature',
+        'features',
+        'embedding',
+        'embeddings',
+        'feat',
+        'slide_feature',
+        'wsi_feature',
+        'global_feature',
+    ]
+    
+    features = []
+    for path in wsi_feature_paths:
+        feat = _load_single_wsi_feature(path, possible_keys)
+        features.append(feat)
+    
+    return features
+
+
+def _load_single_wsi_feature(h5_path, possible_keys):
+    """Load a single WSI feature from an H5 file."""
+    with h5py.File(h5_path, 'r') as f:
+        # Try each possible key
+        for key in possible_keys:
+            if key in f:
+                data = f[key][:]
+                
+                # Handle different array shapes
+                if data.ndim == 0:
+                    raise ValueError(f"Feature in {h5_path} is scalar, expected 1D array")
+                elif data.ndim == 1:
+                    pass  # Already 1D
+                elif data.ndim == 2:
+                    if data.shape[0] == 1:
+                        data = data.squeeze(0)
+                    else:
+                        # Multiple features - take mean for aggregation
+                        data = data.mean(axis=0)
+                else:
+                    data = data.reshape(-1)
+                
+                return torch.from_numpy(data.astype(np.float32))
+        
+        # No valid key found
+        available_keys = list(f.keys())
+        raise KeyError(
+            f"No valid feature key found in {h5_path}. "
+            f"Available keys: {available_keys}. "
+            f"Tried: {possible_keys[:5]}..."
+        )

@@ -32,6 +32,8 @@ def masked_collated_fn(instances: Sequence[Dict],
 
     input_ids, labels = [], []
     has_image = any(inst.get('features') is not None for inst in instances)
+    has_wsi_features = any(inst.get('wsi_features') is not None for inst in instances)
+    
     if use_varlen_attn:
         position_ids, cumulative_len = [], []
         assert len(instances) == 1, (
@@ -44,6 +46,10 @@ def masked_collated_fn(instances: Sequence[Dict],
         features = []
         masks = []
         image_batch_indices = []  # map each image to its sample index
+    
+    # WSI features collection
+    if has_wsi_features:
+        wsi_features_list = []  # List of List[Tensor] for each sample
 
     # Optional regression and survival targets collection
     regression_targets = []
@@ -87,6 +93,15 @@ def masked_collated_fn(instances: Sequence[Dict],
                 masks.extend(example['masks'])
             else:
                 masks.append(example['masks'])
+        
+        # Handle WSI features
+        if has_wsi_features:
+            if 'wsi_features' in example and example['wsi_features'] is not None:
+                # wsi_features is a list of tensors [Tensor(D1), Tensor(D2), ...]
+                wsi_features_list.append(example['wsi_features'])
+            else:
+                # Placeholder - will need to handle this case in the model
+                wsi_features_list.append(None)
 
     ori_length = [len(ids) for ids in input_ids]
     if len(instances) > 1:
@@ -183,38 +198,98 @@ def masked_collated_fn(instances: Sequence[Dict],
         data_dict['image_batch_indices'] = torch.as_tensor(
             image_batch_indices, dtype=torch.long)
 
+    # Add WSI features to data_dict
+    # WSI features are kept as a list of lists (not stacked) since different sources may have different dims
+    if has_wsi_features:
+        # Filter out None values and only include if all samples have WSI features
+        valid_wsi_features = [w for w in wsi_features_list if w is not None]
+        if len(valid_wsi_features) == len(wsi_features_list) and len(valid_wsi_features) > 0:
+            data_dict['wsi_features'] = valid_wsi_features
+        else:
+            # If some samples are missing WSI features, don't include any to avoid shape mismatches
+            data_dict['wsi_features'] = None
+
     # stack regression targets
     if any(not np.isnan(t[0]) for t in regression_targets):
         data_dict['regression_targets'] = torch.tensor(
             regression_targets, dtype=torch.float32).squeeze(-1)
 
-    # stack survival targets (new format: [time, event] list)
+    # stack survival targets (supports both Cox and Discrete formats)
+    # Cox format: {'time': float, 'event': float} or [time, event]
+    # Discrete format: {'time': float, 'event': float, 'bins': list} or {'bins': list, ...}
     if any(t is not None for t in survival_targets):
         survival_times = []
         survival_events = []
+        survival_bins = []  # For discrete method: list of K-length tensors
+        has_bins = False
         
         for t in survival_targets:
             if t is not None:
-                # Handle [time, event] format from JSON
-                if isinstance(t, (list, tuple)) and len(t) == 2:
+                # Check for discrete bins format
+                if isinstance(t, dict) and 'bins' in t:
+                    has_bins = True
+                    survival_bins.append(t['bins'])
+                    # Also extract time/event for C-index evaluation
+                    survival_times.append(float(t.get('time', 0.0)))
+                    survival_events.append(float(t.get('event', 0.0)))
+                # Handle [time, event] format from JSON (Cox)
+                elif isinstance(t, (list, tuple)) and len(t) == 2:
                     survival_times.append(float(t[0]))
                     survival_events.append(float(t[1]))
-                # Handle dict format (legacy support)
+                    survival_bins.append(None)
+                # Handle dict format (Cox)
                 elif isinstance(t, dict):
                     survival_times.append(float(t.get('time', 0.0)))
                     survival_events.append(float(t.get('event', 0.0)))
+                    survival_bins.append(None)
                 else:
                     # Fallback: treat as invalid
                     survival_times.append(float('nan'))
                     survival_events.append(float('nan'))
+                    survival_bins.append(None)
             else:
                 survival_times.append(float('nan'))
                 survival_events.append(float('nan'))
+                survival_bins.append(None)
         
-        data_dict['survival_targets'] = {
+        survival_dict = {
             'time': torch.tensor(survival_times, dtype=torch.float32),
-            'event': torch.tensor(survival_events, dtype=torch.float32)
+            'event': torch.tensor(survival_events, dtype=torch.float32),
+            'method': 'discrete' if has_bins else 'cox'
         }
+        
+        # Add bins data for discrete method
+        if has_bins:
+            # Stack bins into tensors if all samples have bins
+            valid_bins = [b for b in survival_bins if b is not None]
+            if valid_bins:
+                # Assume all bins have the same structure: {'target_y': [...], 'at_risk_mask': [...]}
+                if isinstance(valid_bins[0], dict):
+                    target_y_list = []
+                    at_risk_mask_list = []
+                    for i, b in enumerate(survival_bins):
+                        if b is not None:
+                            target_y_list.append(torch.tensor(b['target_y'], dtype=torch.float32))
+                            at_risk_mask_list.append(torch.tensor(b['at_risk_mask'], dtype=torch.float32))
+                        else:
+                            # Placeholder for samples without bins (use zeros)
+                            K = len(valid_bins[0]['target_y'])
+                            target_y_list.append(torch.zeros(K, dtype=torch.float32))
+                            at_risk_mask_list.append(torch.zeros(K, dtype=torch.float32))
+                    survival_dict['target_y'] = torch.stack(target_y_list)
+                    survival_dict['at_risk_mask'] = torch.stack(at_risk_mask_list)
+                else:
+                    # bins is a list of values [y1, y2, ..., yK]
+                    target_y_list = []
+                    for i, b in enumerate(survival_bins):
+                        if b is not None:
+                            target_y_list.append(torch.tensor(b, dtype=torch.float32))
+                        else:
+                            K = len(valid_bins[0])
+                            target_y_list.append(torch.zeros(K, dtype=torch.float32))
+                    survival_dict['target_y'] = torch.stack(target_y_list)
+        
+        data_dict['survival_targets'] = survival_dict
 
     if return_hf_format:
         return data_dict

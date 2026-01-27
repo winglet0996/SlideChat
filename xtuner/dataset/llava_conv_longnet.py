@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 
 from xtuner.registry import BUILDER
 from .huggingface import process_hf_dataset
-from .utils import load_image, load_wsi_feature, PadToGrid, RandomVariableCrop, CenterFixedSizeCrop, RandomVariableCropWithLimit
+from .utils import load_image, load_wsi_feature, load_wsi_global_features, PadToGrid, RandomVariableCrop, CenterFixedSizeCrop, RandomVariableCropWithLimit
 from torchvision import transforms
 
 import pandas as pd
@@ -142,49 +142,23 @@ class LLaVADataset_conv_longnet(Dataset):
         return len(self.text_data)
 
     def __getitem__(self, index):
-        max_retries = 20
-        for _ in range(max_retries):
-            try:
-                data_dict = self.text_data[index]
-                # image manipulation
-                if data_dict.get('image', None) is not None:
-                    image_list = data_dict['image']
-                    if isinstance(image_list, str):
-                        image_list = [image_list]
-                    feats = []
-                    masks = []
-                    for image_file in image_list:
-                        if image_file.endswith('.h5'):
-                            result = load_wsi_feature(
-                                image_file,
-                                max_patch_num=self.max_patch_num,
-                                transform=self.transform,
-                            )
-                            if isinstance(result, tuple) and len(result) == 2:
-                                feat, mask = result
-                            else:
-                                feat = result
-                                mask = None
-                        else:
-                            image = load_image(image_file)
-                            feat = image
-                            mask = None
-                        feats.append(feat)
-                        masks.append(mask)
-                    
-                    # Check if we successfully loaded all images
-                    if len(feats) != len(image_list):
-                        raise FileNotFoundError(f"Expected {len(image_list)} images, but loaded {len(feats)}")
-                        
-                    data_dict['features'] = feats
-                    data_dict['masks'] = masks
-                    data_dict['image_file'] = image_list
-                
-                return data_dict
-            
-            except (FileNotFoundError, OSError, Exception) as e:
-                print_log(f"Warning: Failed to load sample {index} (image missing or corrupt): {e}. Trying next sample.", 
-                          logger='current', level=logging.WARNING)
-                index = (index + 1) % len(self.text_data)
+        data_dict = self.text_data[index].copy()
         
-        raise RuntimeError(f"Failed to load any valid sample after {max_retries} retries starting from index {index}")
+        # 1. 加载 Patch 图像/特征
+        images = data_dict.get('image')
+        if images:
+            image_list = [images] if isinstance(images, str) else images
+            res_list = [load_wsi_feature(f, self.max_patch_num, self.transform) if f.endswith('.h5') 
+                        else (load_image(f), None) for f in image_list]
+            
+            data_dict['features'] = [r[0] if isinstance(r, tuple) else r for r in res_list]
+            data_dict['masks'] = [r[1] if isinstance(r, tuple) else None for r in res_list]
+            data_dict['image_file'] = image_list
+
+        # 2. 加载 WSI 全局特征
+        wsi_paths = data_dict.get('wsi_features')
+        if wsi_paths:
+            wsi_list = [wsi_paths] if isinstance(wsi_paths, str) else wsi_paths
+            data_dict['wsi_features'] = load_wsi_global_features(wsi_list)
+            
+        return data_dict

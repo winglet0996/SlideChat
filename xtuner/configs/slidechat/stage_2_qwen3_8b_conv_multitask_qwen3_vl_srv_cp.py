@@ -32,10 +32,10 @@ setting = 'alignment'
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 2e-5  # Reduced from 1e-4 for better stability
+    lr = 5e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
     # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
-    max_epochs = 10
+    max_epochs = 16
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -47,12 +47,12 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_srv/iter_50_cp.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mut/iter_2000.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
     # ckpt_path = None
     lr = 1e-5
     freeze_llm = True
-    max_epochs = 10
+    max_epochs = 25
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -66,12 +66,12 @@ resume = False
 # cat = 'Diagnosis'
 
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-4B-Instruct'
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_survival_os_context.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_survival_os_context.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_os_fix_cpbalanced.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os_fix.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os_fix.json'
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_os_dynamic.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os_dynamic.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_os_dynamic.json'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -84,7 +84,7 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_t
 ckpt_out_path = None
 
 work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_{setting}_multitask_srv/'
-vis_name = f'qwen3_4b_conv_{setting}_multitask_mcqa_srv_random_discrete_dynamic_context_wsi_feat_titan+prism'
+vis_name = f'qwen3_4b_conv_{setting}_multitask_mcqa_srv_random_discrete_fix_cpbalanced'
 # vis_name = None
 
 
@@ -106,11 +106,11 @@ val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 50  # More frequent saves for alignment debugging
-save_total_limit = 1  # Keep more checkpoints for analysis
+save_steps = 250  # More frequent saves for alignment debugging
+save_total_limit = 0  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 10  # More frequent evaluation for alignment debugging
+evaluation_freq = 100  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -170,8 +170,8 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 16  # per_device
-accumulative_counts = 1
+batch_size = 32  # per_device
+accumulative_counts = 8
 dataloader_num_workers = 8
 optim_type = SophiaG
 # optim_type = AdamW
@@ -240,12 +240,7 @@ model = dict(
         "dims": [768, 1024, 2048],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
-    },
-    deepstack_visual_indexes=[0, 1, 2],
-    deepstack_reverse_injection=True,
-    # wsi_feature_dims=[768, 1280, 768, 768],  # for TITAN, PRISM, GIGAPATH, CHIEF
-    wsi_feature_dims=[768, 1280],  # for TITAN, PRISM, GIGAPATH, CHIEF
-    head_scaling=[0.5, 0.5, 1]
+    }
     )
 
 #######################################################################
