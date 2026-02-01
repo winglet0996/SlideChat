@@ -91,7 +91,7 @@ resume = False
 #
 # The model will automatically skip unused modalities based on config.
 # =====================================================================
-model_type = 'text_patch'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
+model_type = 'multimodal'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
 
 # Model paths - change to Qwen3-4B or Qwen3-8B as needed
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
@@ -104,7 +104,7 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_t
 # Output paths
 ckpt_out_path = None
 work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_unified_{model_type}_{setting}'
-vis_name = f'qwen3_8b_conv_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
+vis_name = f'qwen3_8b_lm_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
 # vis_name = None
 
 visualizer = None if vis_name is None else dict(
@@ -263,7 +263,8 @@ model = dict(
     srv_token='<SRV>',
     num_survival_intervals=6,
     survival_method='discrete',  # 'cox' or 'discrete'
-    lambda_llm=1.0,
+    gen_forcing = False,
+    lambda_llm=0.0,
     lambda_reg=1.0,
     lambda_srv=1.0,
     head_scaling=[1, 1, 1],  # [reg_mult, srv_mult, wsi_mult]

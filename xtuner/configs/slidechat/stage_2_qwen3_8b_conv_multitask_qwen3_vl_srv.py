@@ -27,7 +27,7 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'alignment'
+setting = 'lora'
 
 if setting == 'alignment':
     llm_lora = None
@@ -47,10 +47,10 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_srv/iter_50_cp.pth'
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_srv/iter_50_cp.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
-    # ckpt_path = None
-    lr = 1e-5
+    ckpt_path = None
+    lr = 2e-5
     freeze_llm = True
     max_epochs = 10
 if setting == 'full_param':
@@ -65,7 +65,7 @@ resume = False
 
 # cat = 'Diagnosis'
 
-llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-4B-Instruct'
+llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-8B-Instruct'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
@@ -83,8 +83,8 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_t
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_{setting}_multitask_srv/'
-vis_name = f'qwen3_4b_conv_{setting}_multitask_mcqa_srv_random_discrete_dynamic_context_wsi_feat_titan+prism'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_vl_{setting}_multitask_srv/'
+vis_name = f'qwen3_8b_vl_{setting}_multitask_mcqa_srv_random_discrete_dynamic_context_wsi_feat_titan+prism'
 # vis_name = None
 
 
@@ -106,7 +106,7 @@ val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 50  # More frequent saves for alignment debugging
+save_steps = 100  # More frequent saves for alignment debugging
 save_total_limit = 1  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
@@ -170,7 +170,7 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 16  # per_device
+batch_size = 8  # per_device
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = SophiaG
@@ -230,13 +230,14 @@ model = dict(
     reg_token='<REG>',
     srv_token='<SRV>',
     survival_method='discrete',  # or 'discrete'
+    gen_forcing = False,
     num_survival_intervals=6, # (ignored for cox)
-    lambda_llm=1.0,
+    lambda_llm=0.0,
     lambda_reg=1.0,
     lambda_srv=1.0,
     vision_conv_cfg={
         "in_chans": 768,
-        "depths": [1, 3, 1],
+        "depths": [3, 9, 3],
         "dims": [768, 1024, 2048],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
@@ -245,7 +246,7 @@ model = dict(
     deepstack_reverse_injection=True,
     # wsi_feature_dims=[768, 1280, 768, 768],  # for TITAN, PRISM, GIGAPATH, CHIEF
     wsi_feature_dims=[768, 1280],  # for TITAN, PRISM, GIGAPATH, CHIEF
-    head_scaling=[0.5, 0.5, 1]
+    head_scaling=[1, 1, 1]
     )
 
 #######################################################################

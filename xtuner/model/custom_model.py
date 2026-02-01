@@ -752,7 +752,8 @@ class SurvivalHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass. Returns raw logits without clamping to preserve gradients.
+        Numerical stability is handled in the loss functions.
         
         For cox: returns risk scores (N,)
         For discrete: returns hazard logits (N, K)
@@ -868,34 +869,65 @@ def cox_ph_loss(
     theta: torch.Tensor,
     time: torch.Tensor,
     event: torch.Tensor,
-    eps: float = 1e-12
+    eps: float = 1e-8
 ) -> torch.Tensor:
     """
-    Cox proportional hazards partial likelihood loss.
+    Cox proportional hazards partial likelihood loss with numerical stability.
+    
+    Uses centered theta for numerical stability while preserving gradients.
     
     Args:
         theta: (N,) risk score (log-risk)
         time:  (N,) follow-up time
         event: (N,) 1=event, 0=censored
+        eps:   Small constant for numerical stability
     """
     theta = theta.view(-1)
     time = time.view(-1)
     event = event.view(-1).float()
-
+    
+    N = theta.numel()
     n_events = event.sum()
+    
     if n_events < 1:
-        return torch.zeros((), device=theta.device, dtype=theta.dtype)
+        # No events: return small L2 regularization to keep gradients flowing
+        # This prevents gradient vanishing while not affecting the model much
+        return 1e-6 * (theta ** 2).mean()
+
+    # Center theta for numerical stability (subtract max)
+    # This is mathematically equivalent but prevents exp() overflow
+    theta_max = theta.detach().max()  # detach to avoid affecting gradients
+    theta_centered = theta - theta_max
 
     # Risk set mask: R[i,j] = (time[j] >= time[i])
-    R = (time[None, :] >= time[:, None])
+    # Sample j is in risk set of sample i if j's time >= i's time
+    R = (time[None, :] >= time[:, None])  # (N, N)
 
     # log denom_i = log sum_{j in R_i} exp(theta_j)
-    M = theta.numel()
-    theta_row = theta.view(1, M).expand(M, M)
-    log_denom = torch.logsumexp(theta_row.masked_fill(~R, float("-inf")), dim=1)
-
-    # negative partial log-likelihood
-    loss = -((theta - log_denom) * event).sum() / (n_events + eps)
+    # = log sum_{j in R_i} exp(theta_centered_j + theta_max)
+    # = theta_max + log sum_{j in R_i} exp(theta_centered_j)
+    theta_row = theta_centered.view(1, N).expand(N, N)
+    
+    # Mask out samples not in risk set with large negative value
+    masked_theta = torch.where(R, theta_row, torch.tensor(-1e9, device=theta.device, dtype=theta.dtype))
+    
+    # logsumexp is numerically stable
+    log_denom = torch.logsumexp(masked_theta, dim=1)  # (N,)
+    # Add back theta_max: log_denom_true = theta_max + log_denom
+    # But since we also centered theta in numerator, they cancel out:
+    # theta - log_denom_true = (theta_centered + theta_max) - (theta_max + log_denom) = theta_centered - log_denom
+    
+    # Compute per-sample negative log partial likelihood
+    # loss_i = -(theta_i - log_denom_i) for event samples
+    per_sample_nll = -(theta_centered - log_denom)  # (N,)
+    
+    # Only sum over event samples
+    loss = (per_sample_nll * event).sum() / (n_events + eps)
+    
+    # Safety check: if loss is NaN/Inf, return small regularization loss
+    if not torch.isfinite(loss):
+        return 1e-6 * (theta ** 2).mean()
+    
     return loss
 
 

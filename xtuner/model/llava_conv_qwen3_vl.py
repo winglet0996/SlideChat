@@ -10,6 +10,7 @@ from mmengine import print_log
 from mmengine.config import Config, ConfigDict
 from mmengine.model import BaseModel
 from mmengine.dist import is_main_process
+from mmengine.utils import is_list_of
 from peft import get_peft_model, prepare_model_for_kbit_training
 from transformers import (AddedToken, AutoConfig, GenerationConfig, StoppingCriteriaList, Qwen3VLConfig, AutoModelForCausalLM)
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel, Qwen3VLForConditionalGeneration, Qwen3VLTextModel
@@ -522,6 +523,7 @@ class LLaVAModel_conv(BaseModel):
                  enable_survival: bool = True, srv_token: str = '<SRV>',
                  num_survival_intervals: int = 6,
                  survival_method: str = 'cox',  # 'cox' or 'discrete'
+                 gen_forcing: bool = True,  # If False, skip token generation check for task prediction
                  lambda_llm: float = 0.1, lambda_reg: float = 1.0, lambda_srv: float = 1.0,
                  vision_conv_cfg: Optional[Dict] = None,
                  deepstack_visual_indexes: List[int] = [8, 16, 24],
@@ -534,6 +536,10 @@ class LLaVAModel_conv(BaseModel):
         Args:
             survival_method: 'cox' for Cox proportional hazards or 'discrete' for discrete-time survival
             num_survival_intervals: Number of intervals (K) for discrete method
+            gen_forcing: If True (default), the model must correctly generate the special token
+                         (<REG>/<SRV>) during inference to trigger task prediction. If False,
+                         task predictions are always computed using the learned special token
+                         embedding directly, regardless of whether the model generated it.
             wsi_feature_dims: List of input dimensions for each WSI encoder source.
                               E.g., [768, 1024, 768] for three different encoders (TITAN, CONCH, UNI).
                               If None, WSI feature injection is disabled.
@@ -555,6 +561,7 @@ class LLaVAModel_conv(BaseModel):
             srv_token=srv_token,
             num_survival_intervals=num_survival_intervals,
             survival_method=survival_method,
+            gen_forcing=gen_forcing,
             lambda_llm=lambda_llm,
             lambda_reg=lambda_reg,
             lambda_srv=lambda_srv,
@@ -597,7 +604,7 @@ class LLaVAModel_conv(BaseModel):
 
     def _init_attributes(self, freeze_llm: bool, enable_regression: bool, reg_token: str,
                          enable_survival: bool, srv_token: str, num_survival_intervals: int,
-                         survival_method: str,
+                         survival_method: str, gen_forcing: bool,
                          lambda_llm: float, lambda_reg: float, lambda_srv: float, vision_conv_cfg: Optional[Dict],
                          deepstack_visual_indexes: List[int],
                          deepstack_reverse_injection: bool = False,
@@ -611,6 +618,7 @@ class LLaVAModel_conv(BaseModel):
         self.srv_token = srv_token
         self.num_survival_intervals = num_survival_intervals
         self.survival_method = survival_method  # 'cox' or 'discrete'
+        self.gen_forcing = gen_forcing  # If False, skip token generation check
         self.lambda_llm = lambda_llm
         self.lambda_reg = lambda_reg
         self.lambda_srv = lambda_srv
@@ -1552,10 +1560,16 @@ class LLaVAModel_conv(BaseModel):
 
                 has_reg = (self.enable_regression and self.reg_token_id is not None and (gen_id == self.reg_token_id).any().item())
                 has_srv = (self.enable_survival and self.srv_token_id is not None and (gen_id == self.srv_token_id).any().item())
+                
+                # When gen_forcing=False, always attempt task predictions based on enabled tasks
+                if not self.gen_forcing:
+                    has_reg = self.enable_regression and self.reg_token_id is not None
+                    has_srv = self.enable_survival and self.srv_token_id is not None
+                    
                 has_regression.append(bool(has_reg))
                 has_survival.append(bool(has_srv))
 
-            # If no sample generated any special tokens, return text-only predictions
+            # If no sample generated any special tokens (or no tasks enabled), return text-only predictions
             if not (any(has_regression) or any(has_survival)):
                 return data_samples
 
@@ -1673,74 +1687,98 @@ class LLaVAModel_conv(BaseModel):
             norm = self._get_language_model_norm()
             if norm is not None:
                 hidden = norm(hidden)
+            
+            # Compute last valid position for each sample (used when token not generated)
+            # This gives contextualized representation instead of raw token embedding
+            last_valid_pos = full_attention_mask.bool().sum(dim=1) - 1  # (B,)
 
         # For each batch, locate generated special-token positions and predict
         for b in range(B):
             # Regression
             if has_regression[b] and self.enable_regression and self.reg_token_id is not None:
                 pos_in_gen = torch.nonzero(generate_ids[b] == self.reg_token_id, as_tuple=False).flatten()
+                embed = None
+                
                 if pos_in_gen.numel() > 0:
+                    # Token was generated - use its position
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                        fused = self._fuse_token_with_vision(embed, b, 'regression')  # Shape depends on mode
-                        pred_out = self.regression_head(fused)
-                        pred = float(pred_out.squeeze(-1).item()) if pred_out is not None else None
-                        data_samples[b]['regression_prediction'] = pred
-                        prev = data_samples[b].get('prediction_text', '')
-                        text_suffix = f"[Regression: {pred:.4f}]" if pred is not None else ""
-                        data_samples[b]['prediction_text'] = f"{prev} {text_suffix}".strip()
+                elif not self.gen_forcing:
+                    # gen_forcing=False: Token not generated, use last valid hidden state
+                    # (contains full context info, unlike raw token embedding)
+                    embed = hidden[b, last_valid_pos[b]]  # (H,)
+                
+                if embed is not None:
+                    fused = self._fuse_token_with_vision(embed, b, 'regression')  # Shape depends on mode
+                    pred_out = self.regression_head(fused)
+                    pred = float(pred_out.squeeze(-1).item()) if pred_out is not None else None
+                    data_samples[b]['regression_prediction'] = pred
+                    prev = data_samples[b].get('prediction_text', '')
+                    text_suffix = f"[Regression: {pred:.4f}]" if pred is not None else ""
+                    data_samples[b]['prediction_text'] = f"{prev} {text_suffix}".strip()
 
             # Survival (supports both Cox and Discrete methods)
             if has_survival[b] and self.enable_survival and self.srv_token_id is not None:
                 pos_in_gen = torch.nonzero(generate_ids[b] == self.srv_token_id, as_tuple=False).flatten()
+                embed = None
+                
                 if pos_in_gen.numel() > 0:
+                    # Token was generated - use its position
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                        fused = self._fuse_token_with_vision(embed, b, 'survival')  # (1, H)
-                        
-                        # Build prediction dict based on survival method
-                        pred_dict = {}
-                        
-                        if self.survival_method == 'discrete':
-                            # Discrete method: predict survival probabilities and derive risk
-                            survival_probs_out = self.survival_head.predict_survival_probs(fused)
-                            survival_probs = survival_probs_out.squeeze(0).cpu().tolist() if survival_probs_out is not None else None
-                            
-                            risk_score_out = self.survival_head.predict_risk_scores(fused)
-                            risk_score = float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None
-                            
-                            median_time_out = self.survival_head.predict_median_survival_time(fused)
-                            median_time = float(median_time_out.squeeze(0).item()) if median_time_out is not None else None
-                            
-                            pred_dict = {
-                                "method": "discrete",
-                                "risk_score": risk_score,
-                                "survival_probs": survival_probs,
-                                "median_survival_time": median_time,
-                            }
-                            
-                            suffixes = []
-                            if risk_score is not None:
-                                suffixes.append(f"Risk: {risk_score:.4f}")
-                            if median_time is not None:
-                                suffixes.append(f"Median: {median_time:.2f}")
-                            text_suffix = f"[{', '.join(suffixes)}]" if suffixes else ""
-                        else:
-                            # Cox method: predict risk score only
-                            risk_score_out = self.survival_head.predict_risk_scores(fused)
-                            risk_score = float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None
-                            pred_dict = {
-                                "method": "cox",
-                                "risk_score": risk_score,
-                            }
-                            text_suffix = f"[Risk Score: {risk_score:.4f}]" if risk_score is not None else ""
-                        
-                        data_samples[b]["survival_prediction"] = pred_dict
-                        data_samples[b]["risk_score"] = pred_dict["risk_score"]
-                        prev = data_samples[b].get("prediction_text", "")
-                        data_samples[b]["prediction_text"] = f"{prev} {text_suffix}".strip()
+                elif not self.gen_forcing:
+                    # gen_forcing=False: Token not generated, use last valid hidden state
+                    # (contains full context info, unlike raw token embedding)
+                    embed = hidden[b, last_valid_pos[b]]  # (H,)
+                
+                if embed is None:
+                    continue
+                
+                fused = self._fuse_token_with_vision(embed, b, 'survival')  # (1, H)
+                
+                # Build prediction dict based on survival method
+                pred_dict = {}
+                
+                if self.survival_method == 'discrete':
+                    # Discrete method: predict survival probabilities and derive risk
+                    survival_probs_out = self.survival_head.predict_survival_probs(fused)
+                    survival_probs = survival_probs_out.squeeze(0).cpu().tolist() if survival_probs_out is not None else None
+                    
+                    risk_score_out = self.survival_head.predict_risk_scores(fused)
+                    risk_score = float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None
+                    
+                    median_time_out = self.survival_head.predict_median_survival_time(fused)
+                    median_time = float(median_time_out.squeeze(0).item()) if median_time_out is not None else None
+                    
+                    pred_dict = {
+                        "method": "discrete",
+                        "risk_score": risk_score,
+                        "survival_probs": survival_probs,
+                        "median_survival_time": median_time,
+                    }
+                    
+                    suffixes = []
+                    if risk_score is not None:
+                        suffixes.append(f"Risk: {risk_score:.4f}")
+                    if median_time is not None:
+                        suffixes.append(f"Median: {median_time:.2f}")
+                    text_suffix = f"[{', '.join(suffixes)}]" if suffixes else ""
+                else:
+                    # Cox method: predict risk score only
+                    risk_score_out = self.survival_head.predict_risk_scores(fused)
+                    risk_score = float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None
+                    pred_dict = {
+                        "method": "cox",
+                        "risk_score": risk_score,
+                    }
+                    text_suffix = f"[Risk Score: {risk_score:.4f}]" if risk_score is not None else ""
+                
+                data_samples[b]["survival_prediction"] = pred_dict
+                data_samples[b]["risk_score"] = pred_dict["risk_score"]
+                prev = data_samples[b].get("prediction_text", "")
+                data_samples[b]["prediction_text"] = f"{prev} {text_suffix}".strip()
         return data_samples
 
     def _fuse_token_with_vision(self, token_embed: torch.Tensor, b: int, task_type: str = 'survival') -> torch.Tensor:
@@ -1756,6 +1794,36 @@ class LLaVAModel_conv(BaseModel):
                 delattr(self, attr)
 
     # ========== Loss path ==========
+
+    def parse_losses(self, losses: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Custom parse_losses to ensure only 'loss' is used for backward,
+        preventing double-counting of components already included in total_loss.
+        """
+        log_vars = []
+        for loss_name, loss_value in losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                log_vars.append([loss_name, loss_value.mean()])
+            elif is_list_of(loss_value, torch.Tensor):
+                log_vars.append([loss_name, sum(_loss.mean() for _loss in loss_value)])
+            else:
+                raise TypeError(f"{loss_name} is not a tensor or list of tensors")
+
+        # If we manually provided 'loss', use it as the primary loss for backward
+        if 'loss' in losses:
+            loss = losses['loss']
+        else:
+            # Fallback to default behavior: sum all components containing 'loss'
+            loss = sum(value for key, value in log_vars if 'loss' in key)
+        
+        # Ensure 'loss' is the first element for MMEngine logging
+        log_vars_dict = OrderedDict()
+        log_vars_dict['loss'] = loss
+        for name, val in log_vars:
+            if name != 'loss':
+                log_vars_dict[name] = val
+
+        return loss, log_vars_dict
 
     def compute_loss(self, data: Dict[str, torch.Tensor], data_samples: Optional[List] = None, 
                      regression_targets: Optional[torch.Tensor] = None,
@@ -1820,7 +1888,26 @@ class LLaVAModel_conv(BaseModel):
                       self.lambda_reg * reg_loss +
                       self.lambda_srv * srv_loss)
 
-        return {'lm_loss': lm_loss, 'reg_loss': reg_loss, 'srv_loss': srv_loss, 'loss': total_loss}
+        # NaN protection: if any individual loss is NaN/Inf, replace with small regularization
+        # This keeps gradients flowing while preventing training collapse
+        if not torch.isfinite(lm_loss):
+            lm_loss = torch.zeros_like(lm_loss)
+        if not torch.isfinite(reg_loss):
+            reg_loss = self._get_regularization_loss('regression')
+        if not torch.isfinite(srv_loss):
+            srv_loss = self._get_regularization_loss('survival')
+        
+        # Recompute total_loss with sanitized components
+        total_loss = (self.lambda_llm * lm_loss +
+                      self.lambda_reg * reg_loss +
+                      self.lambda_srv * srv_loss)
+
+        return {
+            'lm_loss': lm_loss.detach(), 
+            'reg_loss': reg_loss.detach(), 
+            'srv_loss': srv_loss.detach(), 
+            'loss': total_loss
+        }
 
     def _compute_task_loss_safe(self, labels: torch.Tensor, targets: Union[torch.Tensor, Dict], 
                                 task: str) -> torch.Tensor:
@@ -1892,27 +1979,33 @@ class LLaVAModel_conv(BaseModel):
                 return cox_ph_loss(output[valid], time[valid], event[valid])
 
     def _get_zero_loss_with_grad_connectivity(self, task: str, base_loss: torch.Tensor) -> torch.Tensor:
-        """Return zero loss while ensuring task parameters remain in computation graph.
+        """Return small L2 regularization loss to keep gradients flowing.
         
-        This prevents gradient synchronization deadlocks in multi-GPU training by ensuring
-        all trainable parameters participate in the computation graph on all devices.
+        This prevents gradient vanishing when no valid samples exist in a batch,
+        and ensures gradient synchronization in multi-GPU training.
         """
-        zero_loss = torch.zeros_like(base_loss)
+        return self._get_regularization_loss(task, scale=1e-6)
+    
+    def _get_regularization_loss(self, task: str, scale: float = 1e-6) -> torch.Tensor:
+        """Return small L2 regularization loss for the specified task head.
         
-        # Add minimal parameter connectivity to ensure gradients flow through task heads
+        This keeps gradients flowing through task-specific parameters.
+        """
         if task == 'regression' and self.enable_regression and hasattr(self, 'regression_head'):
-            # Sum all parameters and multiply by epsilon to maintain gradient connectivity
-            param_sum = sum(p.sum() for p in self.regression_head.parameters() if p.requires_grad)
-            if isinstance(param_sum, torch.Tensor):
-                zero_loss = zero_loss + 1e-12 * param_sum
+            # L2 regularization on head weights
+            reg = sum((p ** 2).mean() for p in self.regression_head.parameters() if p.requires_grad)
+            if isinstance(reg, torch.Tensor):
+                return scale * reg
                 
         elif task == 'survival' and self.enable_survival and hasattr(self, 'survival_head'):
-            # Sum all parameters and multiply by epsilon to maintain gradient connectivity  
-            param_sum = sum(p.sum() for p in self.survival_head.parameters() if p.requires_grad)
-            if isinstance(param_sum, torch.Tensor):
-                zero_loss = zero_loss + 1e-12 * param_sum
-                
-        return zero_loss
+            reg = sum((p ** 2).mean() for p in self.survival_head.parameters() if p.requires_grad)
+            if isinstance(reg, torch.Tensor):
+                return scale * reg
+        
+        # Fallback: return zero tensor on the correct device
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        return torch.zeros((), device=device, dtype=dtype)
 
     # ========== Misc ==========
 
