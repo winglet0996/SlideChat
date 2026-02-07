@@ -40,7 +40,7 @@ if setting == 'alignment':
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=32,
+        r=64,
         lora_alpha=64,
         lora_dropout=0.2,
         bias='none',
@@ -63,15 +63,15 @@ if setting == 'full_param':
     
 resume = False
 
-# cat = 'Diagnosis'
+model_type = 'text_patch'  # Options: 'text_patch', 'multimodal'
 
 llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-8B-Instruct'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_survival_os_context.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/tcga_aligned_survival_survival_os_context.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_survival_survival_os_context.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_survival_survival_os_context.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_survival_survival_os_context.json'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -83,8 +83,8 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_t
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_vl_{setting}_multitask_srv/'
-vis_name = f'qwen3_8b_vl_{setting}_multitask_mcqa_srv_random_discrete_dynamic_context_wsi_feat_titan+prism'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8b_vl_multitask_srv_{model_type}_{setting}/'
+vis_name = f'qwen3_8b_vl_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
 # vis_name = None
 
 
@@ -194,6 +194,29 @@ tokenizer = dict(
     padding_side='right'
     )
 
+# Configure model based on model_type
+# Vision config - set to None for text-only modes
+if model_type == 'text_patch':
+    vision_conv_cfg = {
+        "in_chans": 768,
+        "depths": [3, 9, 3],
+        "dims": [768, 1024, 2048],
+        "drop_path_rate": 0.3,
+        "num_downsamples": 2,
+    }
+    wsi_feature_dims = None  # No WSI features
+elif model_type == 'multimodal':
+    vision_conv_cfg = {
+        "in_chans": 768,
+        "depths": [3, 9, 3],
+        "dims": [768, 1024, 2048],
+        "drop_path_rate": 0.3,
+        "num_downsamples": 2,
+    }
+    wsi_feature_dims = [768, 1280] # [768, 1280, 768, 768], for TITAN, PRISM, GIGAPATH, CHIEF
+else:
+    raise ValueError(f"Unknown model_type: {model_type}. Options: 'text_patch', 'multimodal'")
+
 model = dict(
     type=LLaVAModel_conv,
     tokenizer=tokenizer,
@@ -232,20 +255,13 @@ model = dict(
     survival_method='discrete',  # or 'discrete'
     gen_forcing = False,
     num_survival_intervals=6, # (ignored for cox)
-    lambda_llm=0.0,
+    lambda_llm=1.0,
     lambda_reg=1.0,
     lambda_srv=1.0,
-    vision_conv_cfg={
-        "in_chans": 768,
-        "depths": [3, 9, 3],
-        "dims": [768, 1024, 2048],
-        "drop_path_rate": 0.3,
-        "num_downsamples": 2,
-    },
+    vision_conv_cfg=vision_conv_cfg,
     deepstack_visual_indexes=[0, 1, 2],
     deepstack_reverse_injection=True,
-    # wsi_feature_dims=[768, 1280, 768, 768],  # for TITAN, PRISM, GIGAPATH, CHIEF
-    wsi_feature_dims=[768, 1280],  # for TITAN, PRISM, GIGAPATH, CHIEF
+    wsi_feature_dims=wsi_feature_dims,
     head_scaling=[1, 1, 1]
     )
 

@@ -40,19 +40,19 @@ if setting == 'alignment':
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=32,
+        r=64,
         lora_alpha=64,
         lora_dropout=0.2,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mut/iter_2000.pth'
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mut/iter_2000.pth'
     # ckpt_path = '/home/xiaozhou/data/project/TCGA/train_s2_multitask_qwen3_8b_conv_lora_multitask_mcqa_srv/iter_5000.pth'
-    # ckpt_path = None
-    lr = 1e-5
+    ckpt_path = None
+    lr = 2e-5
     freeze_llm = True
-    max_epochs = 25
+    max_epochs = 10
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
