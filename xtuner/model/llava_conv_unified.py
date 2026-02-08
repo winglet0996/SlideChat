@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from mmengine import print_log
 from mmengine.config import Config, ConfigDict
 from mmengine.model import BaseModel
+from mmengine.utils import is_list_of
 from mmengine.dist import is_main_process
 from peft import get_peft_model, prepare_model_for_kbit_training
 from transformers import (AddedToken, AutoConfig, GenerationConfig, StoppingCriteriaList)

@@ -47,7 +47,7 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     save_best_metrics = None
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_unified_text_patch_alignment/iter_100_cp.pth'
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/iter_200.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 10
@@ -92,9 +92,8 @@ resume = False
 # The model will automatically skip unused modalities based on config.
 # =====================================================================
 model_type = 'text_patch'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
-
-# Model paths - change to Qwen3-4B or Qwen3-8B as needed
-llm_name_or_path = '/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-8B'
+model_size = '8B'
+llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-{model_size}'
 
 # Data paths (same full-modal data for all modes)
 train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_survival_survival_os_context.json'
@@ -103,8 +102,8 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/t
 
 # Output paths
 ckpt_out_path = None
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_unified_{model_type}_{setting}'
-vis_name = f'qwen3_8b_lm_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}'
+vis_name = f'qwen3_{model_size}_lm_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
 # vis_name = None
 
 visualizer = None if vis_name is None else dict(
@@ -125,7 +124,7 @@ test_output_path = work_dir + '/test_results'
 
 # Save settings
 save_steps = 100
-save_total_limit = 1
+save_total_limit = 2
 
 # Evaluation frequency
 evaluation_freq = 50
