@@ -180,25 +180,32 @@ class PathologyMetric(BaseMetric):
 
     def _determine_task_type(self, metadata: Dict[str, Any], pred_str: str, sample: Dict, input_str: str = "") -> str:
         """Determine task type using explicit model fields and category."""
-        if 'survival_prediction' in sample:
-            return 'survival'
-        if 'regression_prediction' in sample:
-            return 'regression'
-            
-        # 1. Check for MCQA markers in input or target (most reliable)
-        target_str = metadata.get('target_str', '') or ""
-        if '<CHOICES>' in input_str or self._extract_mcqa_choice(target_str):
-            return 'mcqa'
-
         category = metadata.get('category', '').lower()
         
-        # 2. Check for explicit task markers in category
+        # 0. Check category first for explicit hints (most reliable for mixed tasks)
+        if 'survival' in category:
+            return 'survival'
+        if 'regression' in category:
+            return 'regression'
         if 'mcqa' in category:
             return 'mcqa'
         if any(kw in category for kw in ['text', 'caption', 'report', 'diagnosis', 'generation']):
             return 'text'
+
+        # 1. Check for MCQA structural markers in input or target
+        target_str = metadata.get('target_str', '') or ""
+        if '<CHOICES>' in input_str or self._extract_mcqa_choice(target_str):
+            return 'mcqa'
+
+        # 2. Fallback to model fields if category is missing/uninformative
+        # If both are present (gen_forcing=False), we prioritize regression 
+        # because survival is often present as a background field in TCGA datasets.
+        if 'regression_prediction' in sample:
+            return 'regression'
+        if 'survival_prediction' in sample:
+            return 'survival'
             
-        # Default to text for safety if it doesn't look like MCQA
+        # Default to text for safety
         return 'text'
 
     def _process_survival_sample(self, sample: Dict, input_str: str, pred_str: str, 

@@ -578,6 +578,34 @@ class LLaVAModel_conv_unified(BaseModel):
             return getattr(self.llm.config.text_config, 'hidden_size')
         raise AttributeError("Could not determine hidden_size from LLM config")
 
+    def _get_language_model_norm(self):
+        """Get the final RMSNorm layer from the language model.
+        
+        This is needed because hidden_states[-1] from output_hidden_states=True
+        are PRE-normalization. The model internally applies RMSNorm before lm_head.
+        We need to apply the same normalization for regression/survival heads.
+        """
+        paths_to_try = [
+            # Standard Qwen2/3 or Llama-like
+            lambda: self.llm.model.norm,
+            # Qwen3-VL style
+            lambda: self.llm.model.language_model.norm,
+            # PEFT-wrapped standard
+            lambda: self.llm.base_model.model.model.norm,
+            # PEFT-wrapped Qwen3-VL
+            lambda: self.llm.base_model.model.model.language_model.norm,
+        ]
+        
+        for get_norm in paths_to_try:
+            try:
+                norm = get_norm()
+                if norm is not None:
+                    return norm
+            except (AttributeError, TypeError):
+                continue
+        
+        return None
+
     def _init_vision_components(self) -> None:
         """Initialize vision processing components."""
         default_conv_cfg = dict(
@@ -1371,6 +1399,11 @@ class LLaVAModel_conv_unified(BaseModel):
                                return_dict=True)
             hidden = outputs.hidden_states[-1]
             
+            # Apply RMSNorm to hidden states - same as training path (compute_loss)
+            norm = self._get_language_model_norm()
+            if norm is not None:
+                hidden = norm(hidden)
+            
             # Compute last valid position for each sample (used when token not generated)
             # This gives contextualized representation instead of raw token embedding
             last_valid_pos = full_attention_mask.bool().sum(dim=1) - 1  # (B,)
@@ -1523,6 +1556,14 @@ class LLaVAModel_conv_unified(BaseModel):
             lm_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
         self._last_hidden_state = last_hidden
+
+        # For regression/survival heads, apply final normalization to be consistent 
+        # with how the lm_head receives hidden states.
+        norm = self._get_language_model_norm()
+        if norm is not None:
+            self._last_hidden_state = norm(last_hidden)
+        else:
+            self._last_hidden_state = last_hidden
 
         # Debug logging
         if not hasattr(self, '_logged_token_stats'):

@@ -1,6 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-# Config for Qwen3 text-only model with optional vision support (unified architecture)
-# Supports: Qwen3-4B, Qwen3-8B (text-only, text+WSI, text+vision+WSI)
+# xtuner/configs/llava/internlm2_chat_7b_clip_vit_large_p14_336/pretrain/llava_internlm2_chat_7b_clip_vit_large_p14_336_e1_gpu8_pretrain.py
 import torch
 from mmengine.dataset import DefaultSampler, InfiniteSampler
 from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
@@ -10,20 +9,20 @@ from mmengine.visualization import Visualizer, WandbVisBackend
 
 from torch.optim import AdamW
 from sophia import SophiaG 
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
+from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
 from xtuner.dataset import LLaVADataset_conv_longnet
 from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
-from xtuner.engine.hooks import DatasetInfoHook
+from xtuner.dataset.samplers import CategoryProjectSampler
+from xtuner.engine.hooks import DatasetInfoHook #, EvaluateChatHook_conv_longnet, HFCheckpointHook
 from xtuner.engine.runner import TrainLoop
-from xtuner.model import LLaVAModel_conv_unified
+from xtuner.model import LLaVAModel_conv
 from xtuner.utils import PROMPT_TEMPLATE
 from xtuner.configs.slidechat.eval_samples import evaluation_images, evaluation_inputs, evaluation_targets
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
-
 #######################################################################
 #                          PART 1  Settings                           #
 #######################################################################
@@ -33,8 +32,9 @@ setting = 'lora'
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 2e-5
+    lr = 2e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
     max_epochs = 10
     save_best_metrics = None
 if setting == 'lora':
@@ -45,91 +45,75 @@ if setting == 'lora':
         lora_dropout=0.2,
         bias='none',
         task_type='CAUSAL_LM')
+    # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/iter_200.pth'
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8B_vl_multitask_srv_multimodal_alignment/iter_200.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 10
+    max_epochs = 5
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
     lr = 1e-5
     save_best_metrics = ['eval/reg_overall_rmse']
-    ckpt_path = None
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
 resume = False
 
-# =====================================================================
-# MODALITY SELECTION (use same full-modal data, control via config only)
-# =====================================================================
-# You can use the SAME full-modal dataset (containing <image> tokens, 
-# patch features, and WSI features) with any of these modes.
-# The model automatically handles unused modalities:
-#
-# MODEL MODES (Qwen3-4B/8B text-only backbone):
-# ┌──────────────┬──────────────────┬────────────────┬─────────────────────┐
-# │ Mode         │ vision_conv_cfg  │ wsi_feature_dims│ Behavior           │
-# ├──────────────┼──────────────────┼────────────────┼─────────────────────┤
-# │ text_only    │ None             │ None           │ Pure text, strips   │
-# │              │                  │                │ <image> tokens      │
-# ├──────────────┼──────────────────┼────────────────┼─────────────────────┤
-# │ text_wsi     │ None             │ [768,1024,...] │ Text + WSI features,│
-# │              │                  │                │ strips <image> tok  │
-# ├──────────────┼──────────────────┼────────────────┼─────────────────────┤
-# │ text_patch   │ {...}            │ None           │ Text + patch visual │
-# │              │                  │                │ uses <image> tokens │
-# ├──────────────┼──────────────────┼────────────────┼─────────────────────┤
-# │ multimodal   │ {...}            │ [768,1024,...] │ Full: Text+Patch+WSI│
-# └──────────────┴──────────────────┴────────────────┴─────────────────────┘
-#
-# Data format: Your JSON data can contain all modalities:
-#   - "image": path to patch features (.h5 file)
-#   - "wsi_features": paths to WSI global features [titan.pt, prism.pt, ...]
-#   - "conversations": with or without <image> tokens in text
-#
-# The model will automatically skip unused modalities based on config.
-# =====================================================================
-model_type = 'text_patch'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
+model_type = 'multimodal'  # Options: 'text_patch', 'multimodal'
 model_size = '8B'
-llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-{model_size}'
 
-# Data paths (same full-modal data for all modes)
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_survival_os.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
+llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_10000.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/cptac/cptac_aligned_test_all.json'
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 
-# Output paths
+# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_train.json'
+# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+
+# ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}'
-vis_name = f'qwen3_{model_size}_lm_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
-# vis_name = None
 
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
+# vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
+vis_name = None
+
+
+# set visualizer
 visualizer = None if vis_name is None else dict(
     type=Visualizer,
     vis_backends=[
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='pathoverse_multitask_conv_srv_debug',
+                project='pathoverse_multitask_all',
                 name=vis_name
             )
         )
     ]
 )
 
-val_output_path = work_dir + '/val_results'
-test_output_path = work_dir + '/test_results'
+val_output_path = work_dir + 'val_results'
+test_output_path = work_dir + 'test_results'
 
-# Save settings
-save_steps = 100
-save_total_limit = 1
+# Save
+save_steps = 500  # More frequent saves for alignment debugging
+save_total_limit = 3  # Keep more checkpoints for analysis
 
-# Evaluation frequency
-evaluation_freq = 50
-
+# Evaluate the generation performance during the training
+evaluation_freq = 250  # More frequent evaluation for alignment debugging
 image_path_list = None
+
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
@@ -168,7 +152,7 @@ def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
     return None
 
 if resume:
-    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8)
+    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=4)
     
     if latest_valid_ckpt:
         ckpt_path = latest_valid_ckpt
@@ -178,23 +162,24 @@ if resume:
         
 del _get_latest_valid_deepspeed_checkpoint
 
-max_length = 32768
+max_length = 256000
 max_patch_num = None
 max_new_tokens = 32
 repetition_penalty = 1.0
 per_image_length = None
-sample_type = 'wsi'  # 'wsi' or 'image'
+sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 8
+batch_size = 16  # per_device
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = SophiaG
+# optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
-max_norm = 1
+max_norm = 1  # grad clip
 warmup_ratio = 0.05
 
 
@@ -208,18 +193,11 @@ tokenizer = dict(
     pretrained_model_name_or_path=llm_name_or_path,
     trust_remote_code=True,
     padding_side='right'
-)
+    )
 
 # Configure model based on model_type
 # Vision config - set to None for text-only modes
-if model_type == 'text_only':
-    vision_conv_cfg = None
-    wsi_feature_dims = None
-elif model_type == 'text_wsi':
-    vision_conv_cfg = None  # No patch-level vision
-    # WSI feature dimensions: [TITAN, PRISM, GigaPath, CHIEF]
-    wsi_feature_dims = [768, 1280]
-elif model_type == 'text_patch':
+if model_type == 'text_patch':
     vision_conv_cfg = {
         "in_chans": 768,
         "depths": [3, 9, 3],
@@ -236,40 +214,57 @@ elif model_type == 'multimodal':
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
-    wsi_feature_dims = [768, 1280]
+    wsi_feature_dims = [768, 1280] # [768, 1280, 768, 768], for TITAN, PRISM, GIGAPATH, CHIEF
 else:
-    raise ValueError(f"Unknown model_type: {model_type}. Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'")
+    raise ValueError(f"Unknown model_type: {model_type}. Options: 'text_patch', 'multimodal'")
 
 model = dict(
-    type=LLaVAModel_conv_unified,
+    type=LLaVAModel_conv,
     tokenizer=tokenizer,
     freeze_llm=freeze_llm,
-    hidden_size=4096,  # Adjust based on model size (2560 for 4B, 4096 for 8B)
+    hidden_size=4096,
     llm=dict(
-        type=AutoModelForCausalLM.from_pretrained,
+        type=AutoModelForImageTextToText.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
+        attn_implementation='flash_attention_2',
+        # quantization_config=dict(
+        #     type=BitsAndBytesConfig,
+        #     load_in_4bit=True,
+        #     load_in_8bit=False,
+        #     llm_int8_threshold=6.0,
+        #     llm_int8_has_fp16_weight=False,
+        #     bnb_4bit_compute_dtype=torch.float16,
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_quant_type='nf4')
     ),
     generation_kwargs=dict(
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        # temperature=0.3,
+        # top_p=0.8,
+        # length_penalty=0.5,
+        # repetition_penalty=repetition_penalty
     ),
+    stop_words=['<|im_end|>', '<|endoftext|>'],
     llm_lora=llm_lora,
     enable_regression=True,
     enable_survival=True,
     reg_token='<REG>',
     srv_token='<SRV>',
-    num_survival_intervals=6,
-    survival_method='discrete',  # 'cox' or 'discrete'
+    survival_method='discrete',  # or 'discrete'
     gen_forcing = False,
+    num_survival_intervals=6, # (ignored for cox)
     lambda_llm=1.0,
     lambda_reg=1.0,
     lambda_srv=1.0,
-    head_scaling=[1, 1, 1],  # [reg_mult, srv_mult, wsi_mult]
     vision_conv_cfg=vision_conv_cfg,
+    deepstack_visual_indexes=[0, 1, 2],
+    deepstack_reverse_injection=True,
     wsi_feature_dims=wsi_feature_dims,
-)
+    head_scaling=[1, 1, 1]
+    )
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
@@ -292,6 +287,7 @@ train_dataloader = dict(
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=train_llava_dataset,
+    # sampler=dict(type=CategoryProjectSampler, batch_size=batch_size, shuffle=True),
     sampler=dict(type=DefaultSampler, shuffle=True),
     collate_fn=dict(type=masked_collated_fn))
 
@@ -319,7 +315,8 @@ val_dataloader = dict(
 
 val_evaluator = dict(type=PathologyMetric,
             tokenizer=tokenizer,
-            output_dir=val_output_path)
+            output_dir= val_output_path
+            )
 
 test_llava_dataset = dict(
     type=LLaVADataset_conv_longnet,
@@ -341,11 +338,13 @@ test_dataloader = dict(
     pin_memory=True,
     dataset=test_llava_dataset,
     sampler=dict(type=DefaultSampler, shuffle=False),
-    collate_fn=dict(type=masked_collated_fn))
+    collate_fn=dict(type=masked_collated_fn)
+)
 
 test_evaluator = dict(type=PathologyMetric,
             tokenizer=tokenizer,
-            output_dir=test_output_path)
+            output_dir=test_output_path
+            )
 
 #######################################################################
 #                    PART 4  Scheduler & Optimizer                    #
@@ -355,11 +354,14 @@ optim_wrapper = dict(
     type=AmpOptimWrapper,
     optimizer=dict(
         type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
+        # type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
     clip_grad=dict(max_norm=max_norm, error_if_nonfinite=False),
     accumulative_counts=accumulative_counts,
     loss_scale='dynamic',
     dtype='float16')
 
+# learning policy
+# More information: https://github.com/open-mmlab/mmengine/blob/main/docs/en/tutorials/param_scheduler.md  # noqa: E501
 param_scheduler = [
     dict(
         type=LinearLR,
@@ -387,14 +389,20 @@ test_cfg = dict(type="TestLoop")
 #######################################################################
 #                           PART 5  Runtime                           #
 #######################################################################
+# Log the dialogue periodically during the training process, optional
 custom_hooks = [
     dict(type=DatasetInfoHook, tokenizer=tokenizer)
 ]
 
+# configure default hooks
 default_hooks = dict(
+    # record the time of every iteration.
     timer=dict(type=IterTimerHook),
+    # print log every 10 iterations.
     logger=dict(type=LoggerHook, log_metric_by_epoch=False, interval=10),
+    # enable the parameter scheduler.
     param_scheduler=dict(type=ParamSchedulerHook),
+    # save checkpoint per `save_steps`.
     checkpoint=dict(
         type=CheckpointHook,
         by_epoch=False,
@@ -403,16 +411,29 @@ default_hooks = dict(
         save_best=save_best_metrics,
         rule='greater',
         out_dir=ckpt_out_path,),
+    # set sampler seed in distributed evrionment.
     sampler_seed=dict(type=DistSamplerSeedHook),
 )
 
+# configure environment
 env_cfg = dict(
+    # whether to enable cudnn benchmark
     cudnn_benchmark=False,
+    # set multi process parameters
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
+    # set distributed parameters
     dist_cfg=dict(backend='nccl'),
 )
 
+
+# set log level
 log_level = 'INFO'
+
+# load from which checkpoint
 load_from = ckpt_path
+ 
+# Defaults to use random seed and disable `deterministic`
 randomness = dict(seed=None, deterministic=False)
+
+# set log processor
 log_processor = dict(by_epoch=False)

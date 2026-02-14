@@ -687,18 +687,17 @@ class LLaVAModel_conv(BaseModel):
         are PRE-normalization. The model internally applies RMSNorm before lm_head.
         We need to apply the same normalization for regression/survival heads.
         
-        Handles both:
-        - Direct model: self.llm.model.language_model.norm
-        - PEFT-wrapped: self.llm.base_model.model.model.language_model.norm
+        Handles various model structures including PEFT wrappers.
         """
-        # Try different paths for PEFT and non-PEFT models
         paths_to_try = [
+            # Standard Qwen2/3 or Llama-like
+            lambda: self.llm.model.norm,
+            # Qwen3-VL style
+            lambda: self.llm.model.language_model.norm,
+            # PEFT-wrapped standard
+            lambda: self.llm.base_model.model.model.norm,
             # PEFT-wrapped Qwen3-VL
             lambda: self.llm.base_model.model.model.language_model.norm,
-            # Non-PEFT Qwen3-VL
-            lambda: self.llm.model.language_model.norm,
-            # Alternative PEFT path
-            lambda: self.llm.model.model.language_model.norm,
         ]
         
         for get_norm in paths_to_try:
@@ -706,7 +705,7 @@ class LLaVAModel_conv(BaseModel):
                 norm = get_norm()
                 if norm is not None:
                     return norm
-            except AttributeError:
+            except (AttributeError, TypeError):
                 continue
         
         return None

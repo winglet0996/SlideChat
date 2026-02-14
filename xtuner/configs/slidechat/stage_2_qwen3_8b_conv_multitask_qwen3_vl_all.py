@@ -51,7 +51,7 @@ if setting == 'lora':
     # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8B_vl_multitask_srv_multimodal_alignment/iter_200.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 10
+    max_epochs = 5
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -62,16 +62,16 @@ if setting == 'full_param':
     
 resume = False
 
-model_type = 'multimodal'  # Options: 'text_patch', 'multimodal'
+model_type = 'text_patch'  # Options: 'text_patch', 'multimodal'
 model_size = '8B'
 
 llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_survival_survival_os_context.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_survival_survival_os_context.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_survival_survival_os_context.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -83,8 +83,8 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/t
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_{model_size}_vl_multitask_srv_{model_type}_{setting}/'
-vis_name = f'qwen3_{model_size}_vl_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
+vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
 # vis_name = None
 
 
@@ -95,7 +95,7 @@ visualizer = None if vis_name is None else dict(
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='pathoverse_multitask_conv_srv_debug',
+                project='pathoverse_multitask_all',
                 name=vis_name
             )
         )
@@ -106,11 +106,11 @@ val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 100  # More frequent saves for alignment debugging
-save_total_limit = 2  # Keep more checkpoints for analysis
+save_steps = 500  # More frequent saves for alignment debugging
+save_total_limit = 5  # Keep more checkpoints for analysis
 
 # Evaluate the generation performance during the training
-evaluation_freq = 50  # More frequent evaluation for alignment debugging
+evaluation_freq = 250  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -404,8 +404,9 @@ default_hooks = dict(
     # save checkpoint per `save_steps`.
     checkpoint=dict(
         type=CheckpointHook,
-        by_epoch=False,
-        interval=save_steps,
+        by_epoch=True,
+        # interval=save_steps,
+        interval=1,
         max_keep_ckpts=save_total_limit,
         save_best=save_best_metrics,
         rule='greater',
