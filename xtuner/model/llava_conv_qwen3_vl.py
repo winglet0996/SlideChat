@@ -387,7 +387,7 @@ def prepare_inputs_labels_for_qwen3_vl(llm, input_ids, pixel_values,
                     h_index = torch.arange(llm_grid_h, device=cur_input_ids.device).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
                     w_index = torch.arange(llm_grid_w, device=cur_input_ids.device).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
                     cur_new_position_ids.append(torch.stack([t_index, h_index, w_index]) + st_idx)
-                    st_idx += llm_grid_t * llm_grid_h * llm_grid_w
+                    st_idx += max(llm_grid_t, llm_grid_h, llm_grid_w)
                 
                 if deepstack_pixel_values is not None:
                     # Collect all stages for this image, preserving None for sparse layers
