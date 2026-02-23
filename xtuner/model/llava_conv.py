@@ -20,7 +20,7 @@ from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names, get_peft_model_state_dict, 
                     guess_load_checkpoint, make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, AttentionPooling, RegressionHead, SurvivalHead
+from .custom_model import HighResConvNeXtV2Pyramid, PositionalEmbedding2DSinusoidal, AttentionPooling, RegressionHead, SurvivalHead
 
 
 def convert_state_dict_to_hf(state_dict: Dict[str, torch.Tensor], 
@@ -165,7 +165,7 @@ class LLaVAModel_conv(BaseModel):
         )
         if self.vision_conv_cfg is not None:
             default_conv_cfg.update(self.vision_conv_cfg)
-        self.conv = HighResPartialConvNeXt(
+        self.conv = HighResConvNeXtV2Pyramid(
             **default_conv_cfg
         ).to(self.llm.dtype)
         self.pos_emb_2d = PositionalEmbedding2DSinusoidal(
@@ -479,15 +479,12 @@ class LLaVAModel_conv(BaseModel):
 
         return to_return
 
-    def _project_vision_features(self, features: torch.Tensor, masks: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _project_vision_features(self, features: torch.Tensor) -> torch.Tensor:
         """Project vision features through conv, positional embedding, and final projector."""
         conv_input = features.to(self.llm.dtype)
         B, C, H, W = conv_input.shape
 
-        mask = (torch.ones(B, 1, H, W, device=conv_input.device, dtype=conv_input.dtype) 
-                if masks is None else masks.to(conv_input.device, dtype=conv_input.dtype))
-
-        stage_outputs, updated_mask = self.conv(conv_input, mask)
+        stage_outputs = self.conv(conv_input)
         conv_output = stage_outputs[-1]
 
         conv_output = self.pos_emb_2d(conv_output)
@@ -577,10 +574,9 @@ class LLaVAModel_conv(BaseModel):
                                     else None)
 
         # Process vision features
-        projected_features = self._project_vision_features(data['features'], data.get('masks'))
+        projected_features = self._project_vision_features(data['features'])
         data['pixel_values'] = projected_features
         data.pop('features', None)
-        data.pop('masks', None)
 
         if mode == 'predict':
             self._strip_assistant_targets(data)

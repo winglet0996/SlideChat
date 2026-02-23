@@ -44,7 +44,6 @@ def masked_collated_fn(instances: Sequence[Dict],
 
     if has_image:
         features = []
-        masks = []
         image_batch_indices = []  # map each image to its sample index
     
     # WSI features collection
@@ -87,12 +86,6 @@ def masked_collated_fn(instances: Sequence[Dict],
             else:
                 features.append(example['features'])
                 image_batch_indices.append(b_idx)
-            
-            # Handle masks
-            if isinstance(example['masks'], list):
-                masks.extend(example['masks'])
-            else:
-                masks.append(example['masks'])
         
         # Handle WSI features
         if has_wsi_features:
@@ -154,7 +147,7 @@ def masked_collated_fn(instances: Sequence[Dict],
         }
 
     if has_image:
-        # Pad features and masks to the max size in the batch
+        # Pad features to the max size in the batch
         max_h = max(f.shape[1] for f in features)
         max_w = max(f.shape[2] for f in features)
 
@@ -167,21 +160,7 @@ def masked_collated_fn(instances: Sequence[Dict],
             padded_features.append(f)
         features = torch.stack(padded_features)
 
-        if masks[0] is not None:
-            padded_masks = []
-            for m in masks:
-                pad_h = max_h - m.shape[1]
-                pad_w = max_w - m.shape[2]
-                if pad_h > 0 or pad_w > 0:
-                    m = torch.nn.functional.pad(m, (0, pad_w, 0, pad_h), value=0.0)
-                padded_masks.append(m)
-            masks = torch.stack(padded_masks)
-        else:
-            masks = None
-
         data_dict['features'] = features
-        if masks is not None:
-            data_dict['masks'] = masks
         data_dict['labels_text'] = [
             inst.get('conversations', [])[-1].get('value', '') for inst in instances
         ]

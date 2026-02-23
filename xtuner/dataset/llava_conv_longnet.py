@@ -149,10 +149,9 @@ class LLaVADataset_conv_longnet(Dataset):
         if images:
             image_list = [images] if isinstance(images, str) else images
             res_list = [load_wsi_feature(f, self.max_patch_num, self.transform) if f.endswith('.h5') 
-                        else (load_image(f), None) for f in image_list]
-            
-            data_dict['features'] = [r[0] if isinstance(r, tuple) else r for r in res_list]
-            data_dict['masks'] = [r[1] if isinstance(r, tuple) else None for r in res_list]
+                        else load_image(f) for f in image_list]
+
+            data_dict['features'] = res_list
             data_dict['image_file'] = image_list
 
         # 2. 加载 WSI 全局特征

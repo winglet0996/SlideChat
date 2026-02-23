@@ -74,6 +74,62 @@ def patch_qwen3_vl_deepstack():
     patch_forward(Qwen3VLModel)
     patch_forward(Qwen3VLForConditionalGeneration)
 
+    # Patch prepare_inputs_for_generation to preserve our custom 3D position_ids
+    # during generate(). Without this, Qwen3VL unconditionally sets position_ids=None,
+    # which forces get_rope_index(input_ids=None, ...) to fall back to linear 1D positions,
+    # destroying the 2D spatial encoding of visual tokens during inference.
+    old_prepare = Qwen3VLForConditionalGeneration.prepare_inputs_for_generation
+    def new_prepare_inputs_for_generation(self, input_ids, past_key_values=None,
+                                           attention_mask=None, inputs_embeds=None,
+                                           cache_position=None, position_ids=None,
+                                           use_cache=True, pixel_values=None,
+                                           pixel_values_videos=None, image_grid_thw=None,
+                                           video_grid_thw=None, **kwargs):
+        # Save the incoming 3D position_ids before Qwen3VL discards them
+        incoming_position_ids = position_ids
+
+        model_inputs = old_prepare(self, input_ids, past_key_values=past_key_values,
+                                   attention_mask=attention_mask, inputs_embeds=inputs_embeds,
+                                   cache_position=cache_position, position_ids=position_ids,
+                                   use_cache=use_cache, pixel_values=pixel_values,
+                                   pixel_values_videos=pixel_values_videos,
+                                   image_grid_thw=image_grid_thw,
+                                   video_grid_thw=video_grid_thw, **kwargs)
+
+        # On prefill (first step), restore our custom 3D position_ids if available.
+        # Also compute and store rope_deltas on the inner Qwen3VLModel so that
+        # continuation steps (cache_position[0] != 0) can compute correct positions.
+        # Without this, the inner model's rope_deltas stays None (since the
+        # `if position_ids is None:` block in Qwen3VLModel.forward is skipped),
+        # causing a crash on the second generation step.
+        if cache_position is not None and cache_position[0] == 0 and incoming_position_ids is not None:
+            if incoming_position_ids.dim() == 3:
+                model_inputs["position_ids"] = incoming_position_ids
+
+                # Compute rope_deltas = max(position_ids) + 1 - seq_length per batch
+                # This mirrors what get_rope_index normally computes.
+                # Must use attention_mask to select active positions (left-padding safe).
+                B = incoming_position_ids.shape[1]
+                attn = model_inputs.get('attention_mask', attention_mask)
+                rope_deltas = []
+                for i in range(B):
+                    if attn is not None:
+                        attn_bool = attn[i].bool()
+                        active_len = attn_bool.sum().item()
+                        # Select only active (non-padded) positions across all 3 RoPE dims
+                        active_positions = incoming_position_ids[:, i, :][:, attn_bool]
+                        max_pos = active_positions.max().item()
+                    else:
+                        active_len = incoming_position_ids.shape[2]
+                        max_pos = incoming_position_ids[:, i, :].max().item()
+                    rope_deltas.append(max_pos + 1 - active_len)
+                self.model.rope_deltas = torch.tensor(
+                    rope_deltas, device=incoming_position_ids.device, dtype=torch.long
+                ).unsqueeze(1)
+
+        return model_inputs
+    Qwen3VLForConditionalGeneration.prepare_inputs_for_generation = new_prepare_inputs_for_generation
+
 patch_qwen3_vl_deepstack()
 
 AutoModelForCausalLM.register(Qwen3VLConfig, Qwen3VLForConditionalGeneration)
@@ -85,7 +141,7 @@ from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names, get_peft_model_state_dict, 
                     guess_load_checkpoint, make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import (HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, 
+from .custom_model import (HighResConvNeXtV2Pyramid, PositionalEmbedding2DSinusoidal, 
                            AttentionPooling, RegressionHead, SurvivalHead, 
                            cox_ph_loss, logistic_hazard_loss, WSIProjector)
 
@@ -605,7 +661,8 @@ class LLaVAModel_conv(BaseModel):
     def _init_attributes(self, freeze_llm: bool, enable_regression: bool, reg_token: str,
                          enable_survival: bool, srv_token: str, num_survival_intervals: int,
                          survival_method: str, gen_forcing: bool,
-                         lambda_llm: float, lambda_reg: float, lambda_srv: float, vision_conv_cfg: Optional[Dict],
+                         lambda_llm: float, lambda_reg: float, lambda_srv: float,
+                         vision_conv_cfg: Optional[Dict],
                          deepstack_visual_indexes: List[int],
                          deepstack_reverse_injection: bool = False,
                          wsi_feature_dims: Optional[List[int]] = None,
@@ -668,9 +725,8 @@ class LLaVAModel_conv(BaseModel):
         )
         if self.vision_conv_cfg is not None:
             default_conv_cfg.update(self.vision_conv_cfg)
-        self.conv = HighResPartialConvNeXt(
-            **default_conv_cfg
-        ).to(self.llm.dtype)
+        self.conv = HighResConvNeXtV2Pyramid(**default_conv_cfg).to(self.llm.dtype)
+        print_log(f"[VisionBackbone] Using {self.conv.__class__.__name__} with cfg={default_conv_cfg}", 'current')
 
     def _get_llm_hidden_size(self) -> int:
         """Get the hidden size of the LLM, handling both standard and composite configs."""
@@ -721,6 +777,26 @@ class LLaVAModel_conv(BaseModel):
                 depth=depth
             )
             self.projectors.append(ProjectorModel(projector_config).to(self.llm.dtype))
+        
+        # Post-projection normalization to match LLM embedding scale.
+        # Without this, projected features have ~25x larger norm than LLM embeddings,
+        # causing the model to suppress visual features and ignore them for classification.
+        import math
+        self.proj_norms = nn.ModuleList()
+        for _ in self.conv.dims:
+            norm = nn.LayerNorm(llm_hidden_size, elementwise_affine=True)
+            # Initialize gain so output norm ≈ LLM embedding norm (~1.0)
+            # LayerNorm output has unit variance per element, so norm ≈ sqrt(D).
+            # Scale by 1/sqrt(D) to bring norm down to ~1.
+            nn.init.constant_(norm.weight, 1.0 / math.sqrt(llm_hidden_size))
+            nn.init.constant_(norm.bias, 0.0)
+            self.proj_norms.append(norm.to(self.llm.dtype))
+        
+        print_log(
+            f"[ProjectorNorm] Added LayerNorm after each projector, "
+            f"init gain={1.0/math.sqrt(llm_hidden_size):.6f} (target norm≈1.0)",
+            'current'
+        )
         
         # For backward compatibility and easy access to the main projector
         self.projector = self.projectors[-1]
@@ -1010,9 +1086,11 @@ class LLaVAModel_conv(BaseModel):
         # Vision components are trainable by default
         conv_params = sum(p.numel() for p in self.conv.parameters())
         proj_params = sum(p.numel() for p in self.projectors.parameters())
+        proj_norm_params = sum(p.numel() for p in self.proj_norms.parameters()) if hasattr(self, 'proj_norms') else 0
         trainable_params.extend([
             f"conv: {conv_params:,}",
-            f"projectors: {proj_params:,}"
+            f"projectors: {proj_params:,}",
+            f"proj_norms: {proj_norm_params:,}"
         ])
         
         # WSI projector if enabled
@@ -1205,16 +1283,13 @@ class LLaVAModel_conv(BaseModel):
 
         return super().load_state_dict(new_state_dict, strict=strict)
 
-    def _project_vision_features(self, features: torch.Tensor, masks: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    def _project_vision_features(self, features: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """Project vision features through conv and hierarchical projectors.
         Returns (list_of_projected_features, grid_thw)."""
         conv_input = features.to(self.llm.dtype)
         B, C, H, W = conv_input.shape
 
-        mask = (torch.ones(B, 1, H, W, device=conv_input.device, dtype=conv_input.dtype) 
-                if masks is None else masks.to(conv_input.device, dtype=conv_input.dtype))
-
-        stage_outputs, updated_mask = self.conv(conv_input, mask)
+        stage_outputs = self.conv(conv_input)
         
         # Final resolution
         final_feat = stage_outputs[-1]
@@ -1226,9 +1301,11 @@ class LLaVAModel_conv(BaseModel):
             if feat.shape[2:] != (H_final, W_final):
                 feat = F.adaptive_avg_pool2d(feat, (H_final, W_final))
             
-            # Project
-            feat_to_proj = feat.permute(0, 2, 3, 1).reshape(B, H_final * W_final, -1)
-            projected_stages.append(projector(feat_to_proj.to(self.llm.dtype)))
+            feat_to_proj = feat.permute(0, 2, 3, 1).reshape(B, H_final * W_final, -1).to(self.llm.dtype)
+            projected = projector(feat_to_proj)
+            # Normalize to match LLM embedding scale
+            projected = self.proj_norms[i](projected)
+            projected_stages.append(projected)
             
         grid_thw = torch.tensor([[1, H_final, W_final]] * B, device=conv_input.device, dtype=torch.long)
         
@@ -1368,7 +1445,7 @@ class LLaVAModel_conv(BaseModel):
         
         if has_visual_features:
             # Process vision features
-            projected_stages, grid_thw = self._project_vision_features(data['features'], data.get('masks'))
+            projected_stages, grid_thw = self._project_vision_features(data['features'])
             
             # Map multi-stage features to specific LLM layers (e.g., 8, 16, 24)
             ds_indexes = self.deepstack_visual_indexes
@@ -1379,10 +1456,12 @@ class LLaVAModel_conv(BaseModel):
             if self.deepstack_reverse_injection:
                 stages_to_inject = list(reversed(projected_stages))
 
-            # Build sparse list aligned to total LLM layers; only target indices receive features
+            # Build sparse list aligned to total LLM layers; only target indices receive features.
+            # Skip injection where the stage is the same as pixel_values (projected_stages[-1])
+            # to avoid double injection — pixel_values is already used as the visual embedding.
             deepstack_embeds = [None] * num_layers
             for idx, feat in zip(ds_indexes, stages_to_inject):
-                if idx < num_layers:
+                if idx < num_layers and feat is not projected_stages[-1]:
                     deepstack_embeds[idx] = feat
 
             data['pixel_values'] = projected_stages[-1]  # Main feature
@@ -1396,8 +1475,7 @@ class LLaVAModel_conv(BaseModel):
         
         # Clean up features from data dict
         data.pop('features', None)
-        data.pop('masks', None)
-        
+
         # Process WSI features if available
         wsi_embeddings = None
         if self.enable_wsi_injection and 'wsi_features' in data:

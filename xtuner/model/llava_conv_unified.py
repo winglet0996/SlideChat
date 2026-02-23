@@ -36,7 +36,7 @@ from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names, get_peft_model_state_dict, 
                     guess_load_checkpoint, make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import (HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, 
+from .custom_model import (HighResConvNeXtV2Pyramid, PositionalEmbedding2DSinusoidal, 
                            AttentionPooling, RegressionHead, SurvivalHead, 
                            cox_ph_loss, logistic_hazard_loss, WSIProjector)
 
@@ -456,7 +456,7 @@ class LLaVAModel_conv_unified(BaseModel):
                           - If float: applied to all (reg, srv, wsi).
                           - If list of 3: [reg_mult, srv_mult, wsi_mult].
                           Set to 0 for a single linear layer (most lightweight).
-            vision_conv_cfg: Configuration for the HighResPartialConvNeXt vision backbone.
+            vision_conv_cfg: Configuration for the ConvNeXtV2 pyramid vision backbone.
                              If None, vision components are disabled (text-only mode).
         """
         super().__init__()
@@ -617,9 +617,8 @@ class LLaVAModel_conv_unified(BaseModel):
         )
         if self.vision_conv_cfg is not None:
             default_conv_cfg.update(self.vision_conv_cfg)
-        self.conv = HighResPartialConvNeXt(
-            **default_conv_cfg
-        ).to(self.llm.dtype)
+        self.conv = HighResConvNeXtV2Pyramid(**default_conv_cfg).to(self.llm.dtype)
+        print_log(f"[VisionBackbone] Using {self.conv.__class__.__name__} with cfg={default_conv_cfg}", 'current')
         self.pos_emb_2d = PositionalEmbedding2DSinusoidal(
             d_model=self.conv.dims[-1],
             scale_mode='learned',
@@ -1037,7 +1036,7 @@ class LLaVAModel_conv_unified(BaseModel):
 
         return to_return
 
-    def _project_vision_features(self, features: torch.Tensor, masks: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _project_vision_features(self, features: torch.Tensor) -> torch.Tensor:
         """Project vision features through conv, positional embedding, and final projector."""
         if not self.enable_vision:
             raise RuntimeError("Vision components not initialized. Set vision_conv_cfg to enable vision.")
@@ -1045,10 +1044,7 @@ class LLaVAModel_conv_unified(BaseModel):
         conv_input = features.to(self.llm.dtype)
         B, C, H, W = conv_input.shape
 
-        mask = (torch.ones(B, 1, H, W, device=conv_input.device, dtype=conv_input.dtype) 
-                if masks is None else masks.to(conv_input.device, dtype=conv_input.dtype))
-
-        stage_outputs, updated_mask = self.conv(conv_input, mask)
+        stage_outputs = self.conv(conv_input)
         conv_output = stage_outputs[-1]
 
         conv_output = self.pos_emb_2d(conv_output)
@@ -1168,14 +1164,12 @@ class LLaVAModel_conv_unified(BaseModel):
         # Process vision features if present
         has_visual_features = 'features' in data and data['features'] is not None
         if has_visual_features and self.enable_vision:
-            projected_features = self._project_vision_features(data['features'], data.get('masks'))
+            projected_features = self._project_vision_features(data['features'])
             data['pixel_values'] = projected_features
             data.pop('features', None)
-            data.pop('masks', None)
         else:
             data['pixel_values'] = None
             data.pop('features', None)
-            data.pop('masks', None)
 
         # Process WSI features if present
         wsi_embeddings = None

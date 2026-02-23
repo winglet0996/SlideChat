@@ -26,7 +26,7 @@ from .utils import (LoadWoInit, find_all_linear_names,
                     get_peft_model_state_dict, guess_load_checkpoint,
                     make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import HighResPartialConvNeXt, RotaryEmbedding2D
+from .custom_model import HighResConvNeXtV2Pyramid, RotaryEmbedding2D
 
 from .torchscale.model.LongNet import make_longnet_from_name
 import torch.nn.functional as F
@@ -69,8 +69,8 @@ class LLaVAModel_conv_longnet(BaseModel):
 
             self.llm = self._build_from_cfg_or_module(llm)
         
-        # High-resolution partial convolution for feature preprocessing
-        self.conv = HighResPartialConvNeXt().to(self.llm.dtype)
+        # High-resolution ConvNeXtV2 pyramid for feature preprocessing
+        self.conv = HighResConvNeXtV2Pyramid().to(self.llm.dtype)
         
         # 2D rotary embedding for positional encoding (apply to half dimensions)
         self.rotary_emb = RotaryEmbedding2D(dim=hidden_size//2).to(self.llm.dtype)
@@ -293,23 +293,16 @@ class LLaVAModel_conv_longnet(BaseModel):
         else:
             raise NotImplementedError
 
-    def _project_vision_features(self, features, masks=None):
-        """Projects vision features through HighResPartialConvNeXt, 
+    def _project_vision_features(self, features):
+        """Projects vision features through HighResConvNeXtV2Pyramid, 
         RotaryEmbedding2D, and LongNet encoder before final projection."""
         
-        # features: (B, C, H, W), masks: (B, 1, H, W) or None
+        # features: (B, C, H, W)
         conv_input = features.to(self.llm.dtype)  # Ensure correct dtype
         B, C, H, W = conv_input.shape
         
-        # Process masks
-        if masks is None:
-            # Create default mask (all valid)
-            mask = torch.ones(B, 1, H, W, device=conv_input.device, dtype=conv_input.dtype)
-        else:
-            mask = masks.to(conv_input.device, dtype=conv_input.dtype)
-        
-        # Pass through HighResPartialConvNeXt
-        stage_outputs, updated_mask = self.conv(conv_input, mask)
+        # Pass through HighResConvNeXtV2Pyramid
+        stage_outputs = self.conv(conv_input)
         conv_output = stage_outputs[-1]
         
         # Apply 2D rotary positional embedding
@@ -337,13 +330,12 @@ class LLaVAModel_conv_longnet(BaseModel):
             self.to(data['input_ids'].device)
             self.is_first_iter = False
         
-        # features (B, C, H, W) and masks (B, 1, H, W)
-        projected_features = self._project_vision_features(data['features'], data['masks'])
+        # features (B, C, H, W)
+        projected_features = self._project_vision_features(data['features'])
         # Replace with projected features, keep original key for compatibility
         data['pixel_values'] = projected_features
         # Clean up original keys
         data.pop('features', None)
-        data.pop('masks', None)
 
         if mode == 'predict':
             # Mask ground truth: slice data based on labels, keeping original pixel_values.

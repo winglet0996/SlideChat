@@ -27,7 +27,7 @@ from .utils import (LoadWoInit, find_all_linear_names,
                     get_peft_model_state_dict, guess_load_checkpoint,
                     make_inputs_require_grad,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
-from .custom_model import HighResPartialConvNeXt, PositionalEmbedding2DSinusoidal, CustomQformer
+from .custom_model import HighResConvNeXtV2Pyramid, PositionalEmbedding2DSinusoidal, CustomQformer
 
 import torch.nn.functional as F
 
@@ -72,8 +72,8 @@ class LLaVAModel_conv_qformer(BaseModel):
 
             self.llm = self._build_from_cfg_or_module(llm)
         
-        # High-resolution partial convolution for feature preprocessing
-        self.conv = HighResPartialConvNeXt(in_chans=768,
+        # High-resolution ConvNeXtV2 pyramid for feature preprocessing
+        self.conv = HighResConvNeXtV2Pyramid(in_chans=768,
                                            depths=[3, 9, 3],
                                            dims=[768, 768, hidden_size],
                                            drop_path_rate=0.1,
@@ -368,26 +368,19 @@ class LLaVAModel_conv_qformer(BaseModel):
         else:
             raise NotImplementedError
 
-    def _project_vision_features(self, features, masks=None, text_input_ids=None, text_attention_mask=None):
-        """Projects vision features through HighResPartialConvNeXt, 
+    def _project_vision_features(self, features, text_input_ids=None, text_attention_mask=None):
+        """Projects vision features through HighResConvNeXtV2Pyramid, 
         RotaryEmbedding2D, optionally Q-Former, before final projection."""
         
         device = features.device
         dtype = self.llm.dtype
 
-        # features: (B, C, H, W), masks: (B, 1, H, W) or None
+        # features: (B, C, H, W)
         conv_input = features.to(dtype)
         B, C, H, W = conv_input.shape
         
-        # Process masks
-        if masks is None:
-            # Create default mask (all valid)
-            mask = torch.ones(B, 1, H, W, device=device, dtype=dtype)
-        else:
-            mask = masks.to(device, dtype=dtype)
-        
-        # Pass through HighResPartialConvNeXt
-        stage_outputs, updated_mask = self.conv(conv_input, mask)
+        # Pass through HighResConvNeXtV2Pyramid
+        stage_outputs = self.conv(conv_input)
         conv_output = stage_outputs[-1]
         
         # Add positional embedding
@@ -398,9 +391,12 @@ class LLaVAModel_conv_qformer(BaseModel):
         vision_features = conv_output.permute(0, 2, 3, 1).view(B, H_new * W_new, C_new)  # (B, H*W, C)
         vision_features = vision_features.to(self.llm.dtype)
         
-        # Prepare the vision mask for Q-Former
-        # updated_mask shape: (B, 1, H_new, W_new)
-        vision_attention_mask = updated_mask.squeeze(1).view(B, -1)  # Shape: (B, H_new * W_new)
+        # Prepare vision attention mask for Q-Former (all valid tokens)
+        vision_attention_mask = torch.ones(
+            (B, H_new * W_new),
+            dtype=torch.long,
+            device=vision_features.device,
+        )
         
         # Use Q-Former to fuse vision and text features
         # replace IMAGE_TOKEN_INDEX in text_input_ids with pad_token_id (for Q-Former processing only)
@@ -432,10 +428,9 @@ class LLaVAModel_conv_qformer(BaseModel):
         text_input_ids = data.get('input_ids', None)
         text_attention_mask = data.get('attention_mask', None)
         
-        # features (B, C, H, W) and masks (B, 1, H, W)
+        # features (B, C, H, W)
         projected_features = self._project_vision_features(
             data['features'], 
-            data['masks'],
             text_input_ids=text_input_ids,
             text_attention_mask=text_attention_mask
         )
@@ -443,7 +438,6 @@ class LLaVAModel_conv_qformer(BaseModel):
         data['pixel_values'] = projected_features
         # Clean up original keys
         data.pop('features', None)
-        data.pop('masks', None)
 
         if mode == 'predict':
             # Mask ground truth: slice data based on labels, keeping original pixel_values.

@@ -9,10 +9,9 @@
     "overlap_comm": true
   },
   "fp16": {
-    "enabled": "auto",
-    "initial_scale_power": 16
+    "enabled": false
   },
   "bf16": {
-    "enabled": "auto"
+    "enabled": true
   }
 }

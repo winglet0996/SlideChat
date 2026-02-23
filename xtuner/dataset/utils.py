@@ -288,9 +288,7 @@ def decode_base64_to_image(base64_string):
 
 class PadToGrid:
     """
-    Pads sparse features into a dense grid and generates a corresponding mask.
-    The mask indicates valid (1) vs. padded (0) areas, which is required
-    by downstream modules like Partial Convolution (PConv).
+    Pads sparse features into a dense feature grid.
     """
     def __init__(self, pad_value=0.0):
         self.pad_value = pad_value
@@ -301,9 +299,7 @@ class PadToGrid:
             sample (tuple): A tuple containing (features, coords, patch_size).
 
         Returns:
-            tuple: A tuple containing (feature_grid, mask).
-                   - feature_grid (torch.Tensor): The dense grid of features (C, H, W).
-                   - mask (torch.Tensor): The binary mask (1, H, W).
+            torch.Tensor: Dense grid of features with shape (C, H, W).
         """
         features, coords, patch_size = sample
         features = torch.as_tensor(features, dtype=torch.float32)
@@ -333,24 +329,16 @@ class PadToGrid:
             dtype=features.dtype
         )
         
-        # Create a corresponding mask grid initialized to zeros (padded)
-        mask_grid = torch.zeros((grid_h, grid_w), dtype=torch.float32)
-
         # Place the features into the feature grid at their respective locations
         feature_grid[shifted_coords[:, 1], shifted_coords[:, 0]] = features
-        
-        # Set the mask to 1.0 at the locations of valid features
-        mask_grid[shifted_coords[:, 1], shifted_coords[:, 0]] = 1.0
-        
-        # Permute feature grid to (C, H, W) and add channel dim to mask to get (1, H, W)
-        return feature_grid.permute(2, 0, 1), mask_grid.unsqueeze(0)
+
+        # Permute feature grid to (C, H, W)
+        return feature_grid.permute(2, 0, 1)
 
 
 class CenterFixedSizeCrop:
     """
     Performs a center crop with a fixed output size.
-    Crucially, it applies the *same* crop to both the feature grid and its mask
-    to maintain their correspondence.
     If the image is smaller than the crop size, it is padded first.
     """
     def __init__(self, crop_size):
@@ -362,13 +350,11 @@ class CenterFixedSizeCrop:
     def __call__(self, sample):
         """
         Args:
-            sample (tuple): A tuple containing (grid, mask).
-                            - grid (torch.Tensor): A feature grid of shape (C, H, W).
-                            - mask (torch.Tensor): A mask of shape (1, H, W).
+            sample (torch.Tensor): Feature grid of shape (C, H, W).
         Returns:
-            tuple: A tuple containing the cropped (grid, mask).
+            torch.Tensor: Cropped feature grid.
         """
-        grid, mask = sample
+        grid = sample
         
         _, h, w = grid.shape
         th, tw = self.crop_size
@@ -379,7 +365,6 @@ class CenterFixedSizeCrop:
             pad_w = max(0, tw - w)
             # Pad right and bottom
             grid = torch.nn.functional.pad(grid, (0, pad_w, 0, pad_h), value=0)
-            mask = torch.nn.functional.pad(mask, (0, pad_w, 0, pad_h), value=0)
             
         # Update h, w after padding
         _, h, w = grid.shape
@@ -388,17 +373,12 @@ class CenterFixedSizeCrop:
         i = (h - th) // 2
         j = (w - tw) // 2
         
-        cropped_grid = grid[:, i:i+th, j:j+tw]
-        cropped_mask = mask[:, i:i+th, j:j+tw]
-        
-        return cropped_grid, cropped_mask
+        return grid[:, i:i+th, j:j+tw]
 
 
 class RandomVariableCrop:
     """
     Performs a random crop with a variable output size.
-    Crucially, it applies the *same* crop to both the feature grid and its mask
-    to maintain their correspondence.
     """
     def __init__(self, scale=(0.9, 1.0), ratio=(0.2, 5.0)):
         self.scale = scale
@@ -407,22 +387,16 @@ class RandomVariableCrop:
     def __call__(self, sample):
         """
         Args:
-            sample (tuple): A tuple containing (grid, mask).
-                            - grid (torch.Tensor): A feature grid of shape (C, H, W).
-                            - mask (torch.Tensor): A mask of shape (1, H, W).
+            sample (torch.Tensor): Feature grid of shape (C, H, W).
         Returns:
-            tuple: A tuple containing the cropped (grid, mask).
+            torch.Tensor: Cropped feature grid.
         """
-        grid, mask = sample
+        grid = sample
         
         # Use the library's robust function to get crop parameters based on the grid's size
         top, left, h, w = transforms.RandomResizedCrop.get_params(grid, self.scale, self.ratio)
         
-        # Apply the exact same crop to both the grid and the mask
-        cropped_grid = grid[:, top:top + h, left:left + w]
-        cropped_mask = mask[:, top:top + h, left:left + w]
-        
-        return cropped_grid, cropped_mask
+        return grid[:, top:top + h, left:left + w]
 
 
 class RandomVariableCropWithLimit:
@@ -437,12 +411,11 @@ class RandomVariableCropWithLimit:
         self.max_patch_num = max_patch_num
 
     def __call__(self, sample):
-        grid, mask = sample
+        grid = sample
         
         # 1. Variable Crop
         top, left, h, w = transforms.RandomResizedCrop.get_params(grid, self.scale, self.ratio)
         grid = grid[:, top:top + h, left:left + w]
-        mask = mask[:, top:top + h, left:left + w]
         
         # 2. Check limit and crop again if needed
         _, h, w = grid.shape
@@ -461,9 +434,8 @@ class RandomVariableCropWithLimit:
             j = torch.randint(0, w - new_w + 1, size=(1, )).item()
             
             grid = grid[:, i:i+new_h, j:j+new_w]
-            mask = mask[:, i:i+new_h, j:j+new_w]
-            
-        return grid, mask
+
+        return grid
 
 def load_wsi_feature(wsi_file, max_patch_num, transform=None):
     with h5py.File(wsi_file, 'r') as f:

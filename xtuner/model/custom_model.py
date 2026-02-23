@@ -6,67 +6,6 @@ from transformers import InstructBlipQFormerConfig
 from transformers.models.instructblip.modeling_instructblip import InstructBlipQFormerEncoder
 from typing import Optional, Tuple, Iterable, Literal
 
-class PartialConv2d(nn.Conv2d):
-    """
-    Partial Convolution layer, as described in "Image Inpainting for Irregular Holes Using Partial Convolutions".
-    This version is adapted to return the updated mask, which is essential for propagation.
-    """
-    def __init__(self, *args, **kwargs):
-        # Whether the mask is multi-channel or not
-        self.multi_channel = kwargs.pop('multi_channel', False)
-        # Whether to return the mask
-        self.return_mask = kwargs.pop('return_mask', True)
-        super(PartialConv2d, self).__init__(*args, **kwargs)
-
-        if self.multi_channel:
-            weight_maskUpdater = torch.ones(self.out_channels, self.in_channels, self.kernel_size[0], self.kernel_size[1])
-            self.slide_winsize = (self.in_channels // self.groups) * self.kernel_size[0] * self.kernel_size[1]
-        else:
-            weight_maskUpdater = torch.ones(1, 1, self.kernel_size[0], self.kernel_size[1])
-            self.slide_winsize = self.kernel_size[0] * self.kernel_size[1]
-        
-        self.register_buffer('updater_buf', weight_maskUpdater) # Use a buffer
-
-    def forward(self, input, mask_in=None):
-        assert len(input.shape) == 4
-        
-        if mask_in is None:
-            # if mask is not provided, create a ones mask
-            if self.multi_channel:
-                mask = torch.ones_like(input)
-            else:
-                mask = torch.ones(input.shape[0], 1, input.shape[2], input.shape[3], device=input.device, dtype=input.dtype)
-        else:
-            mask = mask_in
-
-        with torch.no_grad():
-            # The updater does not require gradients
-            update_mask = F.conv2d(mask, self.updater_buf, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=1)
-            
-            # For mixed precision training, ensure consistent dtypes
-            mask_ratio = self.slide_winsize / (update_mask + 1e-8)
-            mask_ratio = mask_ratio.to(input.dtype)
-            
-            update_mask = torch.clamp(update_mask, 0, 1)
-            mask_ratio = mask_ratio * update_mask
-
-        # Apply the mask to the input
-        masked_input = input * mask
-        
-        # Perform the convolution
-        raw_out = super(PartialConv2d, self).forward(masked_input)
-
-        if self.bias is not None:
-            bias_view = self.bias.view(1, self.out_channels, 1, 1)
-            output = (raw_out - bias_view) * mask_ratio + bias_view
-        else:
-            output = raw_out * mask_ratio
-
-        if self.return_mask:
-            return output, update_mask
-        else:
-            return output
-
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
     """
@@ -123,138 +62,98 @@ class GRN(nn.Module):
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
 
-class PartialConvNeXtV2Block(nn.Module):
-    """ Partial ConvNeXtV2 Block.
-    
-    Args:
-        dim (int): Number of input channels.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-    """
-    def __init__(self, dim, drop_path=0.):
+class ConvNeXtV2Block(nn.Module):
+    """Standard ConvNeXtV2 block (no partial-mask conv) for stable optimization."""
+
+    def __init__(self, dim: int, drop_path: float = 0.0):
         super().__init__()
-        # Use PartialConv2d for the depthwise convolution
-        self.dwconv = PartialConv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = LayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
         self.act = nn.GELU()
         self.grn = GRN(4 * dim)
         self.pwconv2 = nn.Linear(4 * dim, dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, x, mask):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
-        # The dwconv is a PartialConv2d, it returns the feature map and the updated mask
-        x, updated_mask = self.dwconv(x, mask)
-        
-        # Permute to (N, H, W, C) to use nn.Linear and the official GRN
+        x = self.dwconv(x)
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.grn(x)
         x = self.pwconv2(x)
-        x = x.permute(0, 3, 1, 2) # Permute back to (N, C, H, W)
-
-        # Apply residual connection.
-        # The output of the main path is added to the original input.
-        x = shortcut + self.drop_path(x)
-        
-        return x, updated_mask
+        x = x.permute(0, 3, 1, 2)
+        return shortcut + self.drop_path(x)
 
 
-class HighResPartialConvNeXt(nn.Module):
+class HighResConvNeXtV2Pyramid(nn.Module):
+    """A concise ConvNeXtV2-style feature pyramid.
+
+    Returns:
+        stage_outputs: list of stage tensors
     """
-    A PartialConvNeXtV2-based model optimized for processing high-dimensional feature maps.
-    It removes the aggressive stem and classification head, acting as a general-purpose
-    feature refinement module.
 
-    Args:
-        in_chans (int): Number of input feature channels.
-        depths (tuple(int)): Number of blocks at each stage.
-        dims (int): Feature dimension at each stage.
-        drop_path_rate (float): Stochastic depth rate.
-        num_downsamples (int): Number of downsampling stages. Must be <= len(depths) - 1.
-    """
-    def __init__(self, in_chans=768, 
-                 depths=[2, 2, 6], dims=[768, 768, 768], 
-                 drop_path_rate=0.1, num_downsamples=2
-                 ):
+    def __init__(self,
+                 in_chans: int = 768,
+                 depths: Iterable[int] = (2, 2, 4),
+                 dims: Iterable[int] = (768, 1024, 1536),
+                 drop_path_rate: float = 0.1,
+                 num_downsamples: int = 2):
         super().__init__()
-        
-        # Store dims for later access
+
+        depths = list(depths)
+        dims = list(dims)
         self.dims = dims
-        
+
+        if len(depths) != len(dims):
+            raise ValueError(f"depths and dims must have same length, got {len(depths)} and {len(dims)}")
         if num_downsamples > len(depths) - 1:
             raise ValueError(f"num_downsamples ({num_downsamples}) cannot exceed len(depths)-1 ({len(depths)-1})")
 
-        # --- Gentle Input Projection (1x1 Conv) ---
-        # Only used if the input channels don't match the first stage dimension.
-        if in_chans != dims[0]:
-            self.input_proj = PartialConv2d(in_chans, dims[0], kernel_size=1)
-        else:
-            self.input_proj = None
+        self.input_proj = nn.Conv2d(in_chans, dims[0], kernel_size=1, bias=True) if in_chans != dims[0] else None
 
-        # --- Stages & Downsampling Layers ---
         self.stages = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()
-        
+
         dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
+        for i, (depth, dim) in enumerate(zip(depths, dims)):
+            blocks = nn.ModuleList([ConvNeXtV2Block(dim=dim, drop_path=dp_rates[cur + j]) for j in range(depth)])
+            self.stages.append(blocks)
+            cur += depth
 
-        # Create all stages
-        for i in range(len(depths)):
-            stage = nn.ModuleList(
-                [PartialConvNeXtV2Block(dim=dims[i], drop_path=dp_rates[cur + j]) for j in range(depths[i])]
-            )
-            self.stages.append(stage)
-            cur += depths[i]
-
-            # Create corresponding downsampling layer if needed
             if i < num_downsamples:
-                downsample_layer = nn.ModuleList([
-                    LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
-                    PartialConv2d(dims[i], dims[i+1], kernel_size=2, stride=2),
-                ])
-                self.downsample_layers.append(downsample_layer)
+                self.downsample_layers.append(
+                    nn.Sequential(
+                        LayerNorm(dim, eps=1e-6, data_format='channels_first'),
+                        nn.Conv2d(dim, dims[i + 1], kernel_size=2, stride=2, bias=True),
+                    ))
 
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, (PartialConv2d, nn.Linear)):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, mask=None):
-        """
-        Input:
-            x (torch.Tensor): Input feature map of shape (N, C_in, H, W).
-            mask (torch.Tensor, optional): Input mask of shape (N, 1, H, W). Defaults to all ones.
-        
-        Returns:
-            (List[torch.Tensor], torch.Tensor): A list of stage outputs and the final mask.
-        """
-        if mask is None:
-            mask = torch.ones(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
-
+    def forward(self, x: torch.Tensor):
         if self.input_proj is not None:
-            x, mask = self.input_proj(x, mask)
+            x = self.input_proj(x)
 
         stage_outputs = []
-        # Iterate through stages and downsampling layers
         for i, stage in enumerate(self.stages):
             for block in stage:
-                x, mask = block(x, mask)
-            
+                x = block(x)
             stage_outputs.append(x)
 
             if i < len(self.downsample_layers):
-                # Apply downsampling
-                x = self.downsample_layers[i][0](x) # LayerNorm
-                x, mask = self.downsample_layers[i][1](x, mask) # PartialConv
+                x = self.downsample_layers[i](x)
 
-        return stage_outputs, mask
-    
+        return stage_outputs
+
 class RotaryEmbedding2D(nn.Module):
     """
     2D Rotary Position Embedding (RoPE)

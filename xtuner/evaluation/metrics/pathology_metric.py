@@ -786,11 +786,14 @@ class PathologyMetric(BaseMetric):
                 ks = [self._infer_num_choices(inp) for inp in group['inputs']]
                 known_ks = [k for k in ks if k > 0]
                 observed_labels = sorted({x for x in (group['targets'] + group['preds']) if x})
+                target_labels = sorted({x for x in group['targets'] if x})
                 if known_ks:
                     is_binary = all(k == 2 for k in known_ks)
                     has_multichoice = any(k > 2 for k in known_ks)
                 else:
-                    is_binary = (len(observed_labels) == 2)
+                    # Use target label space for fallback binary detection so
+                    # garbage prediction letters do not break AUROC branch.
+                    is_binary = (len(target_labels) == 2)
                     has_multichoice = False
 
                 # If any sample indicates K>2, do not treat as binary
@@ -814,11 +817,14 @@ class PathologyMetric(BaseMetric):
 
                     # AUROC: use logits for the two labels when available (pos label defaults to 'A' if present)
                     auroc = None
-                    if len(observed_labels) == 2:
-                        pos_label = 'A' if 'A' in observed_labels else observed_labels[0]
-                        neg_label = observed_labels[1] if observed_labels[0] == pos_label else observed_labels[0]
+                    if len(target_labels) == 2:
+                        pos_label = 'A' if 'A' in target_labels else target_labels[0]
+                        neg_label = target_labels[1] if target_labels[0] == pos_label else target_labels[0]
                         y_true, y_score = [], []
-                        for t, logits in zip(group['targets'], group['choice_logits']):
+                        for t, p, logits in zip(group['targets'], group['preds'], group['choice_logits']):
+                            # Filter out garbage letters before AUROC collection.
+                            if p not in (pos_label, neg_label):
+                                continue
                             if t not in (pos_label, neg_label):
                                 continue
                             if not isinstance(logits, dict) or pos_label not in logits or neg_label not in logits:
