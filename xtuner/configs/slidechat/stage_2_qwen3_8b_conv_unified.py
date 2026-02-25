@@ -35,7 +35,7 @@ if setting == 'alignment':
     freeze_llm = True
     lr = 2e-5
     ckpt_path = None
-    max_epochs = 10
+    max_epochs = 1
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -46,11 +46,11 @@ if setting == 'lora':
         bias='none',
         task_type='CAUSAL_LM')
     save_best_metrics = None
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/iter_200.pth'
+    # ckpt_path = None
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_text_patch_alignment/iter_250.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 10
+    max_epochs = 5
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -96,14 +96,14 @@ model_size = '8B'
 llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-{model_size}'
 
 # Data paths (same full-modal data for all modes)
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_survival_os.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
 
 # Output paths
 ckpt_out_path = None
 work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}'
-vis_name = f'qwen3_{model_size}_lm_multitask_mcqa_srv_random_discrete_dynamic_{model_type}_{setting}'
+vis_name = f'qwen3_{model_size}_lm_multitask_all_{model_type}_{setting}'
 # vis_name = None
 
 visualizer = None if vis_name is None else dict(
@@ -112,7 +112,7 @@ visualizer = None if vis_name is None else dict(
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='pathoverse_multitask_conv_srv_debug',
+                project='pathoverse_multitask_all',
                 name=vis_name
             )
         )
@@ -122,12 +122,14 @@ visualizer = None if vis_name is None else dict(
 val_output_path = work_dir + '/val_results'
 test_output_path = work_dir + '/test_results'
 
-# Save settings
-save_steps = 100
-save_total_limit = 1
+# Save
+by_epoch = True
+# interval = 250
+interval = 1
+save_total_limit = 5
 
 # Evaluation frequency
-evaluation_freq = 50
+evaluation_freq = 500
 
 image_path_list = None
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -190,9 +192,8 @@ sample_type = 'wsi'  # 'wsi' or 'image'
 batch_size = 8
 accumulative_counts = 1
 dataloader_num_workers = 8
-optim_type = SophiaG
+optim_type = AdamW
 betas = (0.9, 0.999)
-rho = 0.01
 weight_decay = 1e-1
 max_norm = 1
 warmup_ratio = 0.05
@@ -222,8 +223,8 @@ elif model_type == 'text_wsi':
 elif model_type == 'text_patch':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [3, 9, 3],
-        "dims": [768, 1024, 2048],
+        "depths": [1, 3, 1],
+        "dims": [768, 1024, 1536],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
@@ -231,8 +232,8 @@ elif model_type == 'text_patch':
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [3, 9, 3],
-        "dims": [768, 1024, 2048],
+        "depths": [1, 3, 1],
+        "dims": [768, 1024, 1536],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
@@ -249,7 +250,7 @@ model = dict(
         type=AutoModelForCausalLM.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
     ),
     generation_kwargs=dict(
         max_new_tokens=max_new_tokens,
@@ -354,11 +355,11 @@ test_evaluator = dict(type=PathologyMetric,
 optim_wrapper = dict(
     type=AmpOptimWrapper,
     optimizer=dict(
-        type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
+        type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
     clip_grad=dict(max_norm=max_norm, error_if_nonfinite=False),
     accumulative_counts=accumulative_counts,
     loss_scale='dynamic',
-    dtype='float16')
+    dtype='bfloat16')
 
 param_scheduler = [
     dict(
@@ -397,8 +398,8 @@ default_hooks = dict(
     param_scheduler=dict(type=ParamSchedulerHook),
     checkpoint=dict(
         type=CheckpointHook,
-        by_epoch=False,
-        interval=save_steps,
+        by_epoch=by_epoch,
+        interval=interval,
         max_keep_ckpts=save_total_limit,
         save_best=save_best_metrics,
         rule='greater',

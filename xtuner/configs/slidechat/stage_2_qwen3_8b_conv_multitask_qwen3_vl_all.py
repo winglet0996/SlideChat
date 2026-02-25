@@ -35,7 +35,7 @@ if setting == 'alignment':
     lr = 2e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
     # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
-    max_epochs = 10
+    max_epochs = 1
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -48,7 +48,7 @@ if setting == 'lora':
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/home/ps/pathology/codes/project/TCGA/train_s2_multitask_all_qwen3_4B_vl_text_patch_alignment/epoch_1.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/iter_250.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 5
@@ -63,15 +63,12 @@ if setting == 'full_param':
 resume = False
 
 model_type = 'text_patch'  # Options: 'text_patch', 'multimodal'
-model_size = '4B'
+model_size = '8B'
 
-llm_name_or_path = f'Qwen/Qwen3-VL-{model_size}-Instruct'
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-train_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_hrd_status.json'
-val_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_hrd_status_200.json'
-test_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_hrd_status_200.json'
+llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -83,9 +80,9 @@ test_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline
 # ckpt_out_path = 's3://zhouxiao/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/home/ps/pathology/codes/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
-# vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
-vis_name = None
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
+vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
+# vis_name = None
 
 
 # set visualizer
@@ -106,11 +103,13 @@ val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-save_steps = 500  # More frequent saves for alignment debugging
-save_total_limit = 1  # Keep more checkpoints for analysis
+by_epoch = True
+# interval = 500
+interval = 1
+save_total_limit = 5
 
 # Evaluate the generation performance during the training
-evaluation_freq = 250  # More frequent evaluation for alignment debugging
+evaluation_freq = 500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -170,11 +169,10 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 2  # per_device
+batch_size = 8  # per_device
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = AdamW
-# optim_type = SophiaG
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
@@ -199,18 +197,18 @@ tokenizer = dict(
 if model_type == 'text_patch':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [2, 2, 4],
+        "depths": [1, 3, 1],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.1,
+        "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
     wsi_feature_dims = None  # No WSI features
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [2, 2, 4],
+        "depths": [1, 3, 1],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.1,
+        "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
     wsi_feature_dims = [768, 1280] # [768, 1280, 768, 768], for TITAN, PRISM, GIGAPATH, CHIEF
@@ -259,7 +257,7 @@ model = dict(
     lambda_reg=1.0,
     lambda_srv=1.0,
     vision_conv_cfg=vision_conv_cfg,
-    deepstack_visual_indexes=[8, 16, 24],
+    deepstack_visual_indexes=[1, 2, 3],
     deepstack_reverse_injection=True,
     wsi_feature_dims=wsi_feature_dims,
     head_scaling=[1, 1, 1]
@@ -404,9 +402,8 @@ default_hooks = dict(
     # save checkpoint per `save_steps`.
     checkpoint=dict(
         type=CheckpointHook,
-        by_epoch=True,
-        # interval=save_steps,
-        interval=1,
+        by_epoch=by_epoch,
+        interval=interval,
         max_keep_ckpts=save_total_limit,
         save_best=save_best_metrics,
         rule='greater',
