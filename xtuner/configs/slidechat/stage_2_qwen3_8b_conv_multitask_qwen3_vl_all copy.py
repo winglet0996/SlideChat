@@ -27,7 +27,7 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'lora'
+setting = 'alignment'
 
 if setting == 'alignment':
     llm_lora = None
@@ -47,8 +47,8 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/epoch_1.pth'
+    ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_lora/epoch_5.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 8
@@ -169,7 +169,7 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 8
+batch_size = 8  # per_device
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = AdamW

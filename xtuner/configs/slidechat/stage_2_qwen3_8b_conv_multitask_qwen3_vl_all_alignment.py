@@ -27,7 +27,7 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'lora'
+setting = 'alignment'
 
 if setting == 'alignment':
     llm_lora = None
@@ -47,8 +47,8 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/epoch_1.pth'
+    ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_lora/epoch_5.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 8
@@ -66,8 +66,8 @@ model_type = 'multimodal'  # Options: 'text_patch', 'multimodal'
 model_size = '8B'
 
 llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all_10000.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_100.json'
 test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -81,8 +81,8 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/t
 ckpt_out_path = None
 
 work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
-vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
-# vis_name = None
+# vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
+vis_name = None
 
 
 # set visualizer
@@ -104,8 +104,8 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = True
-# interval = 250
-interval = 1
+interval = 500
+# interval = 1
 save_total_limit = 5
 
 # Evaluate the generation performance during the training

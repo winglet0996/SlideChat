@@ -47,10 +47,10 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_text_patch_alignment/iter_250.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/epoch_1.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 5
+    max_epochs = 8
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -91,7 +91,7 @@ resume = False
 #
 # The model will automatically skip unused modalities based on config.
 # =====================================================================
-model_type = 'text_patch'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
+model_type = 'multimodal'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
 model_size = '8B'
 llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-{model_size}'
 
@@ -189,7 +189,7 @@ sample_type = 'wsi'  # 'wsi' or 'image'
 
 
 # Scheduler & Optimizer
-batch_size = 8
+batch_size = 12
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = AdamW
@@ -223,7 +223,7 @@ elif model_type == 'text_wsi':
 elif model_type == 'text_patch':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [1, 3, 1],
+        "depths": [3, 9, 3],
         "dims": [768, 1024, 1536],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
@@ -232,7 +232,7 @@ elif model_type == 'text_patch':
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [1, 3, 1],
+        "depths": [3, 9, 3],
         "dims": [768, 1024, 1536],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,

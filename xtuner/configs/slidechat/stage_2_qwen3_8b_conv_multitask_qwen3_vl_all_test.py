@@ -35,7 +35,7 @@ if setting == 'alignment':
     lr = 2e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
     # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
-    max_epochs = 10
+    max_epochs = 1
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -47,8 +47,8 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_8B_vl_multitask_srv_multimodal_alignment/iter_200.pth'
+    # ckpt_path = None
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/iter_250.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 5
@@ -62,17 +62,13 @@ if setting == 'full_param':
     
 resume = False
 
-model_type = 'multimodal'  # Options: 'text_patch', 'multimodal'
+model_type = 'text_patch'  # Options: 'text_patch', 'multimodal'
 model_size = '8B'
 
 llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/tcga_aligned_survival_survival_os_context_debug.json'
 train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_10000.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/cptac/cptac_aligned_test_all.json'
+val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -104,14 +100,16 @@ visualizer = None if vis_name is None else dict(
 )
 
 val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_results'
+test_output_path = work_dir + f'test_results_{model_size}_vl_{model_type}_{setting}'
 
 # Save
-save_steps = 500  # More frequent saves for alignment debugging
-save_total_limit = 3  # Keep more checkpoints for analysis
+by_epoch = True
+# interval = 500
+interval = 1
+save_total_limit = 5
 
 # Evaluate the generation performance during the training
-evaluation_freq = 250  # More frequent evaluation for alignment debugging
+evaluation_freq = 500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -171,11 +169,10 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 16  # per_device
+batch_size = 8  # per_device
 accumulative_counts = 1
 dataloader_num_workers = 8
-optim_type = SophiaG
-# optim_type = AdamW
+optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
@@ -200,8 +197,8 @@ tokenizer = dict(
 if model_type == 'text_patch':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [3, 9, 3],
-        "dims": [768, 1024, 2048],
+        "depths": [1, 3, 1],
+        "dims": [768, 1024, 1536],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
@@ -209,8 +206,8 @@ if model_type == 'text_patch':
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [3, 9, 3],
-        "dims": [768, 1024, 2048],
+        "depths": [1, 3, 1],
+        "dims": [768, 1024, 1536],
         "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
@@ -227,7 +224,7 @@ model = dict(
         type=AutoModelForImageTextToText.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         attn_implementation='flash_attention_2',
         # quantization_config=dict(
         #     type=BitsAndBytesConfig,
@@ -260,7 +257,7 @@ model = dict(
     lambda_reg=1.0,
     lambda_srv=1.0,
     vision_conv_cfg=vision_conv_cfg,
-    deepstack_visual_indexes=[0, 1, 2],
+    deepstack_visual_indexes=[1, 2, 3],
     deepstack_reverse_injection=True,
     wsi_feature_dims=wsi_feature_dims,
     head_scaling=[1, 1, 1]
@@ -353,12 +350,12 @@ test_evaluator = dict(type=PathologyMetric,
 optim_wrapper = dict(
     type=AmpOptimWrapper,
     optimizer=dict(
-        type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
-        # type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
+        # type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
+        type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
     clip_grad=dict(max_norm=max_norm, error_if_nonfinite=False),
     accumulative_counts=accumulative_counts,
     loss_scale='dynamic',
-    dtype='float16')
+    dtype='bfloat16')
 
 # learning policy
 # More information: https://github.com/open-mmlab/mmengine/blob/main/docs/en/tutorials/param_scheduler.md  # noqa: E501
@@ -405,8 +402,8 @@ default_hooks = dict(
     # save checkpoint per `save_steps`.
     checkpoint=dict(
         type=CheckpointHook,
-        by_epoch=False,
-        interval=save_steps,
+        by_epoch=by_epoch,
+        interval=interval,
         max_keep_ckpts=save_total_limit,
         save_best=save_best_metrics,
         rule='greater',
