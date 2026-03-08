@@ -199,16 +199,16 @@ if model_type == 'text_patch':
         "in_chans": 768,
         "depths": [3, 9, 3],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
+        "drop_path_rate": 0.15,
         "num_downsamples": 2,
     }
     wsi_feature_dims = None  # No WSI features
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [3, 9, 3],
+        "depths": [1, 3, 1],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
+        "drop_path_rate": 0.15,
         "num_downsamples": 2,
     }
     wsi_feature_dims = [768, 1280] # [768, 1280, 768, 768], for TITAN, PRISM, GIGAPATH, CHIEF
@@ -257,8 +257,8 @@ model = dict(
     lambda_reg=1.0,
     lambda_srv=1.0,
     vision_conv_cfg=vision_conv_cfg,
-    deepstack_visual_indexes=[1, 2, 3],
-    deepstack_reverse_injection=True,
+    deepstack_visual_indexes=[2, 4, 8],
+    deepstack_reverse_injection=False,
     wsi_feature_dims=wsi_feature_dims,
     head_scaling=[1, 1, 1]
     )

@@ -103,7 +103,7 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/t
 
 # Output paths
 ckpt_out_path = None
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}_1down'
 # vis_name = f'qwen3_{model_size}_lm_multitask_all_{model_type}_{setting}'
 vis_name = None
 
@@ -233,10 +233,10 @@ elif model_type == 'text_patch':
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [1,3,1],
-        "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
-        "num_downsamples": 2,
+        "depths": [1, 3],
+        "dims": [768, 1024],
+        "drop_path_rate": 0.15,
+        "num_downsamples": 1,
     }
     wsi_feature_dims = [768, 1280]
 else:

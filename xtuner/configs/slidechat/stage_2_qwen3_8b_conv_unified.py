@@ -47,7 +47,8 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/epoch_1.pth'
+    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/epoch_1.pth'
+    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment_1down/epoch_1.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 8
@@ -102,8 +103,8 @@ test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/t
 
 # Output paths
 ckpt_out_path = None
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}'
-vis_name = f'qwen3_{model_size}_lm_multitask_all_{model_type}_{setting}'
+work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}_1down'
+vis_name = f'qwen3_{model_size}_lm_multitask_all_{model_type}_{setting}_1down'
 # vis_name = None
 
 visualizer = None if vis_name is None else dict(
@@ -189,7 +190,7 @@ sample_type = 'wsi'  # 'wsi' or 'image'
 
 
 # Scheduler & Optimizer
-batch_size = 12
+batch_size = 8
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = AdamW
@@ -232,10 +233,10 @@ elif model_type == 'text_patch':
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [3, 9, 3],
-        "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
-        "num_downsamples": 2,
+        "depths": [1, 3],
+        "dims": [768, 1024],
+        "drop_path_rate": 0.15,
+        "num_downsamples": 1,
     }
     wsi_feature_dims = [768, 1280]
 else:

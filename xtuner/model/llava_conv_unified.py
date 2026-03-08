@@ -72,13 +72,13 @@ def _strip_image_tokens(input_ids: torch.Tensor, labels: torch.Tensor,
     is_image = (input_ids == IMAGE_TOKEN_INDEX)
     valid_mask = attn_bool & ~is_image  # (B, L) - positions to keep
     
+    # Early exit: no attended image tokens to strip → return None (caller skips unpacking)
+    if not (is_image & attn_bool).any():
+        return None
+    
     # Get new lengths after removing image tokens
     new_lengths = valid_mask.sum(dim=1)  # (B,)
     max_new_len = new_lengths.max().item()
-    
-    if max_new_len == L:
-        # No image tokens found in valid (attended) positions
-        return input_ids, labels, attention_mask
     
     # Create new tensors with proper padding values
     new_input_ids = torch.full((B, max_new_len), pad_token_id, dtype=input_ids.dtype, device=device)
@@ -236,9 +236,11 @@ def prepare_inputs_labels_for_text_and_wsi(
     # Case 1: Pure text mode - no visual features and no <image> tokens (or we strip them)
     if not has_pixel_values and not has_wsi:
         if has_image_tokens:
-            # Strip <image> tokens from input_ids and labels
-            input_ids, labels, attention_mask = _strip_image_tokens(
+            # Strip <image> tokens from input_ids and labels (returns None if nothing to strip)
+            strip_result = _strip_image_tokens(
                 input_ids, labels, attention_mask, padding_side, pad_token_id)
+            if strip_result is not None:
+                input_ids, labels, attention_mask = strip_result
         inputs_embeds = llm.get_input_embeddings()(input_ids)
         # Generate position_ids that respect padding (attention_mask based)
         B, L = input_ids.shape
@@ -263,8 +265,10 @@ def prepare_inputs_labels_for_text_and_wsi(
     # Case 2: Text + WSI only (no patch features) - strip <image> tokens if present
     if not has_pixel_values and has_wsi:
         if has_image_tokens:
-            input_ids, labels, attention_mask = _strip_image_tokens(
+            strip_result = _strip_image_tokens(
                 input_ids, labels, attention_mask, padding_side, pad_token_id)
+            if strip_result is not None:
+                input_ids, labels, attention_mask = strip_result
         return _prepare_text_with_wsi(llm, input_ids, labels, attention_mask, 
                                       position_ids, past_key_values, wsi_embeddings, padding_side)
     
@@ -608,11 +612,14 @@ class LLaVAModel_conv_unified(BaseModel):
 
     def _init_vision_components(self) -> None:
         """Initialize vision processing components."""
+        # depths=[2,4]: balanced; deeper pyramid-stage is more powerful than [1,3]
+        # without the gradient issues of [3,9,3].  drop_path_rate=0.15 keeps
+        # stochastic depth regularisation mild so gradients flow cleanly.
         default_conv_cfg = dict(
             in_chans=768,
-            depths=[1, 3],
+            depths=[2, 4],
             dims=[1024, 2048],
-            drop_path_rate=0.3,
+            drop_path_rate=0.15,
             num_downsamples=1,
         )
         if self.vision_conv_cfg is not None:
@@ -627,6 +634,7 @@ class LLaVAModel_conv_unified(BaseModel):
 
     def _init_projector(self, depth: int = 2) -> None:
         """Initialize the vision-language projector."""
+        import math
         llm_hidden_size = self._get_llm_hidden_size()
         projector_config = ProjectorConfig(
             visual_hidden_size=self.conv.dims[-1],
@@ -634,6 +642,36 @@ class LLaVAModel_conv_unified(BaseModel):
             depth=depth
         )
         self.projector = ProjectorModel(projector_config).to(self.llm.dtype)
+
+        # Post-projection LayerNorm to stabilize visual feature distribution.
+        #
+        # Initialization note: we use standard LayerNorm init (weight=1.0, bias=0),
+        # NOT the 1/sqrt(D) "scale-to-unit-norm" trick used in the VL model.
+        #
+        # Reason: in the unified model visual tokens enter the LLM ONLY via the input
+        # sequence (no DeepStack).  If weight << 1 at init, the backward gradient to
+        # projector/conv is scaled by weight, creating a large attenuation factor
+        # (e.g. 1/sqrt(4096) ≈ 0.016 → 64× gradient throttle).  In bf16 this causes
+        # gradient underflow for the visual pathway, especially for tasks with small
+        # gradient magnitude such as SmoothL1 regression.  Survival (hazard-log-loss)
+        # and MCQA survive because their gradients are larger / text-driven.
+        #
+        # With weight=1.0 the initial output norm is ~sqrt(D) (~64 for D=4096), which
+        # is larger than text embeddings, but that is intentional: visual tokens
+        # dominate <REG> hidden states early in training, forcing the regression head
+        # to actually use visual information.  The trainable weight converges to the
+        # right scale within a few hundred steps.
+        norm = nn.LayerNorm(llm_hidden_size, elementwise_affine=True)
+        # Standard init: weight=1, bias=0 – do NOT override with small constant.
+        nn.init.ones_(norm.weight)
+        nn.init.zeros_(norm.bias)
+        self.proj_norm = norm.to(self.llm.dtype)
+        print_log(
+            f"[ProjectorNorm] Added LayerNorm after projector (weight=1.0, standard init). "
+            f"Initial output norm ≈ sqrt({llm_hidden_size}) ≈ {math.sqrt(llm_hidden_size):.1f} "
+            f"(intentionally large for full gradient flow).",
+            'current'
+        )
 
     def _init_wsi_projector(self) -> None:
         """Initialize the WSI feature projector for multi-source WSI injection."""
@@ -902,9 +940,11 @@ class LLaVAModel_conv_unified(BaseModel):
             conv_params = sum(p.numel() for p in self.conv.parameters())
             proj_params = sum(p.numel() for p in self.projector.parameters())
             pos_params = sum(p.numel() for p in self.pos_emb_2d.parameters())
+            norm_params = sum(p.numel() for p in self.proj_norm.parameters())
             trainable_params.extend([
                 f"conv: {conv_params:,}",
-                f"projector: {proj_params:,}", 
+                f"projector: {proj_params:,}",
+                f"proj_norm: {norm_params:,}",
                 f"pos_emb_2d: {pos_params:,}"
             ])
         
@@ -1014,7 +1054,7 @@ class LLaVAModel_conv_unified(BaseModel):
 
         # Save vision and projection components
         if self.enable_vision:
-            vision_keys = ['projector.', 'conv.', 'pos_emb_2d.']
+            vision_keys = ['projector.', 'proj_norm.', 'conv.', 'pos_emb_2d.']
             to_return.update({k: v for k, v in state_dict.items() 
                               if any(key in k for key in vision_keys)})
 
@@ -1037,7 +1077,7 @@ class LLaVAModel_conv_unified(BaseModel):
         return to_return
 
     def _project_vision_features(self, features: torch.Tensor) -> torch.Tensor:
-        """Project vision features through conv, positional embedding, and final projector."""
+        """Project vision features through conv, positional embedding, projector, and proj_norm."""
         if not self.enable_vision:
             raise RuntimeError("Vision components not initialized. Set vision_conv_cfg to enable vision.")
         
@@ -1050,7 +1090,9 @@ class LLaVAModel_conv_unified(BaseModel):
         conv_output = self.pos_emb_2d(conv_output)
         _, C_new, H_new, W_new = conv_output.shape
         feat_to_proj = conv_output.permute(0, 2, 3, 1).view(B, H_new * W_new, C_new)
-        return self.projector(feat_to_proj.to(self.llm.dtype))
+        projected = self.projector(feat_to_proj.to(self.llm.dtype))
+        # Normalize to match LLM embedding scale (prevents visual-feature suppression)
+        return self.proj_norm(projected)
 
     def _project_wsi_features(self, wsi_features: List[List[torch.Tensor]]) -> torch.Tensor:
         """
@@ -1353,8 +1395,10 @@ class LLaVAModel_conv_unified(BaseModel):
         """Compute task predictions at generated special-token positions.
         
         When gen_forcing=False and special tokens are not generated, we use the
-        hidden state at the last valid position (which contains full context info)
-        instead of raw token embeddings (which would be identical for all samples).
+        hidden state at the last valid prefix position (causal LM: prefix hidden
+        states are identical regardless of what is generated after, so a prefix-only
+        forward pass is sufficient and avoids re-processing all generated tokens).
+        When gen_forcing=True, run over the full prefix + generated sequence.
         """
         device = prefix_inputs_embeds.device
         dtype = prefix_inputs_embeds.dtype
@@ -1362,61 +1406,66 @@ class LLaVAModel_conv_unified(BaseModel):
         Lg = generate_ids.size(1)
 
         with torch.no_grad():
-            tok_emb = self.llm.get_input_embeddings()
-            gen_embeds = tok_emb(generate_ids.to(device))
+            norm = self._get_language_model_norm()
 
-            full_inputs_embeds = torch.cat([prefix_inputs_embeds, gen_embeds.to(dtype)], dim=1)
-
-            pad_id = self.llm.config.pad_token_id
-            if pad_id is None and hasattr(self.tokenizer, 'pad_token_id'):
-                pad_id = self.tokenizer.pad_token_id
-            if pad_id is not None:
-                gen_attn = (generate_ids != pad_id).to(dtype=prefix_attention_mask.dtype, device=device)
+            if not self.gen_forcing:
+                # Fast path: prefix-only forward – much cheaper than
+                # re-processing prefix + all generated tokens.
+                fwd_inputs_embeds = prefix_inputs_embeds
+                fwd_attention_mask = prefix_attention_mask.to(device)
+                fwd_position_ids = (prefix_position_ids.to(device)
+                                    if prefix_position_ids is not None else None)
+                last_valid_pos = fwd_attention_mask.bool().sum(dim=1) - 1  # (B,)
             else:
-                gen_attn = torch.ones((B, Lg), dtype=prefix_attention_mask.dtype, device=device)
+                # Full-sequence path: need hidden states at exact generated positions.
+                tok_emb = self.llm.get_input_embeddings()
+                gen_embeds = tok_emb(generate_ids.to(device))
+                fwd_inputs_embeds = torch.cat([prefix_inputs_embeds, gen_embeds.to(dtype)], dim=1)
 
-            full_attention_mask = torch.cat([prefix_attention_mask.to(device), gen_attn], dim=1)
+                pad_id = self.llm.config.pad_token_id
+                if pad_id is None and hasattr(self.tokenizer, 'pad_token_id'):
+                    pad_id = self.tokenizer.pad_token_id
+                if pad_id is not None:
+                    gen_attn = (generate_ids != pad_id).to(dtype=prefix_attention_mask.dtype, device=device)
+                else:
+                    gen_attn = torch.ones((B, Lg), dtype=prefix_attention_mask.dtype, device=device)
+                fwd_attention_mask = torch.cat([prefix_attention_mask.to(device), gen_attn], dim=1)
 
-            if prefix_position_ids is not None:
-                prefix_position_ids = prefix_position_ids.to(device)
-                last_pos = prefix_position_ids[:, -1].unsqueeze(1)
-                incr = torch.arange(1, Lg + 1, device=device).view(1, -1)
-                gen_pos = last_pos + incr
-                full_position_ids = torch.cat([prefix_position_ids, gen_pos], dim=1)
-            else:
-                full_position_ids = None
+                if prefix_position_ids is not None:
+                    prefix_position_ids = prefix_position_ids.to(device)
+                    last_pos = prefix_position_ids[:, -1].unsqueeze(1)
+                    incr = torch.arange(1, Lg + 1, device=device).view(1, -1)
+                    gen_pos = last_pos + incr
+                    fwd_position_ids = torch.cat([prefix_position_ids, gen_pos], dim=1)
+                else:
+                    fwd_position_ids = None
+                last_valid_pos = fwd_attention_mask.bool().sum(dim=1) - 1  # (B,)
 
-            outputs = self.llm(inputs_embeds=full_inputs_embeds,
-                               attention_mask=full_attention_mask,
-                               position_ids=full_position_ids,
+            outputs = self.llm(inputs_embeds=fwd_inputs_embeds,
+                               attention_mask=fwd_attention_mask,
+                               position_ids=fwd_position_ids,
                                output_hidden_states=True,
                                return_dict=True)
             hidden = outputs.hidden_states[-1]
-            
-            # Apply RMSNorm to hidden states - same as training path (compute_loss)
-            norm = self._get_language_model_norm()
+
+            # Apply RMSNorm – same as training path (compute_loss)
             if norm is not None:
                 hidden = norm(hidden)
-            
-            # Compute last valid position for each sample (used when token not generated)
-            # This gives contextualized representation instead of raw token embedding
-            last_valid_pos = full_attention_mask.bool().sum(dim=1) - 1  # (B,)
 
         for b in range(B):
             # Regression
             if has_regression[b] and self.enable_regression and self.reg_token_id is not None:
-                pos_in_gen = torch.nonzero(generate_ids[b] == self.reg_token_id, as_tuple=False).flatten()
                 embed = None
-                
-                if pos_in_gen.numel() > 0:
-                    # Token was generated - use its position
-                    pos_full = int(Lp + pos_in_gen[-1].item())
-                    if pos_full < hidden.size(1):
-                        embed = hidden[b, pos_full]  # (H,)
-                elif not self.gen_forcing:
-                    # gen_forcing=False: Token not generated, use last valid hidden state
-                    # (contains full context info, unlike raw token embedding)
+
+                if not self.gen_forcing:
+                    # prefix-only hidden: last_valid_pos is always within bounds
                     embed = hidden[b, last_valid_pos[b]]  # (H,)
+                else:
+                    pos_in_gen = torch.nonzero(generate_ids[b] == self.reg_token_id, as_tuple=False).flatten()
+                    if pos_in_gen.numel() > 0:
+                        pos_full = int(Lp + pos_in_gen[-1].item())
+                        if pos_full < hidden.size(1):
+                            embed = hidden[b, pos_full]  # (H,)
                 
                 if embed is not None:
                     fused = embed.unsqueeze(0)
@@ -1429,19 +1478,18 @@ class LLaVAModel_conv_unified(BaseModel):
 
             # Survival
             if has_survival[b] and self.enable_survival and self.srv_token_id is not None:
-                pos_in_gen = torch.nonzero(generate_ids[b] == self.srv_token_id, as_tuple=False).flatten()
                 embed = None
-                
-                if pos_in_gen.numel() > 0:
-                    # Token was generated - use its position
-                    pos_full = int(Lp + pos_in_gen[-1].item())
-                    if pos_full < hidden.size(1):
-                        embed = hidden[b, pos_full]  # (H,)
-                elif not self.gen_forcing:
-                    # gen_forcing=False: Token not generated, use last valid hidden state
-                    # (contains full context info, unlike raw token embedding)
+
+                if not self.gen_forcing:
+                    # prefix-only hidden: last_valid_pos is always within bounds
                     embed = hidden[b, last_valid_pos[b]]  # (H,)
-                
+                else:
+                    pos_in_gen = torch.nonzero(generate_ids[b] == self.srv_token_id, as_tuple=False).flatten()
+                    if pos_in_gen.numel() > 0:
+                        pos_full = int(Lp + pos_in_gen[-1].item())
+                        if pos_full < hidden.size(1):
+                            embed = hidden[b, pos_full]  # (H,)
+
                 if embed is None:
                     continue
                 

@@ -62,7 +62,7 @@ if setting == 'full_param':
     
 resume = False
 
-model_type = 'text_patch'  # Options: 'text_patch', 'multimodal'
+model_type = 'multimodal'  # Options: 'text_patch', 'multimodal'
 model_size = '8B'
 
 llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
@@ -197,9 +197,9 @@ tokenizer = dict(
 if model_type == 'text_patch':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [1, 3, 1],
+        "depths": [3, 9, 3],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
+        "drop_path_rate": 0.15,
         "num_downsamples": 2,
     }
     wsi_feature_dims = None  # No WSI features
@@ -208,7 +208,7 @@ elif model_type == 'multimodal':
         "in_chans": 768,
         "depths": [1, 3, 1],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
+        "drop_path_rate": 0.15,
         "num_downsamples": 2,
     }
     wsi_feature_dims = [768, 1280] # [768, 1280, 768, 768], for TITAN, PRISM, GIGAPATH, CHIEF
@@ -253,9 +253,9 @@ model = dict(
     survival_method='discrete',  # or 'discrete'
     gen_forcing = False,
     num_survival_intervals=6, # (ignored for cox)
-    lambda_llm=1.0,
+    lambda_llm=5.0,
     lambda_reg=1.0,
-    lambda_srv=1.0,
+    lambda_srv=2.0,
     vision_conv_cfg=vision_conv_cfg,
     deepstack_visual_indexes=[1, 2, 3],
     deepstack_reverse_injection=True,

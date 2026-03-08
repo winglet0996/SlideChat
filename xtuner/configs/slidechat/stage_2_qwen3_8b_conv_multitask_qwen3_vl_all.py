@@ -51,7 +51,7 @@ if setting == 'lora':
     ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/epoch_1.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 8
+    max_epochs = 5
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -106,7 +106,7 @@ test_output_path = work_dir + 'test_results'
 by_epoch = True
 # interval = 250
 interval = 1
-save_total_limit = 5
+save_total_limit = 3
 
 # Evaluate the generation performance during the training
 evaluation_freq = 500  # More frequent evaluation for alignment debugging
@@ -199,16 +199,16 @@ if model_type == 'text_patch':
         "in_chans": 768,
         "depths": [3, 9, 3],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
+        "drop_path_rate": 0.15,
         "num_downsamples": 2,
     }
     wsi_feature_dims = None  # No WSI features
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [3, 9, 3],
+        "depths": [1, 3, 1],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.3,
+        "drop_path_rate": 0.15,
         "num_downsamples": 2,
     }
     wsi_feature_dims = [768, 1280] # [768, 1280, 768, 768], for TITAN, PRISM, GIGAPATH, CHIEF
@@ -253,9 +253,9 @@ model = dict(
     survival_method='discrete',  # or 'discrete'
     gen_forcing = False,
     num_survival_intervals=6, # (ignored for cox)
-    lambda_llm=1.0,
+    lambda_llm=5.0,
     lambda_reg=1.0,
-    lambda_srv=1.0,
+    lambda_srv=2.0,
     vision_conv_cfg=vision_conv_cfg,
     deepstack_visual_indexes=[1, 2, 3],
     deepstack_reverse_injection=True,
