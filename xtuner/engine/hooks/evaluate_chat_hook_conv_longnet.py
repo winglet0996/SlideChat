@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import GenerationConfig
 
-from xtuner.dataset.llava_conv_longnet import LLaVADataset_conv_longnet
+from xtuner.dataset.llava_dataset import LLaVADataset
 from xtuner.dataset.collate_fns import default_collate_fn, masked_collated_fn
 from xtuner.registry import BUILDER
 from xtuner.utils import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX)
@@ -22,7 +22,7 @@ from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 
 class EvaluateChatHook_conv_longnet(Hook):
     """
-    Elegant evaluation hook using LLaVADataset_conv_longnet for data loading
+    Elegant evaluation hook using LLaVADataset for data loading
     
     IMPORTANT: This hook is designed to work correctly in distributed (multi-GPU) environments.
     Key features for distributed evaluation:
@@ -124,10 +124,10 @@ class EvaluateChatHook_conv_longnet(Hook):
             return DefaultSampler(dataset, shuffle=False)
 
     def _create_eval_dataset(self, runner):
-        """Create evaluation dataset using LLaVADataset_conv_longnet"""
+        """Create evaluation dataset using LLaVADataset"""
         
         # Create evaluation dataset
-        self.eval_dataset = LLaVADataset_conv_longnet(
+        self.eval_dataset = LLaVADataset(
             image_folder=self.image_folder,
             image_path_list=self.image_path_list,
             per_image_length=self.per_image_length,

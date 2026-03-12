@@ -10,8 +10,7 @@ import torch.nn as nn
 from mmengine import print_log
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import load_state_dict
-from transformers.utils import (SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME,
-                                is_safetensors_available)
+from transformers.utils import (SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME)
 
 SUPPORT_MODELS = (
     'DeepseekV2ForCausalLM',

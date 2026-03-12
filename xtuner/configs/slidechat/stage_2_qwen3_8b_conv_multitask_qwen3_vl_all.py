@@ -13,13 +13,13 @@ from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText, Aut
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
-from xtuner.dataset import LLaVADataset_conv_longnet
+from xtuner.dataset import LLaVADataset
 from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
 from xtuner.dataset.samplers import CategoryProjectSampler
 from xtuner.engine.hooks import DatasetInfoHook #, EvaluateChatHook_conv_longnet, HFCheckpointHook
 from xtuner.engine.runner import TrainLoop
-from xtuner.model import LLaVAModel_conv
+from xtuner.model import LLaVAModel_conv_qwen3vl
 from xtuner.utils import PROMPT_TEMPLATE
 from xtuner.configs.slidechat.eval_samples import evaluation_images, evaluation_inputs, evaluation_targets
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
@@ -69,6 +69,7 @@ llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-V
 train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
 val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
 test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
+dataset_cache_dir = '/mnt/petrelfs/zhouxiao/project/TCGA/.cache/'
 # train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 # test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -106,7 +107,7 @@ test_output_path = work_dir + 'test_results'
 by_epoch = True
 # interval = 250
 interval = 1
-save_total_limit = 3
+save_total_limit = 4
 
 # Evaluate the generation performance during the training
 evaluation_freq = 500  # More frequent evaluation for alignment debugging
@@ -199,16 +200,16 @@ if model_type == 'text_patch':
         "in_chans": 768,
         "depths": [3, 9, 3],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.15,
+        "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
     wsi_feature_dims = None  # No WSI features
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [1, 3, 1],
+        "depths": [1, 1, 1],
         "dims": [768, 1024, 1536],
-        "drop_path_rate": 0.15,
+        "drop_path_rate": 0.3,
         "num_downsamples": 2,
     }
     wsi_feature_dims = [768, 1280] # [768, 1280, 768, 768], for TITAN, PRISM, GIGAPATH, CHIEF
@@ -216,7 +217,7 @@ else:
     raise ValueError(f"Unknown model_type: {model_type}. Options: 'text_patch', 'multimodal'")
 
 model = dict(
-    type=LLaVAModel_conv,
+    type=LLaVAModel_conv_qwen3vl,
     tokenizer=tokenizer,
     freeze_llm=freeze_llm,
     hidden_size=4096,
@@ -255,10 +256,10 @@ model = dict(
     num_survival_intervals=6, # (ignored for cox)
     lambda_llm=5.0,
     lambda_reg=1.0,
-    lambda_srv=2.0,
+    lambda_srv=3.0,
     vision_conv_cfg=vision_conv_cfg,
-    deepstack_visual_indexes=[1, 2, 3],
-    deepstack_reverse_injection=True,
+    deepstack_visual_indexes=[2, 4, 8],
+    deepstack_reverse_injection=False,
     wsi_feature_dims=wsi_feature_dims,
     head_scaling=[1, 1, 1]
     )
@@ -267,8 +268,9 @@ model = dict(
 #                      PART 3  Dataset & Dataloader                   #
 #######################################################################
 train_llava_dataset = dict(
-    type=LLaVADataset_conv_longnet,
+    type=LLaVADataset,
     data_path=train_data_path,
+    cache_dir=dataset_cache_dir,
     image_folder='',
     image_path_list=image_path_list,
     tokenizer=tokenizer,
@@ -289,8 +291,9 @@ train_dataloader = dict(
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
-    type=LLaVADataset_conv_longnet,
+    type=LLaVADataset,
     data_path=val_data_path,
+    cache_dir=dataset_cache_dir,
     image_folder='',
     image_path_list=image_path_list,
     tokenizer=tokenizer,
@@ -316,8 +319,9 @@ val_evaluator = dict(type=PathologyMetric,
             )
 
 test_llava_dataset = dict(
-    type=LLaVADataset_conv_longnet,
+    type=LLaVADataset,
     data_path=test_data_path,
+    cache_dir=dataset_cache_dir,
     image_folder='',
     image_path_list=image_path_list,
     tokenizer=tokenizer,

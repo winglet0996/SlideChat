@@ -96,13 +96,20 @@ def patch_qwen3_vl_deepstack():
                                    image_grid_thw=image_grid_thw,
                                    video_grid_thw=video_grid_thw, **kwargs)
 
+        prepared_cache_position = model_inputs.get('cache_position', cache_position)
+
         # On prefill (first step), restore our custom 3D position_ids if available.
         # Also compute and store rope_deltas on the inner Qwen3VLModel so that
         # continuation steps (cache_position[0] != 0) can compute correct positions.
         # Without this, the inner model's rope_deltas stays None (since the
         # `if position_ids is None:` block in Qwen3VLModel.forward is skipped),
         # causing a crash on the second generation step.
-        if cache_position is not None and cache_position[0] == 0 and incoming_position_ids is not None:
+        if (
+            prepared_cache_position is not None
+            and prepared_cache_position.numel() > 0
+            and prepared_cache_position[0] == 0
+            and incoming_position_ids is not None
+        ):
             if incoming_position_ids.dim() == 3:
                 model_inputs["position_ids"] = incoming_position_ids
 
@@ -541,7 +548,7 @@ def convert_state_dict_to_hf(state_dict: Dict[str, torch.Tensor],
     return new_state_dict
 
 
-class LLaVAModel_conv(BaseModel):
+class LLaVAModel_conv_qwen3vl(BaseModel):
     """
     Multi-modal LLaVA model with convolution-based vision processing and regression/survival prediction.
 
@@ -1014,7 +1021,9 @@ class LLaVAModel_conv(BaseModel):
     def _setup_lora(self, lora_config: Dict, use_activation_checkpointing: bool) -> None:
         """Setup LoRA configuration."""
         lora_config = self._build_from_cfg_or_module(lora_config)
-        self.llm = prepare_model_for_kbit_training(self.llm, use_activation_checkpointing)
+        uses_kbit = self._is_kbit_model(self.llm)
+        if uses_kbit:
+            self.llm = prepare_model_for_kbit_training(self.llm, use_activation_checkpointing)
 
         if lora_config.target_modules is None:
             # For Qwen3-VL, we must avoid targeting 'proj' which matches Conv3d in visual encoder.
@@ -1023,7 +1032,52 @@ class LLaVAModel_conv(BaseModel):
             target_model = getattr(target_model, 'language_model', target_model)
             lora_config.target_modules = find_all_linear_names(target_model)
 
-        self.llm = get_peft_model(self.llm, lora_config)
+        self.llm = self._get_peft_model_without_bnb_dispatch(
+            self.llm,
+            lora_config,
+            disable_bnb_dispatch=not uses_kbit,
+        )
+
+    @staticmethod
+    def _is_kbit_model(model: nn.Module) -> bool:
+        """Return True when the model is actually loaded with 4-bit or 8-bit quantization."""
+        model_config = getattr(model, 'config', None)
+        quantization_config = getattr(model_config, 'quantization_config', None)
+        quantization_method = getattr(model, 'quantization_method', None)
+        return bool(
+            getattr(model, 'is_loaded_in_4bit', False)
+            or getattr(model, 'is_loaded_in_8bit', False)
+            or quantization_config is not None
+            or quantization_method is not None
+        )
+
+    def _get_peft_model_without_bnb_dispatch(self,
+                                             model: nn.Module,
+                                             lora_config: Any,
+                                             disable_bnb_dispatch: bool = False) -> nn.Module:
+        """Build a PEFT LoRA model without touching bitsandbytes when k-bit is unused."""
+        if not disable_bnb_dispatch:
+            return get_peft_model(model, lora_config)
+
+        try:
+            import peft.import_utils as peft_import_utils
+            import peft.tuners.lora.model as peft_lora_model
+        except Exception:
+            return get_peft_model(model, lora_config)
+
+        patched_symbols = []
+        for module in (peft_import_utils, peft_lora_model):
+            for symbol in ('is_bnb_available', 'is_bnb_4bit_available'):
+                if hasattr(module, symbol):
+                    patched_symbols.append((module, symbol, getattr(module, symbol)))
+                    setattr(module, symbol, lambda: False)
+
+        try:
+            print_log('[LoRA] Detected non-quantized model; skip bitsandbytes PEFT dispatch.', 'current')
+            return get_peft_model(model, lora_config)
+        finally:
+            for module, symbol, original in patched_symbols:
+                setattr(module, symbol, original)
 
     def _freeze_llm_with_exceptions(self) -> None:
         """Freeze LLM parameters while keeping task-critical components trainable."""
@@ -1566,13 +1620,16 @@ class LLaVAModel_conv(BaseModel):
                         captured_logits.append(scores.detach().cpu())
                     return scores
 
+                gen_config = GenerationConfig.from_dict(self.generation_config.to_dict())
+                gen_config.return_dict_in_generate = True
+                gen_config.output_scores = True
+                if self.tokenizer.bos_token_id is not None:
+                    gen_config.bos_token_id = self.tokenizer.bos_token_id
+
                 gen_out = self.llm.generate(
                     **data,
-                    generation_config=self.generation_config,
+                    generation_config=gen_config,
                     stopping_criteria=self.stop_criteria,
-                    bos_token_id=self.tokenizer.bos_token_id,
-                    return_dict_in_generate=True,
-                    output_scores=True,
                     logits_processor=[capture_logits_processor]
                 )
 
@@ -1689,6 +1746,23 @@ class LLaVAModel_conv(BaseModel):
         B, Lp, H = prefix_inputs_embeds.shape
         Lg = generate_ids.size(1)
 
+        # When gen_forcing=False, always use explicit task token construction.
+        # This avoids relying on the last generated token's hidden state, which
+        # causes a train/infer distribution mismatch (heads were trained on
+        # special-token positions, not on arbitrary generated tokens).
+        if not self.gen_forcing:
+            return self._predict_tasks_from_prefix_tokens(
+                data_samples=data_samples,
+                has_regression=has_regression,
+                has_survival=has_survival,
+                prefix_inputs_embeds=prefix_inputs_embeds,
+                prefix_attention_mask=prefix_attention_mask,
+                prefix_position_ids=prefix_position_ids,
+                visual_pos_masks=visual_pos_masks,
+                deepstack_visual_embeds=deepstack_visual_embeds,
+                image_grid_thw=image_grid_thw,
+            )
+
         # Build embeddings for generated tokens
         with torch.no_grad():
             tok_emb = self.llm.get_input_embeddings()
@@ -1756,18 +1830,13 @@ class LLaVAModel_conv(BaseModel):
 
             outputs = self.llm(**llm_kwargs)
             hidden = outputs.hidden_states[-1]  # (B, Lp+Lg, H)
+            # hidden_states[-1] is already POST-RMSNorm (tied to last_hidden_state
+            # by @capture_outputs), no additional norm needed.
 
-            # Apply RMSNorm to hidden states - same as training path (compute_loss)
-            # hidden_states[-1] are PRE-normalization; the model applies RMSNorm before lm_head.
-            # Regression/survival heads were trained on normalized hidden states,
-            # so we must apply the same normalization at inference time.
-            norm = self._get_language_model_norm()
-            if norm is not None:
-                hidden = norm(hidden)
-            
-            # Compute last valid position for each sample (used when token not generated)
-            # This gives contextualized representation instead of raw token embedding
-            last_valid_pos = full_attention_mask.bool().sum(dim=1) - 1  # (B,)
+            # Correctly find the last attended position even with left-padding.
+            # sum()-1 is wrong when there are leading PAD tokens.
+            _seq_indices = torch.arange(full_attention_mask.size(1), device=device).unsqueeze(0)
+            last_valid_pos = (_seq_indices * full_attention_mask.bool().long()).max(dim=1).values  # (B,)
 
         # For each batch, locate generated special-token positions and predict
         for b in range(B):
@@ -1781,10 +1850,6 @@ class LLaVAModel_conv(BaseModel):
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                elif not self.gen_forcing:
-                    # gen_forcing=False: Token not generated, use last valid hidden state
-                    # (contains full context info, unlike raw token embedding)
-                    embed = hidden[b, last_valid_pos[b]]  # (H,)
                 
                 if embed is not None:
                     fused = self._fuse_token_with_vision(embed, b, 'regression')  # Shape depends on mode
@@ -1805,10 +1870,6 @@ class LLaVAModel_conv(BaseModel):
                     pos_full = int(Lp + pos_in_gen[-1].item())
                     if pos_full < hidden.size(1):
                         embed = hidden[b, pos_full]  # (H,)
-                elif not self.gen_forcing:
-                    # gen_forcing=False: Token not generated, use last valid hidden state
-                    # (contains full context info, unlike raw token embedding)
-                    embed = hidden[b, last_valid_pos[b]]  # (H,)
                 
                 if embed is None:
                     continue
@@ -1856,6 +1917,211 @@ class LLaVAModel_conv(BaseModel):
                 data_samples[b]["risk_score"] = pred_dict["risk_score"]
                 prev = data_samples[b].get("prediction_text", "")
                 data_samples[b]["prediction_text"] = f"{prev} {text_suffix}".strip()
+        return data_samples
+
+    def _predict_tasks_from_prefix_tokens(
+            self,
+            data_samples: List[Dict[str, Any]],
+            has_regression: List[bool],
+            has_survival: List[bool],
+            prefix_inputs_embeds: torch.Tensor,
+            prefix_attention_mask: torch.Tensor,
+            prefix_position_ids: Optional[torch.Tensor] = None,
+            visual_pos_masks: Optional[torch.Tensor] = None,
+            deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
+            image_grid_thw: Optional[torch.Tensor] = None) -> List[Dict[str, Any]]:
+        """Append task tokens to the prefix and predict from those hidden states.
+
+        When gen_forcing=False, instead of using the last generated token's hidden
+        state (distribution mismatch), we explicitly append <REG>/<SRV> tokens to
+        the prefix and run one forward pass, reading hidden states at those positions.
+        This matches the training setup exactly (heads trained on special-token positions).
+
+        Handles Qwen3-VL specifics:
+          - 3-D position IDs  (3, B, L)
+          - visual_pos_masks / deepstack_visual_embeds / image_grid_thw pass-through
+          - RMSNorm application on hidden states
+          - Left-padding-aware prefix slicing (predict mode uses left-padding)
+        """
+        device = prefix_inputs_embeds.device
+        dtype = prefix_inputs_embeds.dtype
+        tok_emb = self.llm.get_input_embeddings()
+        embed_list = []
+        attn_list = []
+        pos_list = []
+        vmask_list = []
+        reg_positions = []
+        srv_positions = []
+
+        if prefix_position_ids is not None:
+            prefix_position_ids = prefix_position_ids.to(device)
+        if visual_pos_masks is not None:
+            visual_pos_masks = visual_pos_masks.to(device)
+
+        for b_idx in range(prefix_inputs_embeds.size(0)):
+            valid_len = int(prefix_attention_mask[b_idx].bool().sum().item())
+            if valid_len == 0:
+                embed_list.append(torch.zeros(0, prefix_inputs_embeds.size(-1), device=device, dtype=dtype))
+                attn_list.append(torch.zeros(0, device=device, dtype=torch.bool))
+                pos_list.append(None)
+                vmask_list.append(None)
+                reg_positions.append(None)
+                srv_positions.append(None)
+                continue
+
+            # NOTE: predict mode uses left-padding, so valid tokens are at the END.
+            # Use [-valid_len:] to correctly extract the attended tokens.
+            cur_embeds = prefix_inputs_embeds[b_idx, -valid_len:]
+            cur_attn = prefix_attention_mask[b_idx, -valid_len:].bool()
+
+            cur_pos = None
+            if prefix_position_ids is not None:
+                if prefix_position_ids.dim() == 3:
+                    # (3, B, L) -> (3, valid_len)
+                    cur_pos = prefix_position_ids[:, b_idx, -valid_len:]
+                else:
+                    cur_pos = prefix_position_ids[b_idx, -valid_len:]
+
+            cur_vmask = None
+            if visual_pos_masks is not None:
+                cur_vmask = visual_pos_masks[b_idx, -valid_len:].bool()
+
+            suffix_ids = []
+            reg_pos = None
+            srv_pos = None
+            if has_regression[b_idx] and self.enable_regression and self.reg_token_id is not None:
+                reg_pos = valid_len + len(suffix_ids)
+                suffix_ids.append(self.reg_token_id)
+            if has_survival[b_idx] and self.enable_survival and self.srv_token_id is not None:
+                srv_pos = valid_len + len(suffix_ids)
+                suffix_ids.append(self.srv_token_id)
+
+            if suffix_ids:
+                suffix_tensor = torch.tensor(suffix_ids, device=device, dtype=torch.long)
+                suffix_embeds = tok_emb(suffix_tensor).to(dtype=dtype)
+                cur_embeds = torch.cat([cur_embeds, suffix_embeds], dim=0)
+                cur_attn = torch.cat([
+                    cur_attn,
+                    torch.ones(len(suffix_ids), device=device, dtype=torch.bool)
+                ], dim=0)
+
+                # Extend position IDs
+                if cur_pos is not None:
+                    extra = torch.arange(1, len(suffix_ids) + 1, device=device, dtype=cur_pos.dtype)
+                    if cur_pos.dim() == 2:
+                        # (3, valid_len) -> (3, valid_len + num_suffix)
+                        last_pos = cur_pos[:, -1:]  # (3, 1)
+                        suffix_pos = last_pos + extra.unsqueeze(0)  # (3, num_suffix)
+                        cur_pos = torch.cat([cur_pos, suffix_pos], dim=1)
+                    else:
+                        last_p = int(cur_pos[-1].item()) if cur_pos.numel() > 0 else -1
+                        cur_pos = torch.cat([
+                            cur_pos,
+                            torch.arange(last_p + 1, last_p + 1 + len(suffix_ids),
+                                         device=device, dtype=cur_pos.dtype)
+                        ], dim=0)
+
+                # Extend visual mask: task tokens are non-visual
+                if cur_vmask is not None:
+                    cur_vmask = torch.cat([
+                        cur_vmask,
+                        torch.zeros(len(suffix_ids), device=device, dtype=torch.bool)
+                    ], dim=0)
+
+            embed_list.append(cur_embeds)
+            attn_list.append(cur_attn)
+            pos_list.append(cur_pos)
+            vmask_list.append(cur_vmask)
+            reg_positions.append(reg_pos)
+            srv_positions.append(srv_pos)
+
+        max_len = max(x.size(0) for x in embed_list)
+        batch_size = len(embed_list)
+        hidden_dim = embed_list[0].size(-1)
+        inputs_embeds = torch.zeros((batch_size, max_len, hidden_dim), device=device, dtype=dtype)
+        attention_mask = torch.zeros((batch_size, max_len), device=device, dtype=torch.bool)
+
+        # Build position_ids tensor (right-padded with zeros)
+        has_3d_pos = pos_list[0] is not None and pos_list[0].dim() == 2
+        position_ids = None
+        if pos_list[0] is not None:
+            if has_3d_pos:
+                position_ids = torch.zeros((3, batch_size, max_len), device=device,
+                                           dtype=pos_list[0].dtype)
+            else:
+                position_ids = torch.zeros((batch_size, max_len), device=device,
+                                           dtype=pos_list[0].dtype)
+
+        full_vmask = None
+        if vmask_list[0] is not None:
+            full_vmask = torch.zeros((batch_size, max_len), device=device, dtype=torch.bool)
+
+        for b_idx, (emb, attn, pids, vmask) in enumerate(
+                zip(embed_list, attn_list, pos_list, vmask_list)):
+            cur_len = emb.size(0)
+            inputs_embeds[b_idx, :cur_len] = emb
+            attention_mask[b_idx, :cur_len] = attn
+            if position_ids is not None and pids is not None:
+                if has_3d_pos:
+                    position_ids[:, b_idx, :cur_len] = pids
+                else:
+                    position_ids[b_idx, :cur_len] = pids
+            if full_vmask is not None and vmask is not None:
+                full_vmask[b_idx, :cur_len] = vmask
+
+        with torch.no_grad():
+            llm_kwargs = {
+                'inputs_embeds': inputs_embeds,
+                'attention_mask': attention_mask,
+                'position_ids': position_ids,
+                'output_hidden_states': True,
+                'return_dict': True,
+            }
+            if full_vmask is not None:
+                llm_kwargs['visual_pos_masks'] = full_vmask
+            if deepstack_visual_embeds is not None:
+                llm_kwargs['deepstack_visual_embeds'] = deepstack_visual_embeds
+            if image_grid_thw is not None:
+                llm_kwargs['image_grid_thw'] = image_grid_thw
+
+            outputs = self.llm(**llm_kwargs)
+            hidden = outputs.hidden_states[-1]
+            # hidden_states[-1] is already POST-RMSNorm (tied to last_hidden_state
+            # by @capture_outputs), no additional norm needed.
+
+        for b_idx in range(batch_size):
+            if reg_positions[b_idx] is not None and self.enable_regression:
+                reg_embed = hidden[b_idx, reg_positions[b_idx]].unsqueeze(0)
+                reg_embed = reg_embed.to(dtype=next(self.regression_head.parameters()).dtype)
+                pred_out = self.regression_head(reg_embed)
+                pred = float(pred_out.squeeze(-1).item())
+                data_samples[b_idx]['regression_prediction'] = pred
+                prev = data_samples[b_idx].get('prediction_text', '')
+                data_samples[b_idx]['prediction_text'] = f"{prev} [Regression: {pred:.4f}]".strip()
+
+            if srv_positions[b_idx] is not None and self.enable_survival:
+                srv_embed = hidden[b_idx, srv_positions[b_idx]].unsqueeze(0)
+                srv_embed = srv_embed.to(dtype=next(self.survival_head.parameters()).dtype)
+                pred_dict = {}
+                if self.survival_method == 'discrete':
+                    survival_probs_out = self.survival_head.predict_survival_probs(srv_embed)
+                    risk_score_out = self.survival_head.predict_risk_scores(srv_embed)
+                    median_time_out = self.survival_head.predict_median_survival_time(srv_embed)
+                    pred_dict = {
+                        'method': 'discrete',
+                        'risk_score': float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None,
+                        'survival_probs': survival_probs_out.squeeze(0).cpu().tolist() if survival_probs_out is not None else None,
+                        'median_survival_time': float(median_time_out.squeeze(0).item()) if median_time_out is not None else None,
+                    }
+                else:
+                    risk_score_out = self.survival_head.predict_risk_scores(srv_embed)
+                    pred_dict = {
+                        'method': 'cox',
+                        'risk_score': float(risk_score_out.squeeze(0).item()) if risk_score_out is not None else None,
+                    }
+                data_samples[b_idx]['survival_prediction'] = pred_dict
+                data_samples[b_idx]['risk_score'] = pred_dict['risk_score']
+
         return data_samples
 
     def _fuse_token_with_vision(self, token_embed: torch.Tensor, b: int, task_type: str = 'survival') -> torch.Tensor:
@@ -1928,15 +2194,11 @@ class LLaVAModel_conv(BaseModel):
         else:
             lm_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
-        # For regression/survival heads, we also need to apply RMSNorm to be consistent
-        # with how the lm_head receives hidden states. This ensures the task heads 
-        # receive properly normalized features.
-        norm = self._get_language_model_norm()
-        if norm is not None:
-            self._last_hidden_state = norm(last_hidden)
-        else:
-            # Fallback for models without this structure
-            self._last_hidden_state = last_hidden
+        # With transformers >=5.x, @capture_outputs(tie_last_hidden_states=True)
+        # makes outputs.hidden_states[-1] identical to outputs.last_hidden_state,
+        # which is ALREADY POST-RMSNorm.  Applying norm() again would be double
+        # normalization and destabilise task-head training.
+        self._last_hidden_state = last_hidden
 
         # One-time token debug
         if not hasattr(self, '_logged_token_stats'):
