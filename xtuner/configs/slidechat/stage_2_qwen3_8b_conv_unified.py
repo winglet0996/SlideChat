@@ -14,7 +14,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig, CLIPImageProcessor,
                           CLIPVisionModel)
 from peft import LoraConfig
-from xtuner.dataset import LLaVADataset_conv_longnet
+from xtuner.dataset import LLaVADataset
 from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
 from xtuner.engine.hooks import DatasetInfoHook
@@ -46,12 +46,12 @@ if setting == 'lora':
         bias='none',
         task_type='CAUSAL_LM')
     save_best_metrics = None
-    # ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/epoch_1.pth'
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment_1down/epoch_1.pth'
+    ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment/epoch_1.pth'
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_qwen3_8B_lm_unified_multimodal_alignment_1down/epoch_1.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 8
+    max_epochs = 5
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -92,19 +92,20 @@ resume = False
 #
 # The model will automatically skip unused modalities based on config.
 # =====================================================================
-model_type = 'multimodal'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
+model_type = 'text_only'  # Options: 'text_only', 'text_wsi', 'text_patch', 'multimodal'
 model_size = '8B'
-llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-{model_size}'
+llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3-{model_size}'
 
 # Data paths (same full-modal data for all modes)
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
+train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideInstruct_train_aligned.json'
+val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideBench_test_aligned.json'
+test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideBench_test_aligned.json'
+dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 
 # Output paths
 ckpt_out_path = None
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}_1down'
-vis_name = f'qwen3_{model_size}_lm_multitask_all_{model_type}_{setting}_1down'
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}_mcqa_debug'
+vis_name = f'qwen3_{model_size}_lm_mcqa_{model_type}_{setting}'
 # vis_name = None
 
 visualizer = None if vis_name is None else dict(
@@ -113,7 +114,7 @@ visualizer = None if vis_name is None else dict(
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='pathoverse_multitask_all',
+                project='slidechat_mcqa_debug',
                 name=vis_name
             )
         )
@@ -127,7 +128,7 @@ test_output_path = work_dir + '/test_results'
 by_epoch = True
 # interval = 250
 interval = 1
-save_total_limit = 5
+save_total_limit = 1
 
 # Evaluation frequency
 evaluation_freq = 500
@@ -233,10 +234,10 @@ elif model_type == 'text_patch':
 elif model_type == 'multimodal':
     vision_conv_cfg = {
         "in_chans": 768,
-        "depths": [1, 3],
-        "dims": [768, 1024],
+        "depths": [1, 3, 1],
+        "dims": [768, 1024, 1536],
         "drop_path_rate": 0.15,
-        "num_downsamples": 1,
+        "num_downsamples": 2,
     }
     wsi_feature_dims = [768, 1280]
 else:
@@ -277,8 +278,9 @@ model = dict(
 #                      PART 3  Dataset & Dataloader                   #
 #######################################################################
 train_llava_dataset = dict(
-    type=LLaVADataset_conv_longnet,
+    type=LLaVADataset,
     data_path=train_data_path,
+    cache_dir=dataset_cache_dir,
     image_folder='',
     image_path_list=image_path_list,
     tokenizer=tokenizer,
@@ -298,8 +300,9 @@ train_dataloader = dict(
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
-    type=LLaVADataset_conv_longnet,
+    type=LLaVADataset,
     data_path=val_data_path,
+    cache_dir=dataset_cache_dir,
     image_folder='',
     image_path_list=image_path_list,
     tokenizer=tokenizer,
@@ -324,8 +327,9 @@ val_evaluator = dict(type=PathologyMetric,
             output_dir=val_output_path)
 
 test_llava_dataset = dict(
-    type=LLaVADataset_conv_longnet,
+    type=LLaVADataset,
     data_path=test_data_path,
+    cache_dir=dataset_cache_dir,
     image_folder='',
     image_path_list=image_path_list,
     tokenizer=tokenizer,

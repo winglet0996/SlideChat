@@ -53,8 +53,11 @@ xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_3mut.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_all copy.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_all.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_all_alignment.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_all_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_allmut.py
-xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_srv.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_srv_cp.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_no_knowledge.py
@@ -63,6 +66,8 @@ xtuner/configs/slidechat/stage_2_qwen3_8b_conv_qformer.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_qformer_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_unified.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_unified_alignment.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_unified_test.py
 xtuner/dataset/__init__.py
 xtuner/dataset/concat_dataset.py
 xtuner/dataset/huggingface.py
@@ -70,6 +75,7 @@ xtuner/dataset/intern_repo.py
 xtuner/dataset/internvl_dataset.py
 xtuner/dataset/json_dataset.py
 xtuner/dataset/llava_conv_longnet.py
+xtuner/dataset/llava_dataset.py
 xtuner/dataset/llava_longnet.py
 xtuner/dataset/modelscope.py
 xtuner/dataset/moss_sft.py

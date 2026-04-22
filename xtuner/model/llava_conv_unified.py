@@ -878,12 +878,59 @@ class LLaVAModel_conv_unified(BaseModel):
     def _setup_lora(self, lora_config: Dict, use_activation_checkpointing: bool) -> None:
         """Setup LoRA configuration."""
         lora_config = self._build_from_cfg_or_module(lora_config)
-        self.llm = prepare_model_for_kbit_training(self.llm, use_activation_checkpointing)
+        uses_kbit = self._is_kbit_model(self.llm)
+        if uses_kbit:
+            self.llm = prepare_model_for_kbit_training(self.llm, use_activation_checkpointing)
 
         if lora_config.target_modules is None:
             lora_config.target_modules = find_all_linear_names(self.llm)
 
-        self.llm = get_peft_model(self.llm, lora_config)
+        self.llm = self._get_peft_model_without_bnb_dispatch(
+            self.llm,
+            lora_config,
+            disable_bnb_dispatch=not uses_kbit,
+        )
+
+    @staticmethod
+    def _is_kbit_model(model: nn.Module) -> bool:
+        """Return True when the model is actually loaded with 4-bit or 8-bit quantization."""
+        model_config = getattr(model, 'config', None)
+        quantization_config = getattr(model_config, 'quantization_config', None)
+        quantization_method = getattr(model, 'quantization_method', None)
+        return bool(
+            getattr(model, 'is_loaded_in_4bit', False)
+            or getattr(model, 'is_loaded_in_8bit', False)
+            or quantization_config is not None
+            or quantization_method is not None
+        )
+
+    def _get_peft_model_without_bnb_dispatch(self,
+                                             model: nn.Module,
+                                             lora_config: Any,
+                                             disable_bnb_dispatch: bool = False) -> nn.Module:
+        """Build a PEFT LoRA model without touching bitsandbytes when k-bit is unused."""
+        if not disable_bnb_dispatch:
+            return get_peft_model(model, lora_config)
+
+        try:
+            import peft.import_utils as peft_import_utils
+            import peft.tuners.lora.model as peft_lora_model
+        except Exception:
+            return get_peft_model(model, lora_config)
+
+        patched_symbols = []
+        for module in (peft_import_utils, peft_lora_model):
+            for symbol in ('is_bnb_available', 'is_bnb_4bit_available'):
+                if hasattr(module, symbol):
+                    patched_symbols.append((module, symbol, getattr(module, symbol)))
+                    setattr(module, symbol, lambda: False)
+
+        try:
+            print_log('[LoRA] Detected non-quantized model; skip bitsandbytes PEFT dispatch.', 'current')
+            return get_peft_model(model, lora_config)
+        finally:
+            for module, symbol, original in patched_symbols:
+                setattr(module, symbol, original)
 
     def _freeze_llm_with_exceptions(self) -> None:
         """Freeze LLM parameters while keeping task-critical components trainable."""
@@ -1406,8 +1453,6 @@ class LLaVAModel_conv_unified(BaseModel):
         Lg = generate_ids.size(1)
 
         with torch.no_grad():
-            norm = self._get_language_model_norm()
-
             if not self.gen_forcing:
                 # Fast path: prefix-only forward – much cheaper than
                 # re-processing prefix + all generated tokens.
@@ -1447,10 +1492,6 @@ class LLaVAModel_conv_unified(BaseModel):
                                output_hidden_states=True,
                                return_dict=True)
             hidden = outputs.hidden_states[-1]
-
-            # Apply RMSNorm – same as training path (compute_loss)
-            if norm is not None:
-                hidden = norm(hidden)
 
         for b in range(B):
             # Regression
@@ -1597,15 +1638,10 @@ class LLaVAModel_conv_unified(BaseModel):
         else:
             lm_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
+        # Keep the exact hidden-state normalization behavior produced by the model.
+        # Avoid applying an additional final norm here to prevent double normalization
+        # under transformer variants where hidden_states[-1] is already post-norm.
         self._last_hidden_state = last_hidden
-
-        # For regression/survival heads, apply final normalization to be consistent 
-        # with how the lm_head receives hidden states.
-        norm = self._get_language_model_norm()
-        if norm is not None:
-            self._last_hidden_state = norm(last_hidden)
-        else:
-            self._last_hidden_state = last_hidden
 
         # Debug logging
         if not hasattr(self, '_logged_token_stats'):

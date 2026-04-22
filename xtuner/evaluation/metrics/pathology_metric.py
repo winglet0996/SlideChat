@@ -182,7 +182,13 @@ class PathologyMetric(BaseMetric):
         """Determine task type using explicit model fields and category."""
         category = metadata.get('category', '').lower()
         
-        # 0. Check category first for explicit hints (most reliable for mixed tasks)
+        # 1. Check for MCQA structural markers in input or target first, 
+        # because category might contain words like 'diagnosis' even for MCQA tasks (e.g. slidebench::Diagnosis).
+        target_str = metadata.get('target_str', '') or ""
+        if '<CHOICES>' in input_str or self._extract_mcqa_choice(target_str):
+            return 'mcqa'
+
+        # 2. Check category for explicit hints
         if 'survival' in category:
             return 'survival'
         if 'regression' in category:
@@ -192,12 +198,7 @@ class PathologyMetric(BaseMetric):
         if any(kw in category for kw in ['text', 'caption', 'report', 'diagnosis', 'generation']):
             return 'text'
 
-        # 1. Check for MCQA structural markers in input or target
-        target_str = metadata.get('target_str', '') or ""
-        if '<CHOICES>' in input_str or self._extract_mcqa_choice(target_str):
-            return 'mcqa'
-
-        # 2. Fallback to model fields if category is missing/uninformative
+        # 3. Fallback to model fields if category is missing/uninformative
         # If both are present (gen_forcing=False), we prioritize regression 
         # because survival is often present as a background field in TCGA datasets.
         if 'regression_prediction' in sample:

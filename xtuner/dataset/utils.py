@@ -452,6 +452,7 @@ def load_wsi_feature(wsi_file, max_patch_num, transform=None):
         if total_patches >= max_patch_num:
             indices = np.linspace(0, total_patches - 1, max_patch_num, dtype=int)
             features = features[indices]
+            coords = coords[indices]
     
     # do padding and random crop
     sample = (features, coords, patch_size)

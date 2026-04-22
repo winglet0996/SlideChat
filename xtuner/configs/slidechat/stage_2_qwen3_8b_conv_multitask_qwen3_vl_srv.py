@@ -42,13 +42,13 @@ if setting == 'lora':
         type=LoraConfig,
         r=64,
         lora_alpha=64,
-        lora_dropout=0.2,
+        lora_dropout=0.1,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/epoch_1.pth'
+    ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment_srv/epoch_1.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 5
@@ -66,9 +66,9 @@ model_type = 'multimodal'  # Options: 'text_patch', 'multimodal'
 model_size = '8B'
 
 llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
-train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
-val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
-test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
+train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_survival_os.json'
+val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
+test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
@@ -81,7 +81,7 @@ dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 # ckpt_out_path = 's3://zhaoweike/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}_srv/'
 # vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
 vis_name = None
 
@@ -105,12 +105,12 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = True
-# interval = 250
-interval = 1
-save_total_limit = 4
+interval = 250
+# interval = 1
+save_total_limit = 1
 
 # Evaluate the generation performance during the training
-evaluation_freq = 500  # More frequent evaluation for alignment debugging
+evaluation_freq = 123  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -170,7 +170,7 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 16
+batch_size = 8
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = AdamW
@@ -254,11 +254,11 @@ model = dict(
     survival_method='discrete',  # or 'discrete'
     gen_forcing = False,
     num_survival_intervals=6, # (ignored for cox)
-    lambda_llm=5.0,
+    lambda_llm=1.0,
     lambda_reg=1.0,
-    lambda_srv=3.0,
+    lambda_srv=1.0,
     vision_conv_cfg=vision_conv_cfg,
-    deepstack_visual_indexes=[2, 4, 8],
+    deepstack_visual_indexes=[1, 2, 3],
     deepstack_reverse_injection=False,
     wsi_feature_dims=wsi_feature_dims,
     head_scaling=[1, 1, 1]
@@ -434,7 +434,7 @@ log_level = 'INFO'
 load_from = ckpt_path
  
 # Defaults to use random seed and disable `deterministic`
-randomness = dict(seed=None, deterministic=False)
+randomness = dict(seed=42, deterministic=False)
 
 # set log processor
 log_processor = dict(by_epoch=False)

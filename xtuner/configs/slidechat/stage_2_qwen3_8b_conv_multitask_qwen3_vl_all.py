@@ -34,7 +34,7 @@ if setting == 'alignment':
     freeze_llm = True
     lr = 2e-5  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
     max_epochs = 1
     save_best_metrics = None
 if setting == 'lora':
@@ -48,7 +48,7 @@ if setting == 'lora':
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/epoch_1.pth'
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_all_qwen3_8B_vl_multimodal_alignment/epoch_1.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 5
@@ -57,7 +57,7 @@ if setting == 'full_param':
     freeze_llm = False
     lr = 1e-5
     save_best_metrics = ['eval/reg_overall_rmse']
-    ckpt_path = '/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
 resume = False
@@ -65,25 +65,25 @@ resume = False
 model_type = 'multimodal'  # Options: 'text_patch', 'multimodal'
 model_size = '8B'
 
-llm_name_or_path = f'/mnt/petrelfs/zhouxiao/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
-train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all.json'
-val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_20000.json'
-test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all.json'
-dataset_cache_dir = '/mnt/petrelfs/zhouxiao/project/TCGA/.cache/'
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
+llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
+train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all_25000.json'
+val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_all_25000.json'
+test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_all_25000.json'
+dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
+# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
+# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
+# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
 
-# train_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_train.json'
-# val_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
-# test_data_path = '/mnt/petrelfs/zhouxiao/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_train.json'
+# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
 
-# ckpt_out_path = 's3://zhouxiao/ckpt'
+# ckpt_out_path = 's3://zhaoweike/ckpt'
 ckpt_out_path = None
 
-work_dir = f'/mnt/petrelfs/zhouxiao/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
-vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
-# vis_name = None
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_all_qwen3_{model_size}_vl_{model_type}_{setting}/'
+# vis_name = f'qwen3_{model_size}_vl_multitask_all_{model_type}_{setting}'
+vis_name = None
 
 
 # set visualizer
@@ -105,12 +105,12 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = True
-# interval = 250
-interval = 1
+interval = 250
+# interval = 1
 save_total_limit = 4
 
 # Evaluate the generation performance during the training
-evaluation_freq = 500  # More frequent evaluation for alignment debugging
+evaluation_freq = 256  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -254,11 +254,11 @@ model = dict(
     survival_method='discrete',  # or 'discrete'
     gen_forcing = False,
     num_survival_intervals=6, # (ignored for cox)
-    lambda_llm=5.0,
+    lambda_llm=1.0,
     lambda_reg=1.0,
-    lambda_srv=3.0,
+    lambda_srv=1.0,
     vision_conv_cfg=vision_conv_cfg,
-    deepstack_visual_indexes=[2, 4, 8],
+    deepstack_visual_indexes=[1, 2, 3],
     deepstack_reverse_injection=False,
     wsi_feature_dims=wsi_feature_dims,
     head_scaling=[1, 1, 1]
