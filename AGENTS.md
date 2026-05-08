@@ -1,5 +1,6 @@
 # usage
 - The training of this project is launched with slurm by `sbatch run_xtuner_train_conv_multi_gpu.sh`.
+- Use `/mnt/petrelfs/zhouxiao/anaconda3/envs/slidechat/bin/python` for project Python commands and tests.
 
 # xtuner architecture
 - xtuner is a Python config/registry style based LLM/VLM finetuning framework.
