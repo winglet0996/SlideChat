@@ -45,6 +45,8 @@ def masked_collated_fn(instances: Sequence[Dict],
     if has_image:
         features = []
         image_batch_indices = []  # map each image to its sample index
+        feature_shapes = []  # original (H, W) per image before batch padding
+        feature_paths = []  # source path aligned with each flattened feature
     
     # WSI features collection
     if has_wsi_features:
@@ -81,11 +83,24 @@ def masked_collated_fn(instances: Sequence[Dict],
         if has_image:
             # Handle features
             if isinstance(example['features'], list):
+                image_files = example.get('image_file', None)
+                if isinstance(image_files, (list, tuple)):
+                    image_files = list(image_files)
+                elif image_files is None:
+                    image_files = []
+                else:
+                    image_files = [image_files]
+                if len(image_files) < len(example['features']):
+                    image_files.extend([None] * (len(example['features']) - len(image_files)))
+                feature_shapes.extend([(f.shape[1], f.shape[2]) for f in example['features']])
                 features.extend(example['features'])
                 image_batch_indices.extend([b_idx] * len(example['features']))
+                feature_paths.extend(image_files[:len(example['features'])])
             else:
+                feature_shapes.append((example['features'].shape[1], example['features'].shape[2]))
                 features.append(example['features'])
                 image_batch_indices.append(b_idx)
+                feature_paths.append(example.get('image_file', None))
         
         # Handle WSI features
         if has_wsi_features:
@@ -146,6 +161,13 @@ def masked_collated_fn(instances: Sequence[Dict],
             'labels': labels
         }
 
+    data_dict['category'] = [
+        inst.get('category', None) for inst in instances
+    ]
+    data_dict['project'] = [
+        inst.get('project', None) for inst in instances
+    ]
+
     if has_image:
         # Pad features to the max size in the batch
         max_h = max(f.shape[1] for f in features)
@@ -164,18 +186,15 @@ def masked_collated_fn(instances: Sequence[Dict],
         data_dict['labels_text'] = [
             inst.get('conversations', [])[-1].get('value', '') for inst in instances
         ]
-        data_dict['category'] = [
-            inst.get('category', None) for inst in instances
-        ]
         data_dict['image_file'] = [
             inst.get('image_file', None) for inst in instances
-        ]
-        data_dict['project'] = [
-            inst.get('project', None) for inst in instances
         ]
         # Add mapping from image to sample index
         data_dict['image_batch_indices'] = torch.as_tensor(
             image_batch_indices, dtype=torch.long)
+        data_dict['feature_shapes'] = torch.as_tensor(
+            feature_shapes, dtype=torch.long)
+        data_dict['feature_paths'] = feature_paths
 
     # Add WSI features to data_dict
     # WSI features are kept as a list of lists (not stacked) since different sources may have different dims

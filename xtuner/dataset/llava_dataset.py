@@ -105,7 +105,8 @@ def _build_cache_signature(data_path,
                            max_length,
                            per_image_length,
                            max_patch_num,
-                           input_ids_with_output):
+                           input_ids_with_output,
+                           text_only):
     return {
         'cache_version': DATASET_CACHE_VERSION,
         'data_path': _path_signature(data_path),
@@ -117,6 +118,7 @@ def _build_cache_signature(data_path,
         'per_image_length': per_image_length,
         'max_patch_num': max_patch_num,
         'input_ids_with_output': input_ids_with_output,
+        'text_only': text_only,
         'processing_sources': [
             _path_signature(__file__),
             _path_signature(getattr(huggingface_module, '__file__', None)),
@@ -169,13 +171,19 @@ class LLaVADataset(Dataset):
                  mode=None,
                  max_patch_num=None,
                  input_ids_with_output=True,
-                 crop_size=96):
+                 crop_size=96,
+                 text_only=False,
+                 load_patch_features=True,
+                 load_wsi_features=True):
         super().__init__()
 
         self.max_patch_num = max_patch_num
         self.per_image_length = per_image_length
         self.mode = mode
         self.crop_size = crop_size
+        self.text_only = text_only
+        self.load_patch_features = load_patch_features
+        self.load_wsi_features = load_wsi_features
         if max_patch_num is None:
             if mode == 'train':
                 if self.crop_size is not None:
@@ -253,7 +261,8 @@ class LLaVADataset(Dataset):
                 max_length=max_length,
                 per_image_length=self.per_image_length,
                 max_patch_num=self.max_patch_num,
-                input_ids_with_output=input_ids_with_output)
+                input_ids_with_output=input_ids_with_output,
+                text_only=self.text_only)
             cache_key = hashlib.sha256(
                 json.dumps(
                     cache_signature,
@@ -380,7 +389,7 @@ class LLaVADataset(Dataset):
             max_dataset_length=max_dataset_length,
             remove_unused_columns=False,
             pack_to_max_length=False,
-            with_image_token=True,
+            with_image_token=not self.text_only,
             per_image_length=self.per_image_length,
             max_patch_num=self.max_patch_num,
             input_ids_with_output=input_ids_with_output,
@@ -410,21 +419,30 @@ class LLaVADataset(Dataset):
 
     def __getitem__(self, index):
         data_dict = self.text_data[index].copy()
+        if self.text_only:
+            data_dict.pop('image_file', None)
+            data_dict.pop('features', None)
+            return data_dict
         
         # 1. 加载 Patch 图像/特征
         images = data_dict.get('image')
-        if images:
+        if self.load_patch_features and images:
             image_list = [images] if isinstance(images, str) else images
             res_list = [load_wsi_feature(f, self.max_patch_num, self.transform) if f.endswith('.h5') 
                         else load_image(f) for f in image_list]
 
             data_dict['features'] = res_list
             data_dict['image_file'] = image_list
+        else:
+            data_dict.pop('features', None)
+            data_dict.pop('image_file', None)
 
         # 2. 加载 WSI 全局特征
         wsi_paths = data_dict.get('wsi_features')
-        if wsi_paths:
+        if self.load_wsi_features and wsi_paths:
             wsi_list = [wsi_paths] if isinstance(wsi_paths, str) else wsi_paths
             data_dict['wsi_features'] = load_wsi_global_features(wsi_list)
+        else:
+            data_dict.pop('wsi_features', None)
             
         return data_dict

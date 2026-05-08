@@ -96,43 +96,58 @@ model_type = 'text_only'  # Options: 'text_only', 'text_wsi', 'text_patch', 'mul
 model_size = '8B'
 llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3-{model_size}'
 
-# Data paths (same full-modal data for all modes)
-train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideInstruct_train_aligned.json'
-val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideBench_test_aligned.json'
-test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideBench_test_aligned.json'
-dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
+# exp = 'noctx_notrt_xena_noaug-r1'
+exp = 'ctx_notrt_xena_aug-d0.5-r2'
+# exp = 'ctx_notrt_xena_aug-d0.25-r1'
+# exp = 'ctx_notrt_xena_aug-d0.75-r4'
+# exp = 'ctx_trt_landmark_aug-d0.5-r2'
 
-# Output paths
+llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3-VL-{model_size}-Instruct'
+train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/train.json'
+val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
+test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
+dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
+# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_debug_train.json'
+# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
+# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_debug_test.json'
+
+# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_train/supercategories/mcqa_mutation_train.json'
+# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/baseline/tcga_test/supercategories/mcqa_mutation_test.json'
+
+# ckpt_out_path = 's3://zhaoweike/ckpt'
 ckpt_out_path = None
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_qwen3_{model_size}_lm_unified_{model_type}_{setting}_mcqa_debug'
-vis_name = f'qwen3_{model_size}_lm_mcqa_{model_type}_{setting}'
+
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
+vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
 # vis_name = None
 
+
+# set visualizer
 visualizer = None if vis_name is None else dict(
     type=Visualizer,
     vis_backends=[
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='slidechat_mcqa_debug',
+                project='pathoverse_srv',
                 name=vis_name
             )
         )
     ]
 )
 
-val_output_path = work_dir + '/val_results'
-test_output_path = work_dir + '/test_results'
+val_output_path = work_dir + 'val_results'
+test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = True
-# interval = 250
-interval = 1
+interval = 250
+# interval = 1
 save_total_limit = 1
 
-# Evaluation frequency
-evaluation_freq = 500
-
+# Evaluate the generation performance during the training
+evaluation_freq = 500  # More frequent evaluation for alignment debugging
 image_path_list = None
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 

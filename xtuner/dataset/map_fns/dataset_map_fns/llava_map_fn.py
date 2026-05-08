@@ -66,3 +66,40 @@ def llava_map_fn(example):
             result[key] = example[key]
 
     return result
+
+
+@MAP_FUNC.register_module('llava_text_only_map_fn')
+def llava_text_only_map_fn(example):
+    """Text-only variant of llava_map_fn.
+
+    It keeps the same supervision and metadata fields but removes visual
+    placeholders and disables visual loading downstream.
+    """
+    messages = example['conversations']
+    input_text = ''
+    conversation = []
+
+    while messages and messages[0]['from'] == 'gpt':
+        messages = messages[1:]
+
+    for msg in messages:
+        if msg['from'] == 'human':
+            value = msg['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
+            input_text += value
+        elif msg['from'] == 'gpt':
+            conversation.append({'input': input_text, 'output': msg['value']})
+            input_text = ''
+        else:
+            raise NotImplementedError
+
+    result = {
+        'conversation': conversation,
+        'image': None,
+        'wsi_features': None,
+        'image_len': 0,
+    }
+    for key in ['survival_targets', 'regression_targets', 'category', 'id', 'project']:
+        if key in example:
+            result[key] = example[key]
+
+    return result

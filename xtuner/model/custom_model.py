@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from timm.layers import trunc_normal_
 from transformers import InstructBlipQFormerConfig
 from transformers.models.instructblip.modeling_instructblip import InstructBlipQFormerEncoder
-from typing import Optional, Tuple, Iterable, Literal
+from typing import Optional, Tuple, Iterable, Literal, Dict
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
@@ -151,6 +152,163 @@ class HighResConvNeXtV2Pyramid(nn.Module):
 
             if i < len(self.downsample_layers):
                 x = self.downsample_layers[i](x)
+
+        return stage_outputs
+
+
+class SimpleResBlock(nn.Module):
+    """A minimal residual block for patch-grid feature aggregation."""
+
+    def __init__(self, dim: int, drop_path: float = 0.0):
+        super().__init__()
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=True)
+        self.norm1 = LayerNorm(dim, eps=1e-6, data_format='channels_first')
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=True)
+        self.norm2 = LayerNorm(dim, eps=1e-6, data_format='channels_first')
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        nn.init.constant_(self.norm2.weight, 0)
+        nn.init.constant_(self.norm2.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.act(x)
+        x = self.conv2(x)
+        x = self.norm2(x)
+        return shortcut + self.drop_path(x)
+
+
+class SafeSpatialDownsample(nn.Module):
+    """Downsample by ~2x while keeping each spatial dimension at least 1."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        target_h = max(1, x.shape[-2] // 2)
+        target_w = max(1, x.shape[-1] // 2)
+        return F.adaptive_avg_pool2d(x, (target_h, target_w))
+
+
+class HighResResNetPyramid(nn.Module):
+    """A simple ResNet-style pyramid with pooled stage transitions."""
+
+    def __init__(self,
+                 in_chans: int = 768,
+                 depths: Iterable[int] = (1, 1, 1),
+                 dims: Iterable[int] = (768, 1024, 1536),
+                 drop_path_rate: float = 0.1,
+                 num_downsamples: int = 2):
+        super().__init__()
+
+        depths = list(depths)
+        dims = list(dims)
+        self.dims = dims
+
+        if len(depths) != len(dims):
+            raise ValueError(f"depths and dims must have same length, got {len(depths)} and {len(dims)}")
+        if num_downsamples > len(depths) - 1:
+            raise ValueError(f"num_downsamples ({num_downsamples}) cannot exceed len(depths)-1 ({len(depths)-1})")
+
+        self.input_proj = nn.Conv2d(in_chans, dims[0], kernel_size=1, bias=True) if in_chans != dims[0] else None
+
+        self.stages = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        cur = 0
+        for i, (depth, dim) in enumerate(zip(depths, dims)):
+            blocks = nn.ModuleList([SimpleResBlock(dim=dim, drop_path=dp_rates[cur + j]) for j in range(depth)])
+            self.stages.append(blocks)
+            cur += depth
+
+            if i < num_downsamples:
+                self.downsample_layers.append(
+                    nn.Sequential(
+                        SafeSpatialDownsample(),
+                        nn.Conv2d(dim, dims[i + 1], kernel_size=1, bias=True),
+                        LayerNorm(dims[i + 1], eps=1e-6, data_format='channels_first'),
+                    ))
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x: torch.Tensor):
+        if self.input_proj is not None:
+            x = self.input_proj(x)
+
+        stage_outputs = []
+        for i, stage in enumerate(self.stages):
+            for block in stage:
+                x = block(x)
+            stage_outputs.append(x)
+
+            if i < len(self.downsample_layers):
+                x = self.downsample_layers[i](x)
+
+        return stage_outputs
+
+
+class HighResPoolingPyramid(nn.Module):
+    """A parameter-free pooling backbone for patch ablations.
+
+    It builds a true spatial pyramid using repeated pooling steps, so each
+    returned stage corresponds to a different resolution without any learned
+    convolution weights.
+    """
+
+    def __init__(self,
+                 in_chans: int = 768,
+                 dims: Iterable[int] = (768, 768, 768),
+                 num_downsamples: int = 2,
+                 pool_type: Literal['avg', 'max'] = 'avg'):
+        super().__init__()
+        self.in_chans = in_chans
+        self.dims = list(dims)
+        self.num_downsamples = int(num_downsamples)
+        self.pool_type = pool_type
+        if any(dim != in_chans for dim in self.dims):
+            raise ValueError(
+                f"HighResPoolingPyramid requires dims to equal in_chans ({in_chans}), "
+                f"got dims={self.dims}"
+            )
+        if pool_type not in ('avg', 'max'):
+            raise ValueError(f"Unsupported pool_type={pool_type}")
+
+    def forward(self, x: torch.Tensor):
+        if len(self.dims) == 1:
+            cur = x
+            for _ in range(self.num_downsamples):
+                target_h = max(1, cur.shape[-2] // 2)
+                target_w = max(1, cur.shape[-1] // 2)
+                if self.pool_type == 'avg':
+                    cur = F.adaptive_avg_pool2d(cur, (target_h, target_w))
+                else:
+                    cur = F.adaptive_max_pool2d(cur, (target_h, target_w))
+            return [cur]
+
+        stage_outputs = []
+        cur = x
+        num_stages = len(self.dims)
+        num_identity_stages = max(0, num_stages - self.num_downsamples - 1)
+
+        for stage_idx in range(num_stages):
+            stage_outputs.append(cur)
+            if stage_idx < num_stages - 1 and stage_idx >= num_identity_stages:
+                target_h = max(1, cur.shape[-2] // 2)
+                target_w = max(1, cur.shape[-1] // 2)
+                if self.pool_type == 'avg':
+                    cur = F.adaptive_avg_pool2d(cur, (target_h, target_w))
+                else:
+                    cur = F.adaptive_max_pool2d(cur, (target_h, target_w))
 
         return stage_outputs
 
@@ -325,6 +483,757 @@ class PositionalEmbedding2DSinusoidal(nn.Module):
         else:  # scale_mode == 'none'
             # Original direct addition
             return x + pos_emb
+
+
+class DynamicSinusoidalPE2D(nn.Module):
+    """Dynamic 2D sinusoidal positional encoding for patch feature grids."""
+
+    def __init__(self, d_model: int, temperature: float = 10000.0):
+        super().__init__()
+        if d_model % 4 != 0:
+            raise ValueError(f"d_model must be divisible by 4, got {d_model}")
+        self.d_model = d_model
+        self.temperature = temperature
+
+    def forward(
+        self,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        half = self.d_model // 2
+        freq = torch.arange(0, half, 2, device=device, dtype=torch.float32) / half
+        freq = 1.0 / (self.temperature ** freq)
+
+        pos_h = torch.arange(height, device=device, dtype=torch.float32).unsqueeze(1)
+        pos_w = torch.arange(width, device=device, dtype=torch.float32).unsqueeze(1)
+
+        enc_h = torch.cat([torch.sin(pos_h * freq), torch.cos(pos_h * freq)], dim=1)
+        enc_w = torch.cat([torch.sin(pos_w * freq), torch.cos(pos_w * freq)], dim=1)
+
+        pe = torch.zeros(self.d_model, height, width, device=device, dtype=torch.float32)
+        pe[:half] = enc_h.t().unsqueeze(2).expand(-1, -1, width)
+        pe[half:] = enc_w.t().unsqueeze(1).expand(-1, height, -1)
+        return pe.unsqueeze(0).to(dtype=dtype)
+
+
+class PatchAdapter(nn.Module):
+    """Lightweight local patch adapter without downsampling.
+
+    This module only injects local context and 2D spatial position information
+    while keeping the patch grid resolution and channel count unchanged.
+    Token-count reduction is handled later by `WindowRouter`.
+    """
+
+    def __init__(
+        self,
+        d_patch: int,
+        num_blocks: int = 2,
+        drop_path_rate: float = 0.0,
+    ):
+        super().__init__()
+        self.pe = DynamicSinusoidalPE2D(d_patch)
+        drop_rates = torch.linspace(0, drop_path_rate, steps=max(num_blocks, 1)).tolist()
+        self.blocks = nn.Sequential(*[
+            ConvNeXtV2Block(dim=d_patch, drop_path=drop_rates[i])
+            for i in range(num_blocks)
+        ])
+
+    def forward(self, patch_feats: torch.Tensor) -> torch.Tensor:
+        _, _, h, w = patch_feats.shape
+        pos = self.pe(h, w, patch_feats.device, patch_feats.dtype)
+        return self.blocks(patch_feats + pos)
+
+
+class WindowScorer(nn.Module):
+    """Patch-window scoring head with local-global fusion."""
+
+    def __init__(self, d_patch: int):
+        super().__init__()
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.norm = nn.GroupNorm(1, 2 * d_patch, eps=1e-6, affine=True)
+        self.scorer = nn.Sequential(
+            nn.Conv2d(2 * d_patch, d_patch, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(d_patch, 1, kernel_size=1, bias=True),
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                gain = 0.05 if module.out_channels == 1 else 1.0
+                nn.init.xavier_uniform_(module.weight, gain=gain)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, adapted_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        global_ctx = self.global_pool(adapted_feats).expand_as(adapted_feats)
+        fused = self.norm(torch.cat([adapted_feats, global_ctx], dim=1))
+        score_logits = self.scorer(fused)
+        score_map = torch.sigmoid(score_logits)
+        return score_logits, score_map
+
+
+class LLMProjector(nn.Module):
+    """Project routed visual tokens to the LLM hidden size.
+
+    Token-count reduction is handled upstream by `WindowRouter`, so this module
+    only remaps each routed token from patch space into the LLM hidden space.
+    """
+
+    num_position_rows = 4
+
+    def __init__(self, d_patch: int, h_llm: int):
+        super().__init__()
+        hidden_dim = 2 * d_patch
+        self.shortcut = nn.Linear(d_patch, h_llm)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_patch, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, h_llm),
+        )
+        self.residual_gate = nn.Parameter(torch.tensor(-4.0))
+        self.norm = nn.Identity()
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.shortcut.weight, gain=0.1)
+        nn.init.zeros_(self.shortcut.bias)
+
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                gain = 0.05 if module.out_features == self.shortcut.out_features else 0.5
+                nn.init.xavier_uniform_(module.weight, gain=gain)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, routed_tokens: torch.Tensor) -> torch.Tensor:
+        shortcut = self.shortcut(routed_tokens)
+        residual = self.mlp(routed_tokens)
+        gate = torch.sigmoid(self.residual_gate)
+        return self.norm(shortcut + gate * residual)
+
+
+class InputComposer(nn.Module):
+    """Pad variable-length multimodal inputs for Qwen-style decoder models."""
+
+    def forward(
+        self,
+        embeds_list,
+        labels_list,
+        attention_list,
+        position_ids_list,
+        padding_side: str = 'right',
+        label_pad_value: int = -100,
+    ):
+        if not embeds_list:
+            raise ValueError("InputComposer received an empty batch.")
+
+        max_len = max(x.size(0) for x in embeds_list)
+        batch_size = len(embeds_list)
+        hidden_dim = embeds_list[0].size(-1)
+        device = embeds_list[0].device
+        dtype = embeds_list[0].dtype
+        label_dtype = labels_list[0].dtype
+        has_mrope = position_ids_list[0].ndim == 2
+
+        inputs_embeds = torch.zeros((batch_size, max_len, hidden_dim), dtype=dtype, device=device)
+        labels = torch.full((batch_size, max_len), label_pad_value, dtype=label_dtype, device=device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+        if has_mrope:
+            position_ids = torch.zeros(
+                (position_ids_list[0].size(0), batch_size, max_len),
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            position_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+
+        for b_idx, (emb, lbl, attn, pids) in enumerate(
+            zip(embeds_list, labels_list, attention_list, position_ids_list)
+        ):
+            cur_len = emb.size(0)
+            seq_slice = slice(0, cur_len) if padding_side == 'right' else slice(max_len - cur_len, max_len)
+            inputs_embeds[b_idx, seq_slice] = emb
+            labels[b_idx, seq_slice] = lbl
+            attention_mask[b_idx, seq_slice] = attn.bool()
+            if has_mrope:
+                position_ids[:, b_idx, seq_slice] = pids
+            else:
+                position_ids[b_idx, seq_slice] = pids
+
+        return {
+            'inputs_embeds': inputs_embeds,
+            'labels': labels,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+        }
+
+
+class MRoPEPositionIDGenerator(nn.Module):
+    """Generate Qwen3.5 four-row position ids: text, temporal, height, width."""
+
+    num_position_rows = 4
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        sequential_ids: torch.Tensor,
+        patch_start: int,
+        token_positions: torch.Tensor,
+        token_valid: torch.Tensor,
+        vision_end_index: int,
+        base_position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        seq_len = sequential_ids.numel()
+        if base_position_ids is None:
+            pos = sequential_ids.unsqueeze(0).expand(self.num_position_rows, -1).clone()
+        else:
+            pos = base_position_ids.clone()
+
+        if token_positions.numel() == 0:
+            return pos
+
+        rows = token_positions[:, 0].long()
+        cols = token_positions[:, 1].long()
+        valid = token_valid.bool()
+        patch_len = token_positions.size(0)
+        patch_slice = slice(patch_start, patch_start + patch_len)
+
+        temporal_val = sequential_ids[patch_start]
+        fallback = sequential_ids[patch_slice]
+        pos[1, patch_slice] = torch.where(valid, temporal_val.expand_as(rows), fallback)
+        pos[2, patch_slice] = torch.where(valid, rows, fallback)
+        pos[3, patch_slice] = torch.where(valid, cols, fallback)
+        rows_max = torch.where(valid, rows, temporal_val).max()
+        cols_max = torch.where(valid, cols, temporal_val).max()
+        max_resume = torch.stack([temporal_val, rows_max, cols_max]).max() + 1
+
+        if vision_end_index < seq_len:
+            tail = torch.arange(
+                seq_len - vision_end_index,
+                device=sequential_ids.device,
+                dtype=sequential_ids.dtype,
+            ) + max_resume
+            pos[1:, vision_end_index:] = tail.unsqueeze(0).expand(3, -1)
+
+        return pos
+
+
+class PromptConditionedPatchResampler(nn.Module):
+    """Two-stage prompt-conditioned cross-attention resampler for WSI patch grids."""
+
+    def __init__(
+        self,
+        patch_dim: int = 768,
+        llm_hidden_size: int = 2560,
+        resampler_dim: int = 1024,
+        num_region_tokens: int = 128,
+        num_visual_tokens: int = 64,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        use_local_conv: bool = True,
+    ):
+        super().__init__()
+        if resampler_dim % num_heads != 0:
+            raise ValueError(f"resampler_dim={resampler_dim} must be divisible by num_heads={num_heads}.")
+
+        self.patch_dim = int(patch_dim)
+        self.llm_hidden_size = int(llm_hidden_size)
+        self.resampler_dim = int(resampler_dim)
+        self.num_region_tokens = int(num_region_tokens)
+        self.num_visual_tokens = int(num_visual_tokens)
+
+        self.patch_proj = nn.Linear(self.patch_dim, self.resampler_dim)
+        self.patch_norm = nn.LayerNorm(self.resampler_dim)
+        self.coord_proj = nn.Sequential(
+            nn.Linear(4, self.resampler_dim),
+            nn.GELU(),
+            nn.Linear(self.resampler_dim, self.resampler_dim),
+        )
+        if use_local_conv:
+            self.local_mixer = nn.Sequential(
+                nn.Conv2d(self.resampler_dim, self.resampler_dim, 3, padding=1,
+                          groups=self.resampler_dim, bias=False),
+                nn.GELU(),
+                nn.Conv2d(self.resampler_dim, self.resampler_dim, 1, bias=True),
+            )
+        else:
+            self.local_mixer = None
+
+        self.prompt_proj = nn.Linear(self.llm_hidden_size, self.resampler_dim)
+        self.prompt_norm = nn.LayerNorm(self.resampler_dim)
+        self.region_queries = nn.Parameter(torch.empty(self.num_region_tokens, self.resampler_dim))
+        self.visual_queries = nn.Parameter(torch.empty(self.num_visual_tokens, self.resampler_dim))
+        self.region_prompt_bias = nn.Linear(self.resampler_dim, self.resampler_dim)
+        self.visual_prompt_bias = nn.Linear(self.resampler_dim, self.resampler_dim)
+
+        attn_kwargs = dict(embed_dim=self.resampler_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.region_prompt_attn = nn.MultiheadAttention(**attn_kwargs)
+        self.visual_prompt_attn = nn.MultiheadAttention(**attn_kwargs)
+        self.region_cross_attn = nn.MultiheadAttention(**attn_kwargs)
+        self.visual_cross_attn = nn.MultiheadAttention(**attn_kwargs)
+
+        self.region_norm = nn.LayerNorm(self.resampler_dim)
+        self.visual_norm = nn.LayerNorm(self.resampler_dim)
+        self.region_ffn = nn.Sequential(
+            nn.LayerNorm(self.resampler_dim),
+            nn.Linear(self.resampler_dim, self.resampler_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.resampler_dim * 4, self.resampler_dim),
+        )
+        self.visual_ffn = nn.Sequential(
+            nn.LayerNorm(self.resampler_dim),
+            nn.Linear(self.resampler_dim, self.resampler_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.resampler_dim * 4, self.resampler_dim),
+        )
+        self.to_llm = nn.Linear(self.resampler_dim, self.llm_hidden_size)
+        self.output_norm = nn.LayerNorm(self.llm_hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self):
+        trunc_normal_(self.region_queries, std=.02)
+        trunc_normal_(self.visual_queries, std=.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                trunc_normal_(module.weight, std=.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def set_output_rms(self, rms: float) -> None:
+        if rms is None or not math.isfinite(float(rms)) or float(rms) <= 0:
+            return
+        with torch.no_grad():
+            nn.init.constant_(self.output_norm.weight, float(rms))
+            nn.init.zeros_(self.output_norm.bias)
+
+    @staticmethod
+    def _shape_valid_mask(features: torch.Tensor, feature_shapes: Optional[torch.Tensor]) -> torch.Tensor:
+        b, _, h, w = features.shape
+        device = features.device
+        if feature_shapes is None:
+            shape_mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
+        else:
+            feature_shapes = feature_shapes.to(device=device)
+            rows = torch.arange(h, device=device).view(1, h, 1)
+            cols = torch.arange(w, device=device).view(1, 1, w)
+            valid_h = feature_shapes[:, 0].view(b, 1, 1).clamp(min=1, max=h)
+            valid_w = feature_shapes[:, 1].view(b, 1, 1).clamp(min=1, max=w)
+            shape_mask = (rows < valid_h) & (cols < valid_w)
+        nonzero_mask = features.detach().float().abs().sum(dim=1) > 0
+        valid_mask = shape_mask & nonzero_mask
+        empty = ~valid_mask.flatten(1).any(dim=1)
+        if empty.any():
+            valid_mask[empty, 0, 0] = True
+        return valid_mask
+
+    @staticmethod
+    def _coord_features(batch_size: int, height: int, width: int, device: torch.device) -> torch.Tensor:
+        rows = torch.arange(height, device=device, dtype=torch.float32)
+        cols = torch.arange(width, device=device, dtype=torch.float32)
+        grid_r, grid_c = torch.meshgrid(rows, cols, indexing='ij')
+        norm_r = grid_r / max(height - 1, 1)
+        norm_c = grid_c / max(width - 1, 1)
+        coords = torch.stack([norm_r, norm_c, norm_r * 2 - 1, norm_c * 2 - 1], dim=-1)
+        return coords.view(1, height * width, 4).expand(batch_size, -1, -1)
+
+    @staticmethod
+    def _coord_indices(batch_size: int, height: int, width: int, device: torch.device) -> torch.Tensor:
+        rows = torch.arange(height, device=device)
+        cols = torch.arange(width, device=device)
+        grid_r, grid_c = torch.meshgrid(rows, cols, indexing='ij')
+        coords = torch.stack([grid_r, grid_c], dim=-1)
+        return coords.view(1, height * width, 2).expand(batch_size, -1, -1)
+
+    @staticmethod
+    def _safe_prompt_mask(prompt_embeds: torch.Tensor, prompt_attention_mask: Optional[torch.Tensor]):
+        b, l, _ = prompt_embeds.shape
+        if prompt_attention_mask is None:
+            mask = torch.ones((b, l), dtype=torch.bool, device=prompt_embeds.device)
+        else:
+            mask = prompt_attention_mask.to(device=prompt_embeds.device).bool()
+        empty = ~mask.any(dim=1)
+        if empty.any():
+            prompt_embeds = prompt_embeds.clone()
+            prompt_embeds[empty, 0] = 0
+            mask = mask.clone()
+            mask[empty, 0] = True
+        return prompt_embeds, mask
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        weight = mask.to(dtype=x.dtype).unsqueeze(-1)
+        return (x * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+
+    def _condition_queries(self, query_bank, prompt_tokens, prompt_mask, prompt_bias, prompt_attn):
+        batch_size = prompt_tokens.size(0)
+        summary = self._masked_mean(prompt_tokens, prompt_mask)
+        queries = query_bank.unsqueeze(0).expand(batch_size, -1, -1)
+        queries = queries + prompt_bias(summary).unsqueeze(1)
+        conditioned, _ = prompt_attn(
+            query=queries,
+            key=prompt_tokens,
+            value=prompt_tokens,
+            key_padding_mask=~prompt_mask,
+            need_weights=False,
+        )
+        return queries + self.dropout(conditioned)
+
+    @staticmethod
+    def _raise_if_nonfinite(name: str, value: torch.Tensor, extra: str = "") -> None:
+        if torch.isfinite(value).all():
+            return
+        value32 = value.detach().float()
+        finite = value32[torch.isfinite(value32)]
+        if finite.numel() > 0:
+            min_value = float(finite.min().item())
+            max_value = float(finite.max().item())
+        else:
+            min_value = float('nan')
+            max_value = float('nan')
+        suffix = f" {extra}" if extra else ""
+        raise RuntimeError(
+            f"Non-finite tensor detected in {name}:{suffix} "
+            f"shape={tuple(value.shape)} dtype={value.dtype} "
+            f"min={min_value:.6g} max={max_value:.6g}"
+        )
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: Optional[torch.Tensor] = None,
+        feature_shapes: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if features.ndim != 4:
+            raise ValueError(f"Expected features with shape (B, C, H, W), got {tuple(features.shape)}.")
+        if features.size(1) != self.patch_dim:
+            raise ValueError(f"Expected patch_dim={self.patch_dim}, got C={features.size(1)}.")
+
+        b, _, h, w = features.shape
+        prompt_embeds, prompt_attention_mask = self._safe_prompt_mask(prompt_embeds, prompt_attention_mask)
+        valid_mask = self._shape_valid_mask(features, feature_shapes)
+
+        patch_tokens = features.permute(0, 2, 3, 1).reshape(b, h * w, self.patch_dim)
+        patch_tokens = self.patch_norm(self.patch_proj(patch_tokens))
+        coords = self._coord_features(b, h, w, features.device).to(dtype=patch_tokens.dtype)
+        patch_tokens = patch_tokens + self.coord_proj(coords)
+
+        if self.local_mixer is not None:
+            grid_tokens = patch_tokens.view(b, h, w, self.resampler_dim).permute(0, 3, 1, 2)
+            grid_tokens = grid_tokens * valid_mask.unsqueeze(1).to(dtype=grid_tokens.dtype)
+            mixed = self.local_mixer(grid_tokens)
+            mixed = mixed * valid_mask.unsqueeze(1).to(dtype=mixed.dtype)
+            patch_tokens = patch_tokens + mixed.permute(0, 2, 3, 1).reshape(b, h * w, self.resampler_dim)
+
+        self._raise_if_nonfinite('prompt_embeds', prompt_embeds)
+        prompt_dtype = self.prompt_proj.weight.dtype
+        prompt_embeds_fp32 = prompt_embeds.float()
+        prompt_proj_weight = self.prompt_proj.weight.float()
+        prompt_proj_bias = self.prompt_proj.bias.float() if self.prompt_proj.bias is not None else None
+        prompt_tokens = F.linear(prompt_embeds_fp32, prompt_proj_weight, prompt_proj_bias)
+        prompt_tokens = F.layer_norm(
+            prompt_tokens,
+            self.prompt_norm.normalized_shape,
+            self.prompt_norm.weight.float(),
+            self.prompt_norm.bias.float(),
+            self.prompt_norm.eps,
+        )
+        self._raise_if_nonfinite('prompt_tokens', prompt_tokens, extra='after_prompt_proj_norm')
+        prompt_tokens = prompt_tokens.to(dtype=prompt_dtype)
+        patch_key_padding = ~valid_mask.flatten(1)
+        region_queries = self._condition_queries(
+            self.region_queries,
+            prompt_tokens,
+            prompt_attention_mask,
+            self.region_prompt_bias,
+            self.region_prompt_attn,
+        )
+        region_ctx, region_attn = self.region_cross_attn(
+            query=region_queries,
+            key=patch_tokens,
+            value=patch_tokens,
+            key_padding_mask=patch_key_padding,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+        region_tokens = self.region_norm(region_queries + self.dropout(region_ctx))
+        region_tokens = region_tokens + self.dropout(self.region_ffn(region_tokens))
+
+        visual_queries = self._condition_queries(
+            self.visual_queries,
+            prompt_tokens,
+            prompt_attention_mask,
+            self.visual_prompt_bias,
+            self.visual_prompt_attn,
+        )
+        visual_ctx, visual_to_region_attn = self.visual_cross_attn(
+            query=visual_queries,
+            key=region_tokens,
+            value=region_tokens,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+        visual_tokens = self.visual_norm(visual_queries + self.dropout(visual_ctx))
+        visual_tokens = visual_tokens + self.dropout(self.visual_ffn(visual_tokens))
+
+        patch_attention = torch.bmm(visual_to_region_attn.float(), region_attn.float())
+        patch_attention = patch_attention.masked_fill(~valid_mask.flatten(1).unsqueeze(1), 0.0)
+        patch_attention = patch_attention / patch_attention.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        coord_indices = self._coord_indices(b, h, w, features.device).float()
+        token_positions = torch.bmm(patch_attention, coord_indices).round().long()
+        token_positions[..., 0].clamp_(0, h - 1)
+        token_positions[..., 1].clamp_(0, w - 1)
+        token_valid = torch.ones((b, self.num_visual_tokens), dtype=torch.bool, device=features.device)
+        llm_tokens = self.output_norm(self.to_llm(visual_tokens))
+
+        return {
+            'visual_tokens': llm_tokens,
+            'token_positions': token_positions,
+            'token_valid': token_valid,
+            'patch_attention': patch_attention.view(b, self.num_visual_tokens, h, w),
+            'patch_valid_mask': valid_mask,
+            'region_attention': region_attn,
+            'visual_to_region_attention': visual_to_region_attn,
+        }
+
+
+class WindowRouter(nn.Module):
+    """Dynamic window router with hard top-k forward and STE backward."""
+
+    def __init__(
+        self,
+        d_patch: int,
+        window_size: int = 4,
+        topk_windows: int = 64,
+        alpha: float = 0.5,
+        tau_ste: float = 0.5,
+        tau_pool: float = 1.0,
+        tau_aux: float = 0.7,
+        window_score_topn: int = 2,
+    ):
+        super().__init__()
+        self.d_patch = d_patch
+        self.window_size = window_size
+        self.topk_windows = topk_windows
+        self.alpha = alpha
+        self.tau_ste = tau_ste
+        self.tau_pool = tau_pool
+        self.tau_aux = tau_aux
+        self.window_score_topn = window_score_topn
+
+    @staticmethod
+    def _pad_to_window(tensor: torch.Tensor, window_size: int, pad_value: float) -> torch.Tensor:
+        _, _, h, w = tensor.shape
+        pad_h = (window_size - h % window_size) % window_size
+        pad_w = (window_size - w % window_size) % window_size
+        if pad_h > 0 or pad_w > 0:
+            tensor = F.pad(tensor, (0, pad_w, 0, pad_h), value=pad_value)
+        return tensor
+
+    @staticmethod
+    def _partition_windows(tensor: torch.Tensor, ws: int) -> torch.Tensor:
+        b, c, h, w = tensor.shape
+        n_h, n_w = h // ws, w // ws
+        x = tensor.reshape(b, c, n_h, ws, n_w, ws)
+        x = x.permute(0, 2, 4, 3, 5, 1)
+        return x.reshape(b, n_h * n_w, ws * ws, c)
+
+    @staticmethod
+    def _generate_coords(h: int, w: int, ws: int, device: torch.device) -> torch.Tensor:
+        rows = torch.arange(h, device=device)
+        cols = torch.arange(w, device=device)
+        grid_r, grid_c = torch.meshgrid(rows, cols, indexing='ij')
+        coords = torch.stack([grid_r, grid_c], dim=-1)
+        n_h, n_w = h // ws, w // ws
+        coords = coords.reshape(n_h, ws, n_w, ws, 2)
+        coords = coords.permute(0, 2, 1, 3, 4)
+        return coords.reshape(1, n_h * n_w, ws * ws, 2)
+
+    def _compute_window_scores(
+        self,
+        window_logits: torch.Tensor,
+        window_valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = window_logits.float().masked_fill(~window_valid, -1e4)
+        top_n = min(self.window_score_topn, logits.size(-1))
+        topn_logits, _ = logits.topk(top_n, dim=2)
+        window_score = topn_logits.mean(dim=2)
+        window_is_valid = window_valid.any(dim=2)
+        neg_inf = torch.full_like(window_score, -1e4)
+        window_score = torch.where(window_is_valid, window_score, neg_inf)
+
+        valid_count = window_is_valid.sum(dim=1, keepdim=True).clamp(min=1)
+        score_mean = window_score.masked_fill(~window_is_valid, 0.0).sum(dim=1, keepdim=True) / valid_count
+        score_var = (
+            (window_score - score_mean)
+            .masked_fill(~window_is_valid, 0.0)
+            .pow(2)
+            .sum(dim=1, keepdim=True) / valid_count
+        )
+        score_std = torch.sqrt(score_var + 1e-6).clamp_min(1e-6)
+        window_score = torch.where(window_is_valid, (window_score - score_mean) / score_std, neg_inf)
+        return window_score, window_is_valid
+
+    def _topk_with_ste(
+        self,
+        window_score: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, n = window_score.shape
+        k = min(self.topk_windows, n)
+        safe_scores = torch.where(valid_mask, window_score, torch.full_like(window_score, -1e9))
+        topk_vals, topk_idx = torch.topk(safe_scores, k=k, dim=1)
+
+        valid_count = valid_mask.sum(dim=1)
+        actual_k = torch.clamp(valid_count, max=k)
+
+        threshold_index = torch.clamp(actual_k - 1, min=0).unsqueeze(1)
+        threshold = topk_vals.gather(1, threshold_index).detach()
+
+        rank_mask = (
+            torch.arange(k, device=window_score.device).unsqueeze(0) < actual_k.unsqueeze(1)
+        )
+        hard_mask = torch.zeros_like(window_score, dtype=torch.float32)
+        hard_mask.scatter_(1, topk_idx, rank_mask.to(dtype=hard_mask.dtype))
+        hard_mask = hard_mask * valid_mask.to(dtype=hard_mask.dtype)
+
+        soft_mask = torch.sigmoid((safe_scores - threshold) / self.tau_ste)
+        soft_mask = soft_mask * valid_mask.to(dtype=soft_mask.dtype)
+        mask = soft_mask + (hard_mask - soft_mask).detach()
+
+        return mask, hard_mask.bool(), topk_idx, actual_k
+
+    @staticmethod
+    def _gather_tensor(src: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        if src.dim() == 2:
+            return torch.gather(src, 1, idx)
+        expand_shape = [idx.size(0), idx.size(1)] + list(src.shape[2:])
+        idx_expanded = idx.view(idx.size(0), idx.size(1), *([1] * (src.dim() - 2))).expand(*expand_shape)
+        return torch.gather(src, 1, idx_expanded)
+
+    def _low_window_indices(
+        self,
+        window_score: torch.Tensor,
+        selected_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        n = window_score.size(1)
+        low_count = max(n - min(self.topk_windows, n), 0)
+        if low_count == 0:
+            return window_score.new_zeros((window_score.size(0), 0), dtype=torch.long)
+
+        big = torch.full_like(window_score, 1e6)
+        priority = torch.where(
+            ~valid_mask,
+            big + 1e6,
+            torch.where(selected_mask, big, -window_score),
+        )
+        return torch.argsort(priority, dim=1)[:, :low_count]
+
+    def _collect_aux_materials(
+        self,
+        score_logits: torch.Tensor,
+        adapted_feats: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        b, d, h, w = adapted_feats.shape
+        feats_flat = adapted_feats.reshape(b, d, h * w).transpose(1, 2)
+        logits_flat = score_logits.reshape(b, h * w).float() / self.tau_aux
+        valid_flat = valid_mask.reshape(b, h * w)
+        logits_flat = logits_flat.masked_fill(~valid_flat, -1e4)
+        attn = torch.softmax(logits_flat, dim=1)
+        attn = attn * valid_flat.to(dtype=attn.dtype)
+        attn = attn / (attn.sum(dim=1, keepdim=True) + 1e-8)
+        return (attn.unsqueeze(-1) * feats_flat).sum(dim=1)
+
+    def forward(
+        self,
+        adapted_feats: torch.Tensor,
+        score_logits: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        b, d, h, w = adapted_feats.shape
+        ws = self.window_size
+
+        if valid_mask is None:
+            valid_mask = torch.ones((b, 1, h, w), device=adapted_feats.device, dtype=torch.bool)
+        else:
+            valid_mask = valid_mask.bool()
+
+        feats_pad = self._pad_to_window(adapted_feats, ws, pad_value=0.0)
+        logits_pad = self._pad_to_window(score_logits, ws, pad_value=-1e9)
+        vmask_pad = self._pad_to_window(valid_mask.to(dtype=adapted_feats.dtype), ws, pad_value=0.0).bool()
+
+        h_pad, w_pad = feats_pad.shape[-2:]
+        window_feats = self._partition_windows(feats_pad, ws)
+        window_logits = self._partition_windows(logits_pad, ws).squeeze(-1)
+        window_valid = self._partition_windows(vmask_pad.to(dtype=feats_pad.dtype), ws).squeeze(-1).bool()
+        window_coords = self._generate_coords(h_pad, w_pad, ws, adapted_feats.device).expand(b, -1, -1, -1)
+
+        window_score, window_is_valid = self._compute_window_scores(window_logits, window_valid)
+        ste_mask, hard_mask, topk_idx, _ = self._topk_with_ste(window_score, window_is_valid)
+
+        high_feats = self._gather_tensor(window_feats, topk_idx)
+        high_logits = self._gather_tensor(window_logits, topk_idx)
+        high_valid = self._gather_tensor(window_valid, topk_idx)
+        high_coords = self._gather_tensor(window_coords, topk_idx)
+        high_selected = self._gather_tensor(hard_mask, topk_idx)
+        high_valid = high_valid & high_selected.unsqueeze(-1)
+
+        high_scores = torch.sigmoid(high_logits.clamp(min=-8.0, max=8.0))
+        high_feats = high_feats * (1.0 + self.alpha * high_scores.unsqueeze(-1))
+        high_tokens = high_feats.reshape(b, -1, d)
+        high_coords = high_coords.reshape(b, -1, 2)
+        high_token_valid = high_valid.reshape(b, -1)
+        high_tokens = high_tokens * high_token_valid.unsqueeze(-1).to(dtype=high_tokens.dtype)
+
+        low_idx = self._low_window_indices(window_score, hard_mask, window_is_valid)
+        low_feats = self._gather_tensor(window_feats, low_idx)
+        low_logits = self._gather_tensor(window_logits, low_idx)
+        low_valid = self._gather_tensor(window_valid, low_idx)
+        low_coords = self._gather_tensor(window_coords, low_idx)
+        low_selected = self._gather_tensor(hard_mask, low_idx)
+
+        if low_feats.numel() > 0:
+            logits_for_pool = (low_logits.float() / self.tau_pool).masked_fill(~low_valid, -1e4)
+            attn = torch.softmax(logits_for_pool, dim=2)
+            attn = attn * low_valid.to(dtype=attn.dtype)
+            attn = attn / (attn.sum(dim=2, keepdim=True) + 1e-8)
+            low_summary = (attn.unsqueeze(-1) * low_feats).sum(dim=2)
+            low_center = low_coords.float().mean(dim=2).round().long()
+            low_window_valid = low_valid.any(dim=2) & ~low_selected
+            low_summary = low_summary * low_window_valid.unsqueeze(-1).to(dtype=low_summary.dtype)
+        else:
+            low_summary = adapted_feats.new_zeros((b, 0, d))
+            low_center = torch.zeros((b, 0, 2), device=adapted_feats.device, dtype=torch.long)
+            low_window_valid = torch.zeros((b, 0), device=adapted_feats.device, dtype=torch.bool)
+
+        routed_tokens = torch.cat([high_tokens, low_summary], dim=1)
+        token_positions = torch.cat([high_coords, low_center], dim=1)
+        token_valid = torch.cat([high_token_valid, low_window_valid], dim=1)
+        routed_tokens = routed_tokens * token_valid.unsqueeze(-1).to(dtype=routed_tokens.dtype)
+
+        slide_repr = self._collect_aux_materials(score_logits, adapted_feats, valid_mask)
+
+        return {
+            'routed_tokens': routed_tokens,
+            'token_positions': token_positions,
+            'token_valid': token_valid,
+            'slide_repr': slide_repr,
+            'window_scores': window_score,
+            'ste_mask': ste_mask,
+            'selected_window_mask': hard_mask,
+        }
+
 
 class CustomQformer(nn.Module):
     """
@@ -986,6 +1895,15 @@ class WSIProjector(nn.Module):
             WSIProjectorMLP(dim, llm_hidden_size, hidden_mult)
             for dim in wsi_input_dims
         ])
+
+        # Match the scale of LLM token embeddings after projection.
+        self.post_norms = nn.ModuleList([
+            nn.LayerNorm(llm_hidden_size, elementwise_affine=True)
+            for _ in wsi_input_dims
+        ])
+        for norm in self.post_norms:
+            nn.init.constant_(norm.weight, 1.0 / math.sqrt(llm_hidden_size))
+            nn.init.constant_(norm.bias, 0.0)
         
         # Optional dropout after projection
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -1015,7 +1933,8 @@ class WSIProjector(nn.Module):
             )
         
         projected = []
-        for i, (feat, projector, scale) in enumerate(zip(wsi_features, self.projectors, self.scale_factors)):
+        for i, (feat, projector, norm, scale) in enumerate(
+                zip(wsi_features, self.projectors, self.post_norms, self.scale_factors)):
             # Validate input dimension
             if feat.size(-1) != self.wsi_input_dims[i]:
                 raise ValueError(
@@ -1024,6 +1943,7 @@ class WSIProjector(nn.Module):
             
             # Project
             proj = projector(feat)  # (B, llm_hidden_size)
+            proj = norm(proj)
             
             # Apply scale factor
             proj = proj * scale

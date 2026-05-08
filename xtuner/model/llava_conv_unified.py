@@ -883,7 +883,14 @@ class LLaVAModel_conv_unified(BaseModel):
             self.llm = prepare_model_for_kbit_training(self.llm, use_activation_checkpointing)
 
         if lora_config.target_modules is None:
-            lora_config.target_modules = find_all_linear_names(self.llm)
+            # For composite models (e.g. Qwen3-VL), we must avoid targeting
+            # 'proj' which matches Conv3d in the visual encoder.  Searching
+            # only in the language_model sub-module avoids finding 'proj' from
+            # vision blocks.  For standard text-only models the getattr chain
+            # simply falls back to self.llm.
+            target_model = getattr(self.llm, 'model', self.llm)
+            target_model = getattr(target_model, 'language_model', target_model)
+            lora_config.target_modules = find_all_linear_names(target_model)
 
         self.llm = self._get_peft_model_without_bnb_dispatch(
             self.llm,
