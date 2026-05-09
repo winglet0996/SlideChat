@@ -60,16 +60,22 @@ resume = True
 
 model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
-kg_status='wo_knowledge'
+
+# exp = 'noctx_notrt_xena_noaug-r1'
+# exp = 'ctx_notrt_xena_aug-d0.5-r2'
+# exp = 'ctx_notrt_xena_aug-d0.25-r1'
+# exp = 'ctx_notrt_xena_aug-d0.75-r4'
+# exp = 'ctx_trt_landmark_aug-d0.5-r2'
+# exp = 'ctx_notrt_xena_aug-d0.2-k0.8-s0.1-r2-c1'
 
 llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.5-{model_size}'
 # train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/train.json'
 # val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
 # test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
-train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
-val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse/train.json'
+val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse/test.json'
+test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse/test.json'
 
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
@@ -85,8 +91,8 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}/'
-vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}'
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}/'
+vis_name = f'{model_size}_vl_{model_type}_{setting}'
 # vis_name = None
 
 
@@ -97,7 +103,7 @@ visualizer = None if vis_name is None else dict(
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='pathoverse_qwen3_5_r2',
+                project='pathoverse_qwen3_5',
                 name=vis_name
             )
         )
@@ -109,12 +115,12 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1500
+interval = 3070
 # interval = 1
-save_total_limit = 20
+save_total_limit = 16
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1500  # More frequent evaluation for alignment debugging
+evaluation_freq = 3070  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -177,7 +183,7 @@ sample_type='wsi' # 'wsi'or'image'
 
 
 # Scheduler & Optimizer
-batch_size = 16
+batch_size = 8
 accumulative_counts = 1
 dataloader_num_workers = 8
 optim_type = AdamW
@@ -238,8 +244,8 @@ model = dict(
     gen_forcing=False,
     num_survival_intervals=6,
     lambda_llm=1.0,
-    lambda_reg=1.0,
-    lambda_srv=1.0,
+    lambda_reg=1.5,
+    lambda_srv=3.0,
     prompt_resampler_cfg=prompt_resampler_cfg,
     prompt_context_mode='llm_hidden',
     # prompt_context_mode='embedding',

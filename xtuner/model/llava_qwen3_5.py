@@ -2,6 +2,7 @@
 """Prompt-conditioned pathology adapter for Qwen3.5 text models."""
 
 import math
+from contextlib import contextmanager
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -350,6 +351,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         prompt_context_mode: str = 'llm_hidden',
         prompt_context_layer: int = -1,
         prompt_context_detach: bool = True,
+        enable_nonfinite_checks: bool = False,
         wsi_feature_dims: Optional[List[int]] = None,
         wsi_dropout: float = 0.1,
         head_scaling: Union[float, List[float]] = (0.0, 0.0, 0.5),
@@ -370,6 +372,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.prompt_context_mode = prompt_context_mode
         self.prompt_context_layer = int(prompt_context_layer)
         self.prompt_context_detach = bool(prompt_context_detach)
+        self.enable_nonfinite_checks = bool(enable_nonfinite_checks)
         self.enable_vision = prompt_resampler_cfg is not None
         self.wsi_feature_dims = wsi_feature_dims
         self.enable_wsi_injection = wsi_feature_dims is not None and len(wsi_feature_dims) > 0
@@ -644,6 +647,38 @@ class LLaVAModel_qwen3_5(BaseModel):
         for word in stop_words or []:
             self.stop_criteria.append(StopWordStoppingCriteria(self.tokenizer, word))
 
+    def _maybe_raise_if_nonfinite(self, name: str, value: torch.Tensor, extra: str = "") -> None:
+        if not self.enable_nonfinite_checks:
+            return
+        _raise_if_nonfinite(name, value, extra=extra)
+
+    @contextmanager
+    def _temporary_attn_implementation(self, implementation: Optional[str]):
+        """Temporarily override runtime attention backend for fragile eval paths."""
+        if implementation is None:
+            yield
+            return
+
+        targets = []
+        llm_config = getattr(self.llm, 'config', None)
+        for cfg in (llm_config, getattr(llm_config, 'text_config', None)):
+            if cfg is None:
+                continue
+            old_values = {}
+            for attr in ('_attn_implementation', 'attn_implementation'):
+                if hasattr(cfg, attr):
+                    old_values[attr] = getattr(cfg, attr)
+                    setattr(cfg, attr, implementation)
+            if old_values:
+                targets.append((cfg, old_values))
+
+        try:
+            yield
+        finally:
+            for cfg, old_values in targets:
+                for attr, old_value in old_values.items():
+                    setattr(cfg, attr, old_value)
+
     def _prompt_mask(self, data: Dict[str, Any]) -> torch.Tensor:
         input_ids = data['input_ids']
         labels = data.get('labels')
@@ -729,7 +764,7 @@ class LLaVAModel_qwen3_5(BaseModel):
                 final_norm = self._get_language_model_norm()
                 if final_norm is not None:
                     context_embeds = final_norm(context_embeds)
-        _raise_if_nonfinite(
+        self._maybe_raise_if_nonfinite(
             'prompt_context_embeds',
             context_embeds,
             extra=f"mode={self.prompt_context_mode} layer={self.prompt_context_layer}",
@@ -895,9 +930,9 @@ class LLaVAModel_qwen3_5(BaseModel):
         srv_loss = self._compute_task_loss(labels, survival_targets, 'survival') if (
             self.enable_survival and survival_targets is not None and labels is not None
         ) else self._regularization_loss('survival', lm_loss)
-        _raise_if_nonfinite('lm_loss', lm_loss)
-        _raise_if_nonfinite('reg_loss', reg_loss)
-        _raise_if_nonfinite('srv_loss', srv_loss)
+        self._maybe_raise_if_nonfinite('lm_loss', lm_loss)
+        self._maybe_raise_if_nonfinite('reg_loss', reg_loss)
+        self._maybe_raise_if_nonfinite('srv_loss', srv_loss)
         loss = self.lambda_llm * lm_loss + self.lambda_reg * reg_loss + self.lambda_srv * srv_loss
         return {
             'lm_loss': lm_loss.detach(),
@@ -967,7 +1002,7 @@ class LLaVAModel_qwen3_5(BaseModel):
             B, Lp, _ = prefix_inputs_embeds.shape
 
             # 1) Text generation with logits capture for MCQA
-            with torch.no_grad():
+            with torch.no_grad(), self._temporary_attn_implementation('sdpa'):
                 captured_logits = []
                 def capture_logits_processor(input_ids, scores):
                     if not captured_logits:
@@ -1071,15 +1106,16 @@ class LLaVAModel_qwen3_5(BaseModel):
                 return data_samples
 
             # 2) Task predictions from generated special tokens
-            return self._predict_tasks_from_generation(
-                generate_ids=generate_ids,
-                data_samples=data_samples,
-                has_regression=has_regression,
-                has_survival=has_survival,
-                prefix_inputs_embeds=prefix_inputs_embeds,
-                prefix_attention_mask=prefix_attention_mask,
-                prefix_position_ids=prefix_position_ids,
-            )
+            with self._temporary_attn_implementation('sdpa'):
+                return self._predict_tasks_from_generation(
+                    generate_ids=generate_ids,
+                    data_samples=data_samples,
+                    has_regression=has_regression,
+                    has_survival=has_survival,
+                    prefix_inputs_embeds=prefix_inputs_embeds,
+                    prefix_attention_mask=prefix_attention_mask,
+                    prefix_position_ids=prefix_position_ids,
+                )
 
         finally:
             self._cleanup_prediction_state()
