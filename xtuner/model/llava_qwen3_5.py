@@ -12,6 +12,7 @@ from mmengine import print_log
 from mmengine.config import Config, ConfigDict
 from mmengine.dist import is_main_process
 from mmengine.model import BaseModel
+from mmengine.utils import is_list_of
 from peft import get_peft_model, prepare_model_for_kbit_training
 from transformers import AddedToken, AutoConfig, GenerationConfig, StoppingCriteriaList
 from transformers.integrations import is_deepspeed_zero3_enabled
@@ -354,6 +355,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         enable_nonfinite_checks: bool = False,
         wsi_feature_dims: Optional[List[int]] = None,
         wsi_dropout: float = 0.1,
+        survival_head_dropout: float = 0.3,
         head_scaling: Union[float, List[float]] = (0.0, 0.0, 0.5),
     ):
         super().__init__()
@@ -377,6 +379,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.wsi_feature_dims = wsi_feature_dims
         self.enable_wsi_injection = wsi_feature_dims is not None and len(wsi_feature_dims) > 0
         self.wsi_dropout = float(wsi_dropout)
+        self.survival_head_dropout = float(survival_head_dropout)
         self.use_llm_lora = llm_lora is not None
         self._use_llm_lora = self.use_llm_lora
         self.reg_token_id = None
@@ -402,6 +405,7 @@ class LLaVAModel_qwen3_5(BaseModel):
             self._init_wsi_projector()
         if self.enable_regression or self.enable_survival:
             self._init_prediction_modules()
+            self._init_special_lm_head()
         self._configure_training(llm_lora, use_activation_checkpointing)
         self._setup_generation(generation_kwargs, stop_words)
         self.position_generator = MRoPEPositionIDGenerator()
@@ -599,8 +603,50 @@ class LLaVAModel_qwen3_5(BaseModel):
                 method=self.survival_method,
                 num_intervals=self.num_survival_intervals,
                 hidden_mult=self.head_scaling[1],
+                dropout=self.survival_head_dropout,
             )
             self.survival_loss_fn = cox_ph_loss if self.survival_method == 'cox' else logistic_hazard_loss
+
+    def _task_token_ids(self) -> List[int]:
+        token_ids = []
+        if self.enable_regression and self.reg_token_id is not None:
+            token_ids.append(int(self.reg_token_id))
+        if self.enable_survival and self.srv_token_id is not None:
+            token_ids.append(int(self.srv_token_id))
+        return token_ids
+
+    def _init_special_lm_head(self) -> None:
+        token_ids = self._task_token_ids()
+        if not token_ids:
+            self.special_lm_token_ids = []
+            self.special_lm_head = None
+            return
+
+        hidden = self._get_llm_hidden_size()
+        self.special_lm_token_ids = token_ids
+        self.special_lm_head = nn.Linear(hidden, len(token_ids), bias=True)
+
+        out = self.llm.get_output_embeddings()
+        if out is not None and hasattr(out, 'weight'):
+            with torch.no_grad():
+                weight = out.weight[token_ids].detach().float()
+                self.special_lm_head.weight.copy_(weight.to(dtype=self.special_lm_head.weight.dtype))
+                self.special_lm_head.bias.zero_()
+
+    def _apply_special_lm_logits(
+        self,
+        active_logits: torch.Tensor,
+        active_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        if not getattr(self, 'special_lm_token_ids', None) or self.special_lm_head is None:
+            return active_logits
+        token_ids = torch.as_tensor(self.special_lm_token_ids, device=active_logits.device, dtype=torch.long)
+        special_logits = self.special_lm_head(
+            active_hidden.to(dtype=next(self.special_lm_head.parameters()).dtype)
+        )
+        active_logits = active_logits.to(dtype=special_logits.dtype).clone()
+        active_logits.index_copy_(1, token_ids, special_logits)
+        return active_logits
 
     def _configure_training(self, llm_lora: Optional[Dict], use_activation_checkpointing: bool) -> None:
         if llm_lora is not None:
@@ -898,6 +944,30 @@ class LLaVAModel_qwen3_5(BaseModel):
         kwargs = {k: data[k] for k in ['input_ids', 'inputs_embeds', 'attention_mask', 'position_ids'] if k in data}
         return self.llm(**kwargs, use_cache=False, output_hidden_states=True, return_dict=True)
 
+    def parse_losses(self, losses: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Use the pre-weighted total loss for backward and keep components for logging only."""
+        log_vars = []
+        for loss_name, loss_value in losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                log_vars.append([loss_name, loss_value.mean()])
+            elif is_list_of(loss_value, torch.Tensor):
+                log_vars.append([loss_name, sum(_loss.mean() for _loss in loss_value)])
+            else:
+                raise TypeError(f"{loss_name} is not a tensor or list of tensors")
+
+        if 'loss' in losses:
+            loss = losses['loss']
+        else:
+            loss = sum(value for key, value in log_vars if 'loss' in key)
+
+        log_vars_dict = OrderedDict()
+        log_vars_dict['loss'] = loss
+        for name, val in log_vars:
+            if name != 'loss':
+                log_vars_dict[name] = val
+
+        return loss, log_vars_dict
+
     def compute_loss(
         self,
         data: Dict[str, torch.Tensor],
@@ -911,10 +981,14 @@ class LLaVAModel_qwen3_5(BaseModel):
         last_hidden = outputs.hidden_states[-1]
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
+            shift_hidden = last_hidden[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
             active = shift_labels != IGNORE_INDEX
             if active.any():
-                active_logits = shift_logits[active]
+                active_logits = self._apply_special_lm_logits(
+                    shift_logits[active],
+                    shift_hidden[active],
+                )
                 lm_loss = nn.CrossEntropyLoss()(
                     active_logits.float(),
                     shift_labels[active],
@@ -1519,6 +1593,7 @@ class LLaVAModel_qwen3_5(BaseModel):
             'wsi_projector.',
             'regression_head.',
             'survival_head.',
+            'special_lm_head.',
         ]
         keep.update({k: v for k, v in state_dict.items() if any(key in k for key in trainable_keys)})
         return keep

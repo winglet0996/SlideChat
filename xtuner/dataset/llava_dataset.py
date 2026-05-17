@@ -173,6 +173,7 @@ class LLaVADataset(Dataset):
                  input_ids_with_output=True,
                  crop_size=96,
                  text_only=False,
+                 preprocess_num_workers=None,
                  load_patch_features=True,
                  load_wsi_features=True):
         super().__init__()
@@ -182,6 +183,7 @@ class LLaVADataset(Dataset):
         self.mode = mode
         self.crop_size = crop_size
         self.text_only = text_only
+        self.preprocess_num_workers = preprocess_num_workers
         self.load_patch_features = load_patch_features
         self.load_wsi_features = load_wsi_features
         if max_patch_num is None:
@@ -392,6 +394,7 @@ class LLaVADataset(Dataset):
             with_image_token=not self.text_only,
             per_image_length=self.per_image_length,
             max_patch_num=self.max_patch_num,
+            map_num_proc=self.preprocess_num_workers,
             input_ids_with_output=input_ids_with_output,
             reg_token='<REG>',
             srv_token='<SRV>',

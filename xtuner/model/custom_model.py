@@ -1526,6 +1526,7 @@ class SurvivalHead(nn.Module):
         num_intervals: int = 6,
         time_intervals: Optional[torch.Tensor] = None,
         hidden_mult: float = 0.0,
+        dropout: float = 0.3,
     ):
         super().__init__()
         self.method = method
@@ -1537,10 +1538,14 @@ class SurvivalHead(nn.Module):
             self.head = nn.Sequential(
                 nn.Linear(in_dim, hidden_dim),
                 nn.GELU(),
+                nn.Dropout(float(dropout)),
                 nn.Linear(hidden_dim, out_dim)
             )
         else:
-            self.head = nn.Linear(in_dim, out_dim)
+            self.head = nn.Sequential(
+                nn.Dropout(float(dropout)),
+                nn.Linear(in_dim, out_dim)
+            ) if dropout > 0 else nn.Linear(in_dim, out_dim)
             
         # Register time intervals for discrete method (optional, only for median prediction)
         if time_intervals is not None:

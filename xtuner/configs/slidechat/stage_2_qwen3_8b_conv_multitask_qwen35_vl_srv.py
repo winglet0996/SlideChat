@@ -44,10 +44,10 @@ if setting == 'lora':
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/8B_vl_multimodal_alignment_resnet/epoch_3.pth'
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge/iter_1000.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 3
+    max_epochs = 4
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -60,26 +60,20 @@ resume = False
 
 model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
-
-# exp = 'noctx_notrt_xena_noaug-r1'
-# exp = 'ctx_notrt_xena_aug-d0.5-r2'
-# exp = 'ctx_notrt_xena_aug-d0.25-r1'
-# exp = 'ctx_notrt_xena_aug-d0.75-r4'
-# exp = 'ctx_trt_landmark_aug-d0.5-r2'
-exp = 'ctx_notrt_xena_aug-d0.2-k0.8-s0.1-r2-c1'
+kg_status='wo_knowledge'
 
 llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.5-{model_size}'
-train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/train.json'
-val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
+# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/TCGA_DX_survival_ctx_notrt_xena_aug-d0.4-dc0.2-k0.2-s0.6-e0.1-r2-c1/train.json'
+# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/TCGA_DX_survival_ctx_notrt_xena_aug-d0.4-dc0.2-k0.2-s0.6-e0.1-r2-c1/test.json'
+# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/TCGA_DX_survival_ctx_notrt_xena_aug-d0.4-dc0.2-k0.2-s0.6-e0.1-r2-c1/test.json'
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/tcga_aligned_train_survival_os.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/tcga_aligned_test_survival_os.json'
+# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
+# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
 
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
+train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
+val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
+test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
 
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/regression__train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
@@ -91,8 +85,9 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}/'
-vis_name = f'{model_size}_vl_{model_type}_{setting}'
+exp_tag = 'v2'
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}/'
+vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}'
 # vis_name = None
 
 
@@ -103,7 +98,7 @@ visualizer = None if vis_name is None else dict(
         dict(
             type=WandbVisBackend,
             init_kwargs=dict(
-                project='pathoverse_srv',
+                project='pathoverse_qwen3_5',
                 name=vis_name
             )
         )
@@ -114,13 +109,13 @@ val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
 
 # Save
-by_epoch = True
-interval = 250
+by_epoch = False
+interval = 1000000
 # interval = 1
-save_total_limit = 1
+save_total_limit = 20
 
 # Evaluate the generation performance during the training
-evaluation_freq = 50  # More frequent evaluation for alignment debugging
+evaluation_freq = 100  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -164,7 +159,7 @@ def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
     return None
 
 if resume:
-    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=4)
+    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8)
     
     if latest_valid_ckpt:
         ckpt_path = latest_valid_ckpt
@@ -181,11 +176,13 @@ repetition_penalty = 1.0
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
 
+# Data worker settings
+preprocess_num_workers = 8
+dataloader_num_workers = 8
 
 # Scheduler & Optimizer
-batch_size = 8
+batch_size = 16
 accumulative_counts = 1
-dataloader_num_workers = 8
 optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
@@ -203,8 +200,7 @@ tokenizer = dict(
     type=AutoTokenizer.from_pretrained,
     pretrained_model_name_or_path=llm_name_or_path,
     trust_remote_code=True,
-    padding_side='right'
-    )
+)
 
 
 if model_type in ('text_patch', 'multimodal'):
@@ -232,6 +228,7 @@ model = dict(
         trust_remote_code=True,
         dtype=torch.bfloat16,
         attn_implementation='flash_attention_2',
+        # attn_implementation='sdpa',
     ),
     generation_kwargs=dict(max_new_tokens=max_new_tokens, do_sample=False),
     stop_words=['<|im_end|>', '<|endoftext|>'],
@@ -245,12 +242,15 @@ model = dict(
     num_survival_intervals=6,
     lambda_llm=1.0,
     lambda_reg=1.0,
-    lambda_srv=1.0,
+    lambda_srv=0.5,
     prompt_resampler_cfg=prompt_resampler_cfg,
     prompt_context_mode='llm_hidden',
+    # prompt_context_mode='embedding',
     prompt_context_layer=-1,
+    enable_nonfinite_checks=False,
     wsi_feature_dims=wsi_feature_dims,
     wsi_dropout=0.1,
+    survival_head_dropout=0.3,
     head_scaling=[1, 1, 1],
 )
 
@@ -271,6 +271,7 @@ train_llava_dataset = dict(
     per_image_length=per_image_length,
     mode='train',
     text_only=model_type == 'text_only',
+    preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
     load_wsi_features=model_type in ('text_wsi', 'multimodal'))
 
@@ -298,6 +299,7 @@ val_llava_dataset = dict(
     mode='test',
     input_ids_with_output=True,
     text_only=model_type == 'text_only',
+    preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
     load_wsi_features=model_type in ('text_wsi', 'multimodal'))
 
@@ -329,6 +331,7 @@ test_llava_dataset = dict(
     mode='test',
     input_ids_with_output=True,
     text_only=model_type == 'text_only',
+    preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
     load_wsi_features=model_type in ('text_wsi', 'multimodal'))
 

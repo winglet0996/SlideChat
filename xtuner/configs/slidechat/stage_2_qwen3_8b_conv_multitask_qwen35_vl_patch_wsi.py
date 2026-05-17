@@ -43,11 +43,11 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora/iter_3070.pth'
+    # ckpt_path = None
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v2/iter_9000.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 2
+    max_epochs = 1
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -56,7 +56,7 @@ if setting == 'full_param':
     ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
-resume = True
+resume = False
 
 model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
@@ -85,8 +85,9 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}/'
-vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}'
+exp_tag = 'v4'
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
+vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 # vis_name = None
 
 
@@ -109,12 +110,12 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1500
+interval = 1000
 # interval = 1
 save_total_limit = 20
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1500  # More frequent evaluation for alignment debugging
+evaluation_freq = 1000  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -175,11 +176,13 @@ repetition_penalty = 1.0
 per_image_length = None
 sample_type='wsi' # 'wsi'or'image'
 
+# Data worker settings
+preprocess_num_workers = 8
+dataloader_num_workers = 8
 
 # Scheduler & Optimizer
 batch_size = 16
 accumulative_counts = 1
-dataloader_num_workers = 8
 optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
@@ -239,7 +242,7 @@ model = dict(
     num_survival_intervals=6,
     lambda_llm=1.0,
     lambda_reg=1.0,
-    lambda_srv=1.0,
+    lambda_srv=0.2,
     prompt_resampler_cfg=prompt_resampler_cfg,
     prompt_context_mode='llm_hidden',
     # prompt_context_mode='embedding',
@@ -247,7 +250,8 @@ model = dict(
     enable_nonfinite_checks=False,
     wsi_feature_dims=wsi_feature_dims,
     wsi_dropout=0.1,
-    head_scaling=[1, 1, 1],
+    survival_head_dropout=0.5,
+    head_scaling=[1, 0, 1],
 )
 
 #######################################################################
@@ -267,6 +271,7 @@ train_llava_dataset = dict(
     per_image_length=per_image_length,
     mode='train',
     text_only=model_type == 'text_only',
+    preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
     load_wsi_features=model_type in ('text_wsi', 'multimodal'))
 
@@ -294,6 +299,7 @@ val_llava_dataset = dict(
     mode='test',
     input_ids_with_output=True,
     text_only=model_type == 'text_only',
+    preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
     load_wsi_features=model_type in ('text_wsi', 'multimodal'))
 
@@ -325,6 +331,7 @@ test_llava_dataset = dict(
     mode='test',
     input_ids_with_output=True,
     text_only=model_type == 'text_only',
+    preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
     load_wsi_features=model_type in ('text_wsi', 'multimodal'))
 
