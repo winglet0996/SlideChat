@@ -1,11 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Qwen3.5 multitask config with prompt-conditioned WSI patch resampling."""
-import torch
+from os import listdir
+from os.path import basename, isdir, isfile, join
+
 from mmengine.dataset import DefaultSampler
 from mmengine.hooks import CheckpointHook, DistSamplerSeedHook, IterTimerHook, LoggerHook, ParamSchedulerHook
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
 from mmengine.visualization import Visualizer, WandbVisBackend
 from peft import LoraConfig
+from torch import bfloat16
 from torch.optim import AdamW
 from transformers import AutoModelForImageTextToText, AutoTokenizer
 
@@ -36,18 +39,18 @@ if setting == 'alignment':
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=64,
-        lora_alpha=64,
+        r=128,
+        lora_alpha=128,
         lora_dropout=0.2,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v2/iter_9000.pth'
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v6/iter_3000.pth'
     lr = 2e-5
     freeze_llm = True
-    max_epochs = 1
+    max_epochs = 3
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -56,7 +59,7 @@ if setting == 'full_param':
     ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
-resume = False
+resume = True
 
 model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
@@ -85,7 +88,7 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v4'
+exp_tag = 'v6'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
 vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 # vis_name = None
@@ -110,12 +113,12 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1000
+interval = 1500
 # interval = 1
 save_total_limit = 20
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1000  # More frequent evaluation for alignment debugging
+evaluation_freq = 1500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -125,12 +128,11 @@ dataset_map_fn = llava_text_only_map_fn if model_type == 'text_only' else llava_
 
 
 def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
-    import os
     import glob
     import re
-    if not os.path.isdir(work_dir):
+    if not isdir(work_dir):
         return None
-    all_ckpt_dirs = [p for p in glob.glob(os.path.join(work_dir, 'iter_*.pth')) if os.path.isdir(p)]
+    all_ckpt_dirs = [p for p in glob.glob(join(work_dir, 'iter_*.pth')) if isdir(p)]
     
     if not all_ckpt_dirs:
         return None
@@ -138,7 +140,7 @@ def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
     try:
         sorted_ckpts = sorted(
             all_ckpt_dirs,
-            key=lambda p: int(re.search(r'iter_(\d+)\.pth', os.path.basename(p)).group(1)),
+            key=lambda p: int(re.search(r'iter_(\d+)\.pth', basename(p)).group(1)),
             reverse=True
         )
     except (AttributeError, ValueError):
@@ -149,12 +151,12 @@ def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
     
     for ckpt_dir in sorted_ckpts:
         try:
-            if len(os.listdir(ckpt_dir)) == expected_file_count:
+            if len(listdir(ckpt_dir)) == expected_file_count:
                 return ckpt_dir
             else:
-                print(f"Warning: Checkpoint '{os.path.basename(ckpt_dir)}' is incomplete. Skipping.")
+                print(f"Warning: Checkpoint '{basename(ckpt_dir)}' is incomplete. Skipping.")
         except OSError as e:
-            print(f"Warning: Could not access checkpoint '{os.path.basename(ckpt_dir)}'. Error: {e}. Skipping.")
+            print(f"Warning: Could not access checkpoint '{basename(ckpt_dir)}'. Error: {e}. Skipping.")
             continue
     return None
 
@@ -169,6 +171,17 @@ if resume:
         
 del _get_latest_valid_deepspeed_checkpoint
 
+pretrained_pth = None
+if not resume and ckpt_path is not None:
+    if isdir(ckpt_path):
+        pretrained_pth = join(ckpt_path, 'mp_rank_00_model_states.pt')
+    else:
+        pretrained_pth = ckpt_path
+
+    if not isfile(pretrained_pth):
+        raise FileNotFoundError(
+            f'Warm-start checkpoint file not found: {pretrained_pth}')
+
 max_length = 256000
 max_patch_num = None
 max_new_tokens = 32
@@ -178,7 +191,7 @@ sample_type='wsi' # 'wsi'or'image'
 
 # Data worker settings
 preprocess_num_workers = 8
-dataloader_num_workers = 8
+dataloader_num_workers = 1
 
 # Scheduler & Optimizer
 batch_size = 16
@@ -188,7 +201,7 @@ betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
-warmup_ratio = 0.05
+warmup_ratio = 0.1
 
 
 SYSTEM = ''
@@ -210,7 +223,7 @@ if model_type in ('text_patch', 'multimodal'):
         num_region_tokens=128,
         num_visual_tokens=64,
         num_heads=8,
-        dropout=0.1,
+        dropout=0.2,
         use_local_conv=True,
     )
 else:
@@ -226,12 +239,13 @@ model = dict(
         type=AutoModelForImageTextToText.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,
         trust_remote_code=True,
-        dtype=torch.bfloat16,
+        dtype=bfloat16,
         attn_implementation='flash_attention_2',
         # attn_implementation='sdpa',
     ),
     generation_kwargs=dict(max_new_tokens=max_new_tokens, do_sample=False),
     stop_words=['<|im_end|>', '<|endoftext|>'],
+    pretrained_pth=pretrained_pth,
     llm_lora=llm_lora,
     enable_regression=True,
     enable_survival=True,
@@ -240,18 +254,18 @@ model = dict(
     survival_method='discrete',
     gen_forcing=False,
     num_survival_intervals=6,
-    lambda_llm=1.0,
-    lambda_reg=1.0,
-    lambda_srv=0.2,
+    lambda_llm=5.0,
+    lambda_reg=0.5,
+    lambda_srv=0.1,
     prompt_resampler_cfg=prompt_resampler_cfg,
     prompt_context_mode='llm_hidden',
     # prompt_context_mode='embedding',
     prompt_context_layer=-1,
     enable_nonfinite_checks=False,
     wsi_feature_dims=wsi_feature_dims,
-    wsi_dropout=0.1,
-    survival_head_dropout=0.5,
-    head_scaling=[1, 0, 1],
+    wsi_dropout=0.3,
+    survival_head_dropout=0.6,
+    head_scaling=[0, 0, 0.5],
 )
 
 #######################################################################
@@ -433,7 +447,7 @@ env_cfg = dict(
 log_level = 'INFO'
 
 # load from which checkpoint
-load_from = ckpt_path
+load_from = ckpt_path if resume else None
  
 # Defaults to use random seed and disable `deterministic`
 randomness = dict(seed=42, deterministic=False)

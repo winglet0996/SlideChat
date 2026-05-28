@@ -108,8 +108,12 @@ class PathologyMetric(BaseMetric):
             task_type = self._determine_task_type(metadata, pred_str, sample, input_str)
             
             if task_type == 'survival':
+                if 'survival_prediction' not in sample:
+                    continue
                 self._process_survival_sample(sample, input_str, pred_str, metadata)
             elif task_type == 'regression':
+                if 'regression_prediction' not in sample:
+                    continue
                 self._process_regression_sample(sample, input_str, pred_str, metadata)
             elif task_type == 'mcqa':
                 self._process_mcqa_sample(sample, input_str, pred_str, metadata)

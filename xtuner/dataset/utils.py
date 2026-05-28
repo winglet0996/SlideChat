@@ -2,6 +2,7 @@
 import base64
 import copy
 import io
+import os
 from io import BytesIO
 from itertools import chain
 
@@ -13,6 +14,22 @@ import torch
 from torchvision import transforms
 
 from xtuner.utils import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX
+
+
+_H5_TRACE_ENABLED = os.environ.get('XTUNER_H5_TRACE', '0') == '1'
+_H5_TRACE_LOG = os.environ.get('XTUNER_H5_TRACE_LOG', '')
+
+
+def _h5_trace(action, h5_path):
+    """Optional lightweight trace to locate the last H5 path before a worker crash."""
+    if not _H5_TRACE_ENABLED:
+        return
+    msg = f'[H5TRACE] pid={os.getpid()} action={action} path={h5_path}\n'
+    if _H5_TRACE_LOG:
+        with open(_H5_TRACE_LOG, 'a', encoding='utf-8') as f:
+            f.write(msg)
+    else:
+        print(msg, end='', flush=True)
 
 
 def get_bos_eos_token_ids(tokenizer):
@@ -441,8 +458,11 @@ class RandomVariableCropWithLimit:
         return grid
 
 def load_wsi_feature(wsi_file, max_patch_num, transform=None):
+    _h5_trace('open_patch', wsi_file)
     with h5py.File(wsi_file, 'r') as f:
+        _h5_trace('read_patch_features', wsi_file)
         features = f['features'][:]
+        _h5_trace('read_patch_coords', wsi_file)
         coords = f['coords'][:]
         patch_size = f['coords'].attrs.get('patch_size_level0', 512)
 
@@ -514,10 +534,12 @@ def load_wsi_global_features(wsi_feature_paths, feature_key='feature'):
 
 def _load_single_wsi_feature(h5_path, possible_keys):
     """Load a single WSI feature from an H5 file."""
+    _h5_trace('open_wsi_global', h5_path)
     with h5py.File(h5_path, 'r') as f:
         # Try each possible key
         for key in possible_keys:
             if key in f:
+                _h5_trace(f'read_wsi_global_key={key}', h5_path)
                 data = f[key][:]
                 
                 # Handle different array shapes

@@ -63,8 +63,8 @@ def default_collate_fn(instances: Sequence[Dict],
         # Some tokenizers have the same eos token and pad token, so input_ids
         # cannot be masked directly based on the pad token id.
         attention_mask = torch.zeros_like(input_ids).bool()
-        for i in ori_length:
-            attention_mask[:i] = True
+        for row, i in enumerate(ori_length):
+            attention_mask[row, :i] = True
 
         bs, seq_len = input_ids.shape
         position_ids = torch.arange(seq_len).unsqueeze(0).long().repeat(bs, 1)
@@ -95,10 +95,14 @@ def default_collate_fn(instances: Sequence[Dict],
             'labels': labels
         }
 
+    data_dict['category'] = [inst.get('category', None) for inst in instances]
+    data_dict['project'] = [inst.get('project', None) for inst in instances]
+
     if has_image:
 
         pixel_values = torch.stack(pixel_values)
         data_dict['pixel_values'] = pixel_values
+        data_dict['image_file'] = [inst.get('image_file', None) for inst in instances]
 
 
     if return_hf_format:

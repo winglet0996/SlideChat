@@ -76,6 +76,7 @@ dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse/train.json'
 val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse/test.json'
 test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse/test.json'
+test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideBench_test_aligned.json'
 
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'

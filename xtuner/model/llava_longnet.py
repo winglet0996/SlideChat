@@ -345,25 +345,97 @@ class LLaVAModel_longnet(BaseModel):
         outputs = self.llm(**data)
         return outputs
 
+    def _attach_mcqa_choice_logits(self, data_samples, gen_scores):
+        if gen_scores is None or len(gen_scores) == 0:
+            return
+
+        cache = getattr(self, '_mcqa_choice_token_id_cache', None)
+        if cache is None:
+            cache = {}
+            setattr(self, '_mcqa_choice_token_id_cache', cache)
+
+        first_step_logits = gen_scores[0]
+        for i, sample in enumerate(data_samples):
+            if i >= first_step_logits.size(0):
+                break
+            logits_row = first_step_logits[i]
+            choice_logits = {}
+            for letter in ('A', 'B', 'C', 'D', 'E'):
+                token_id = cache.get(letter)
+                if token_id is None and letter not in cache:
+                    for candidate in (letter, f' {letter}'):
+                        try:
+                            token_ids = self.tokenizer.encode(
+                                candidate, add_special_tokens=False)
+                        except Exception:
+                            continue
+                        if isinstance(token_ids, list) and len(token_ids) == 1:
+                            token_id = int(token_ids[0])
+                            break
+                    cache[letter] = token_id
+                if token_id is None:
+                    continue
+                try:
+                    choice_logits[letter] = float(
+                        logits_row[token_id].detach().cpu().item())
+                except Exception:
+                    continue
+            if choice_logits:
+                sample['mcqa_choice_logits'] = choice_logits
+
     def predict(self, data, data_samples=None):
-        generate_ids = self.llm.generate(
+        prompt_lengths = None
+        if data.get('input_ids') is not None:
+            prompt_lengths = []
+            attention_mask = data.get('attention_mask')
+            for i in range(data['input_ids'].size(0)):
+                if attention_mask is not None:
+                    prompt_lengths.append(int(attention_mask[i].sum().item()))
+                else:
+                    prompt_lengths.append(int(data['input_ids'][i].size(0)))
+        elif data.get('inputs_embeds') is not None:
+            attention_mask = data.get('attention_mask')
+            if attention_mask is not None:
+                prompt_lengths = [
+                    int(attention_mask[i].sum().item())
+                    for i in range(attention_mask.size(0))
+                ]
+            else:
+                prompt_lengths = [
+                    int(data['inputs_embeds'][i].size(0))
+                    for i in range(data['inputs_embeds'].size(0))
+                ]
+
+        gen_out = self.llm.generate(
             **data,
             generation_config=self.generation_config,
             stopping_criteria=self.stop_criteria,
             bos_token_id=self.tokenizer.bos_token_id,
+            return_dict_in_generate=True,
+            output_scores=True,
         )
+        generate_ids = getattr(gen_out, 'sequences', gen_out)
+        gen_scores = getattr(gen_out, 'scores', None)
         
         # Decode the output.
         if data_samples is None:
             data_samples = [{} for _ in range(len(generate_ids))]
 
         for i in range(len(generate_ids)):
+            generated_ids = generate_ids[i]
+            if prompt_lengths is not None and i < len(prompt_lengths):
+                prompt_len = prompt_lengths[i]
+                if generated_ids.size(0) > prompt_len:
+                    generated_ids = generated_ids[prompt_len:]
+
             generation_output = self.tokenizer.decode(
-                generate_ids[i], 
+                generated_ids,
                 skip_special_tokens=True
             )
             generated_text = generation_output.strip()
             data_samples[i]['prediction_text'] = generated_text
+
+        self._attach_mcqa_choice_logits(data_samples, gen_scores)
             
         return data_samples
 
