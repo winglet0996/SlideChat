@@ -88,7 +88,7 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v6_nogate'
+exp_tag = 'v7_gate'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
 vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 # vis_name = None
@@ -266,8 +266,8 @@ model = dict(
     wsi_dropout=0.3,
     survival_head_dropout=0.6,
     head_scaling=[0, 0, 0.5],
-    vision_gate_mode='none',
-    wsi_gate_mode='none',
+    vision_gate_mode='scalar',
+    wsi_gate_mode='scalar',
     vision_token_scale=0.5,
     wsi_token_scale=2.0,
 )

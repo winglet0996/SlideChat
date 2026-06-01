@@ -167,6 +167,9 @@ def masked_collated_fn(instances: Sequence[Dict],
     data_dict['project'] = [
         inst.get('project', None) for inst in instances
     ]
+    data_dict['id'] = [
+        inst.get('id', None) for inst in instances
+    ]
 
     if has_image:
         # Pad features to the max size in the batch

@@ -72,7 +72,8 @@ llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
 val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/categories/test.json'
 
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
@@ -88,10 +89,10 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v6_nogate'
+exp_tag = 'v7_gate'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
-vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
-# vis_name = None
+# vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
+vis_name = None
 
 
 # set visualizer
@@ -110,6 +111,8 @@ visualizer = None if vis_name is None else dict(
 
 val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
+save_attention_heatmap = True
+attention_heatmap_dir = test_output_path + '/attn_heatmap'
 
 # Save
 by_epoch = False
@@ -266,10 +269,12 @@ model = dict(
     wsi_dropout=0.3,
     survival_head_dropout=0.6,
     head_scaling=[0, 0, 0.5],
-    vision_gate_mode='none',
-    wsi_gate_mode='none',
+    vision_gate_mode='scalar',
+    wsi_gate_mode='scalar',
     vision_token_scale=0.5,
     wsi_token_scale=2.0,
+    save_attention_heatmap=save_attention_heatmap,
+    attention_heatmap_dir=attention_heatmap_dir,
 )
 
 #######################################################################
@@ -347,6 +352,7 @@ test_llava_dataset = dict(
     max_patch_num=max_patch_num,
     per_image_length=per_image_length,
     mode='test',
+    crop_size=None,
     input_ids_with_output=True,
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,

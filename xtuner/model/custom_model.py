@@ -956,14 +956,15 @@ class PromptConditionedPatchResampler(nn.Module):
             self.region_prompt_bias,
             self.region_prompt_attn,
         )
-        region_ctx, region_attn = self.region_cross_attn(
+        region_ctx, region_attn_heads = self.region_cross_attn(
             query=region_queries,
             key=patch_tokens,
             value=patch_tokens,
             key_padding_mask=patch_key_padding,
             need_weights=True,
-            average_attn_weights=True,
+            average_attn_weights=False,
         )
+        region_attn = region_attn_heads.mean(dim=1)
         region_tokens = self.region_norm(region_queries + self.dropout(region_ctx))
         region_tokens = region_tokens + self.dropout(self.region_ffn(region_tokens))
 
@@ -974,13 +975,14 @@ class PromptConditionedPatchResampler(nn.Module):
             self.visual_prompt_bias,
             self.visual_prompt_attn,
         )
-        visual_ctx, visual_to_region_attn = self.visual_cross_attn(
+        visual_ctx, visual_to_region_attn_heads = self.visual_cross_attn(
             query=visual_queries,
             key=region_tokens,
             value=region_tokens,
             need_weights=True,
-            average_attn_weights=True,
+            average_attn_weights=False,
         )
+        visual_to_region_attn = visual_to_region_attn_heads.mean(dim=1)
         visual_tokens = self.visual_norm(visual_queries + self.dropout(visual_ctx))
         visual_tokens = visual_tokens + self.dropout(self.visual_ffn(visual_tokens))
 
@@ -1002,7 +1004,9 @@ class PromptConditionedPatchResampler(nn.Module):
             'patch_attention': patch_attention.view(b, self.num_visual_tokens, h, w),
             'patch_valid_mask': valid_mask,
             'region_attention': region_attn,
+            'region_attention_heads': region_attn_heads,
             'visual_to_region_attention': visual_to_region_attn,
+            'visual_to_region_attention_heads': visual_to_region_attn_heads,
         }
 
 

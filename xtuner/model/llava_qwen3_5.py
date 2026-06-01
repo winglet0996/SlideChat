@@ -1,13 +1,18 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Prompt-conditioned pathology adapter for Qwen3.5 text models."""
 
+import json
 import math
+import os
+import re
 from contextlib import contextmanager
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from mmengine import print_log
 from mmengine.config import Config, ConfigDict
 from mmengine.dist import is_main_process
@@ -357,6 +362,12 @@ class LLaVAModel_qwen3_5(BaseModel):
         wsi_dropout: float = 0.1,
         survival_head_dropout: float = 0.3,
         head_scaling: Union[float, List[float]] = (0.0, 0.0, 0.5),
+        vision_token_scale: float = 1.0,
+        wsi_token_scale: float = 1.0,
+        vision_gate_mode: str = 'none',
+        wsi_gate_mode: str = 'none',
+        save_attention_heatmap: bool = False,
+        attention_heatmap_dir: Optional[str] = None,
     ):
         super().__init__()
         self.freeze_llm = freeze_llm
@@ -380,6 +391,12 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.enable_wsi_injection = wsi_feature_dims is not None and len(wsi_feature_dims) > 0
         self.wsi_dropout = float(wsi_dropout)
         self.survival_head_dropout = float(survival_head_dropout)
+        self.vision_token_scale = float(vision_token_scale)
+        self.wsi_token_scale = float(wsi_token_scale)
+        self.vision_gate_mode = str(vision_gate_mode)
+        self.wsi_gate_mode = str(wsi_gate_mode)
+        self.save_attention_heatmap = bool(save_attention_heatmap)
+        self.attention_heatmap_dir = attention_heatmap_dir
         self.use_llm_lora = llm_lora is not None
         self._use_llm_lora = self.use_llm_lora
         self.reg_token_id = None
@@ -396,9 +413,14 @@ class LLaVAModel_qwen3_5(BaseModel):
                 raise ValueError("head_scaling must be a float or a length-3 list.")
         if self.prompt_context_mode not in ('embedding', 'llm_hidden'):
             raise ValueError("prompt_context_mode must be 'embedding' or 'llm_hidden'.")
+        if self.vision_gate_mode not in ('none', 'scalar'):
+            raise ValueError("vision_gate_mode must be 'none' or 'scalar'.")
+        if self.wsi_gate_mode not in ('none', 'scalar'):
+            raise ValueError("wsi_gate_mode must be 'none' or 'scalar'.")
 
         self._init_llm(llm, max_position_embeddings)
         self._setup_tokenizer_and_tokens(tokenizer)
+        self._init_token_gates()
         if self.enable_vision:
             self._init_prompt_resampler()
         if self.enable_wsi_injection:
@@ -412,6 +434,39 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.input_composer = InputComposer()
         if pretrained_pth:
             self.load_state_dict(guess_load_checkpoint(pretrained_pth), strict=False)
+
+    def _init_token_gates(self) -> None:
+        if self.vision_gate_mode == 'scalar':
+            self.vision_token_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        else:
+            self.register_parameter('vision_token_gate', None)
+
+        if self.wsi_gate_mode == 'scalar':
+            self.wsi_token_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        else:
+            self.register_parameter('wsi_token_gate', None)
+
+        print_log(
+            f"[TokenGate] vision_gate_mode={self.vision_gate_mode} "
+            f"vision_token_scale={self.vision_token_scale} "
+            f"wsi_gate_mode={self.wsi_gate_mode} "
+            f"wsi_token_scale={self.wsi_token_scale}",
+            'current',
+        )
+
+    def _apply_vision_token_gate(self, tokens: torch.Tensor) -> torch.Tensor:
+        scale = self.vision_token_scale
+        if self.vision_gate_mode == 'scalar' and self.vision_token_gate is not None:
+            gate = torch.sigmoid(self.vision_token_gate).to(device=tokens.device, dtype=tokens.dtype)
+            scale = tokens.new_tensor(scale) * (2.0 * gate)
+        return tokens * scale
+
+    def _apply_wsi_token_gate(self, tokens: torch.Tensor) -> torch.Tensor:
+        scale = self.wsi_token_scale
+        if self.wsi_gate_mode == 'scalar' and self.wsi_token_gate is not None:
+            gate = torch.sigmoid(self.wsi_token_gate).to(device=tokens.device, dtype=tokens.dtype)
+            scale = tokens.new_tensor(scale) * (2.0 * gate)
+        return tokens * scale
 
     def _init_llm(self, llm, max_position_embeddings: Optional[int]) -> None:
         with LoadWoInit():
@@ -467,15 +522,16 @@ class LLaVAModel_qwen3_5(BaseModel):
 
     def _run_prompt_context_model(self, model, **kwargs):
         kwargs.setdefault('use_cache', False)
-        if self.prompt_context_detach:
-            was_training = model.training
-            model.eval()
-            try:
-                with torch.no_grad():
-                    return model(**kwargs)
-            finally:
-                model.train(was_training)
-        return model(**kwargs)
+        with self._temporary_attn_implementation('sdpa'):
+            if self.prompt_context_detach:
+                was_training = model.training
+                model.eval()
+                try:
+                    with torch.no_grad():
+                        return model(**kwargs)
+                finally:
+                    model.train(was_training)
+            return model(**kwargs)
 
     def _setup_tokenizer_and_tokens(self, tokenizer) -> None:
         if isinstance(tokenizer, (dict, Config, ConfigDict)):
@@ -707,9 +763,18 @@ class LLaVAModel_qwen3_5(BaseModel):
 
         targets = []
         llm_config = getattr(self.llm, 'config', None)
-        for cfg in (llm_config, getattr(llm_config, 'text_config', None)):
-            if cfg is None:
+        configs = [llm_config, getattr(llm_config, 'text_config', None)]
+        try:
+            prompt_config = getattr(self._get_prompt_context_model(), 'config', None)
+            configs.extend([prompt_config, getattr(prompt_config, 'text_config', None)])
+        except Exception:
+            pass
+
+        seen_configs = set()
+        for cfg in configs:
+            if cfg is None or id(cfg) in seen_configs:
                 continue
+            seen_configs.add(id(cfg))
             old_values = {}
             for attr in ('_attn_implementation', 'attn_implementation'):
                 if hasattr(cfg, attr):
@@ -849,11 +914,178 @@ class LLaVAModel_qwen3_5(BaseModel):
         self._last_patch_attention = out['patch_attention'].detach()
         self._last_patch_valid_mask = out['patch_valid_mask'].detach()
         return {
-            'pixel_values': out['visual_tokens'],
+            'pixel_values': self._apply_vision_token_gate(out['visual_tokens']),
             'vision_token_positions': out['token_positions'],
             'vision_token_valid': out['token_valid'],
             'patch_attention': out['patch_attention'],
+            'patch_valid_mask': out['patch_valid_mask'],
+            'region_attention': out.get('region_attention'),
+            'region_attention_heads': out.get('region_attention_heads'),
+            'visual_to_region_attention': out.get('visual_to_region_attention'),
+            'visual_to_region_attention_heads': out.get('visual_to_region_attention_heads'),
+            'token_positions': out['token_positions'],
         }
+
+    @staticmethod
+    def _safe_path_name(value: Any, default: str) -> str:
+        value = default if value is None else str(value).rstrip('/')
+        value = value or default
+        value = re.sub(r'[^A-Za-z0-9._-]+', '_', value).strip('._')
+        return value or default
+
+    @staticmethod
+    def _normalize_heatmap_image(heatmap: np.ndarray, valid_mask: np.ndarray) -> Image.Image:
+        heatmap = np.asarray(heatmap, dtype=np.float32)
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        values = heatmap[valid_mask]
+        if values.size == 0:
+            values = heatmap.reshape(-1)
+        lo = float(np.nanmin(values)) if values.size else 0.0
+        hi = float(np.nanmax(values)) if values.size else 0.0
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            arr = np.zeros_like(heatmap, dtype=np.uint8)
+        else:
+            arr = np.clip((heatmap - lo) / (hi - lo), 0.0, 1.0)
+            arr = (arr * 255).astype(np.uint8)
+        arr = np.where(valid_mask, arr, 0).astype(np.uint8)
+        return Image.fromarray(arr, mode='L')
+
+    def _save_attention_heatmaps(self, data: Dict[str, Any], projected: Dict[str, torch.Tensor]) -> None:
+        if not self.save_attention_heatmap or not self.attention_heatmap_dir:
+            return
+        patch_attention = projected.get('patch_attention')
+        valid_mask = projected.get('patch_valid_mask')
+        region_attention = projected.get('region_attention')
+        region_attention_heads = projected.get('region_attention_heads')
+        visual_to_region_attention = projected.get('visual_to_region_attention')
+        visual_to_region_attention_heads = projected.get('visual_to_region_attention_heads')
+        token_positions = projected.get('token_positions')
+        if patch_attention is None or valid_mask is None:
+            return
+
+        patch_attention = patch_attention.detach().float().cpu().numpy()
+        valid_mask = valid_mask.detach().cpu().numpy().astype(bool)
+        if region_attention is not None:
+            region_attention = region_attention.detach().float().cpu().numpy()
+        if region_attention_heads is not None:
+            region_attention_heads = region_attention_heads.detach().float().cpu().numpy()
+        if visual_to_region_attention is not None:
+            visual_to_region_attention = visual_to_region_attention.detach().float().cpu().numpy()
+        if visual_to_region_attention_heads is not None:
+            visual_to_region_attention_heads = visual_to_region_attention_heads.detach().float().cpu().numpy()
+        token_positions = token_positions.detach().cpu().numpy() if token_positions is not None else None
+        feature_shapes = data.get('feature_shapes')
+        if torch.is_tensor(feature_shapes):
+            feature_shapes = feature_shapes.detach().cpu().tolist()
+        image_batch_indices = data.get('image_batch_indices')
+        if torch.is_tensor(image_batch_indices):
+            image_batch_indices = image_batch_indices.detach().cpu().tolist()
+        else:
+            image_batch_indices = list(range(patch_attention.shape[0]))
+        feature_paths = data.get('feature_paths') or [None] * patch_attention.shape[0]
+        sample_ids = data.get('id') or []
+        categories = data.get('category') or []
+        projects = data.get('project') or []
+
+        os.makedirs(self.attention_heatmap_dir, exist_ok=True)
+        counts_by_sample = {}
+        for image_idx in range(patch_attention.shape[0]):
+            if image_idx < len(image_batch_indices):
+                sample_idx = int(image_batch_indices[image_idx])
+            else:
+                sample_idx = image_idx
+            raw_id = sample_ids[sample_idx] if sample_idx < len(sample_ids) else None
+            fallback = feature_paths[image_idx] if image_idx < len(feature_paths) else None
+            fallback = os.path.basename(str(fallback)) if fallback else None
+            fallback_id = self._safe_path_name(fallback, f'sample_{sample_idx}')
+            case_id = self._safe_path_name(raw_id, fallback_id)
+            case_dir = os.path.join(self.attention_heatmap_dir, case_id)
+            os.makedirs(case_dir, exist_ok=True)
+
+            per_sample_count = counts_by_sample.get(sample_idx, 0)
+            counts_by_sample[sample_idx] = per_sample_count + 1
+            suffix = '' if counts_by_sample[sample_idx] == 1 else f'_image{per_sample_count}'
+
+            attn = patch_attention[image_idx]
+            mask = valid_mask[image_idx]
+            mean_heatmap = attn.mean(axis=0)
+            max_heatmap = attn.max(axis=0)
+            region_attn = None
+            region_mean_heatmap = None
+            region_max_heatmap = None
+            if region_attention is not None:
+                region_attn = region_attention[image_idx].reshape(region_attention.shape[1], *mask.shape)
+                region_attn = np.where(mask[None, :, :], region_attn, 0.0)
+                region_mean_heatmap = region_attn.mean(axis=0)
+                region_max_heatmap = region_attn.max(axis=0)
+            visual_to_region = (
+                visual_to_region_attention[image_idx]
+                if visual_to_region_attention is not None
+                else np.empty((0, 0), dtype=np.float32)
+            )
+            region_attn_heads = (
+                region_attention_heads[image_idx]
+                if region_attention_heads is not None
+                else np.empty((0, 0, 0), dtype=np.float32)
+            )
+            visual_to_region_heads = (
+                visual_to_region_attention_heads[image_idx]
+                if visual_to_region_attention_heads is not None
+                else np.empty((0, 0, 0), dtype=np.float32)
+            )
+            token_pos = (
+                token_positions[image_idx]
+                if token_positions is not None
+                else np.empty((0, 2), dtype=np.int64)
+            )
+            np.savez_compressed(
+                os.path.join(case_dir, f'attention{suffix}.npz'),
+                patch_attention=attn,
+                mean_heatmap=mean_heatmap,
+                max_heatmap=max_heatmap,
+                valid_mask=mask,
+                token_positions=token_pos,
+                region_attention=(
+                    region_attn if region_attn is not None
+                    else np.empty((0, *mask.shape), dtype=np.float32)
+                ),
+                region_mean_heatmap=(
+                    region_mean_heatmap if region_mean_heatmap is not None
+                    else np.empty(mask.shape, dtype=np.float32)
+                ),
+                region_max_heatmap=(
+                    region_max_heatmap if region_max_heatmap is not None
+                    else np.empty(mask.shape, dtype=np.float32)
+                ),
+                visual_to_region_attention=visual_to_region,
+                region_attention_heads=region_attn_heads,
+                visual_to_region_attention_heads=visual_to_region_heads,
+            )
+            self._normalize_heatmap_image(mean_heatmap, mask).save(
+                os.path.join(case_dir, f'heatmap_mean{suffix}.png'))
+            self._normalize_heatmap_image(max_heatmap, mask).save(
+                os.path.join(case_dir, f'heatmap_max{suffix}.png'))
+            if region_mean_heatmap is not None and region_max_heatmap is not None:
+                self._normalize_heatmap_image(region_mean_heatmap, mask).save(
+                    os.path.join(case_dir, f'region_heatmap_mean{suffix}.png'))
+                self._normalize_heatmap_image(region_max_heatmap, mask).save(
+                    os.path.join(case_dir, f'region_heatmap_max{suffix}.png'))
+
+            feature_shape = list(mask.shape)
+            if feature_shapes is not None and image_idx < len(feature_shapes):
+                feature_shape = feature_shapes[image_idx]
+            metadata = {
+                'id': raw_id,
+                'sample_index': sample_idx,
+                'image_index': image_idx,
+                'image_file': feature_paths[image_idx] if image_idx < len(feature_paths) else None,
+                'feature_shape': feature_shape,
+                'category': categories[sample_idx] if sample_idx < len(categories) else None,
+                'project': projects[sample_idx] if sample_idx < len(projects) else None,
+            }
+            metadata_path = os.path.join(case_dir, f'metadata{suffix}.json')
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     def _project_wsi_features(self, wsi_features: List[List[torch.Tensor]]) -> Optional[torch.Tensor]:
         if not self.enable_wsi_injection or not hasattr(self, 'wsi_projector'):
@@ -866,7 +1098,7 @@ class LLaVAModel_qwen3_5(BaseModel):
                 wsi_features[b][src_idx].to(device=param.device, dtype=param.dtype)
                 for b in range(batch_size)
             ]))
-        return self.wsi_projector(source_features)
+        return self._apply_wsi_token_gate(self.wsi_projector(source_features))
 
     def forward(self, data: Dict[str, Any], data_samples: Optional[List] = None, mode: str = 'loss') -> Any:
         data = dict(data)
@@ -882,6 +1114,8 @@ class LLaVAModel_qwen3_5(BaseModel):
         has_visual = data.get('features') is not None
         if has_visual:
             projected = self._project_vision_features(data)
+            if mode == 'predict':
+                self._save_attention_heatmaps(data, projected)
             data['pixel_values'] = projected['pixel_values']
             data['vision_token_positions'] = projected['vision_token_positions']
             data['vision_token_valid'] = projected['vision_token_valid']
