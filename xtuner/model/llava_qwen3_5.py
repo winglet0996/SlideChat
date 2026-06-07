@@ -911,10 +911,13 @@ class LLaVAModel_qwen3_5(BaseModel):
             prompt_attention_mask=prompt_mask,
             feature_shapes=feature_shapes,
         )
+        gated_visual_tokens = self._apply_vision_token_gate(out['visual_tokens'])
         self._last_patch_attention = out['patch_attention'].detach()
         self._last_patch_valid_mask = out['patch_valid_mask'].detach()
         return {
-            'pixel_values': self._apply_vision_token_gate(out['visual_tokens']),
+            'pixel_values': gated_visual_tokens,
+            'visual_tokens': out['visual_tokens'],
+            'gated_visual_tokens': gated_visual_tokens,
             'vision_token_positions': out['token_positions'],
             'vision_token_valid': out['token_valid'],
             'patch_attention': out['patch_attention'],
@@ -950,6 +953,17 @@ class LLaVAModel_qwen3_5(BaseModel):
         arr = np.where(valid_mask, arr, 0).astype(np.uint8)
         return Image.fromarray(arr, mode='L')
 
+    @staticmethod
+    def _cosine_similarity_matrix(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if x.size == 0:
+            return np.empty((0, 0), dtype=np.float32)
+        flat = x.reshape(x.shape[0], -1).astype(np.float64, copy=False)
+        norms = np.linalg.norm(flat, axis=1, keepdims=True)
+        norms = np.clip(norms, 1e-12, None)
+        sim = (flat @ flat.T) / (norms * norms.T)
+        return sim.astype(np.float32, copy=False)
+
     def _save_attention_heatmaps(self, data: Dict[str, Any], projected: Dict[str, torch.Tensor]) -> None:
         if not self.save_attention_heatmap or not self.attention_heatmap_dir:
             return
@@ -959,6 +973,8 @@ class LLaVAModel_qwen3_5(BaseModel):
         region_attention_heads = projected.get('region_attention_heads')
         visual_to_region_attention = projected.get('visual_to_region_attention')
         visual_to_region_attention_heads = projected.get('visual_to_region_attention_heads')
+        visual_tokens = projected.get('visual_tokens')
+        gated_visual_tokens = projected.get('gated_visual_tokens')
         token_positions = projected.get('token_positions')
         if patch_attention is None or valid_mask is None:
             return
@@ -973,6 +989,10 @@ class LLaVAModel_qwen3_5(BaseModel):
             visual_to_region_attention = visual_to_region_attention.detach().float().cpu().numpy()
         if visual_to_region_attention_heads is not None:
             visual_to_region_attention_heads = visual_to_region_attention_heads.detach().float().cpu().numpy()
+        if visual_tokens is not None:
+            visual_tokens = visual_tokens.detach().float().cpu().numpy()
+        if gated_visual_tokens is not None:
+            gated_visual_tokens = gated_visual_tokens.detach().float().cpu().numpy()
         token_positions = token_positions.detach().cpu().numpy() if token_positions is not None else None
         feature_shapes = data.get('feature_shapes')
         if torch.is_tensor(feature_shapes):
@@ -1033,6 +1053,41 @@ class LLaVAModel_qwen3_5(BaseModel):
                 if visual_to_region_attention_heads is not None
                 else np.empty((0, 0, 0), dtype=np.float32)
             )
+            visual_token_embeds = (
+                visual_tokens[image_idx]
+                if visual_tokens is not None
+                else np.empty((0, 0), dtype=np.float32)
+            )
+            gated_visual_token_embeds = (
+                gated_visual_tokens[image_idx]
+                if gated_visual_tokens is not None
+                else np.empty((0, 0), dtype=np.float32)
+            )
+            visual_token_cosine = self._cosine_similarity_matrix(visual_token_embeds)
+            gated_visual_token_cosine = self._cosine_similarity_matrix(gated_visual_token_embeds)
+            if visual_to_region_heads.size and region_attn_heads.size:
+                composed_patch_attention_same_head = np.einsum(
+                    'hvr,hrp->hvp',
+                    visual_to_region_heads.astype(np.float32, copy=False),
+                    region_attn_heads.astype(np.float32, copy=False),
+                )
+                composed_patch_attention_same_head = np.where(
+                    mask.reshape(1, 1, -1),
+                    composed_patch_attention_same_head,
+                    0.0,
+                )
+                composed_patch_attention_same_head = composed_patch_attention_same_head / np.clip(
+                    composed_patch_attention_same_head.sum(axis=-1, keepdims=True),
+                    1e-6,
+                    None,
+                )
+                composed_patch_attention_same_head = composed_patch_attention_same_head.reshape(
+                    composed_patch_attention_same_head.shape[0],
+                    composed_patch_attention_same_head.shape[1],
+                    *mask.shape,
+                )
+            else:
+                composed_patch_attention_same_head = np.empty((0, 0, *mask.shape), dtype=np.float32)
             token_pos = (
                 token_positions[image_idx]
                 if token_positions is not None
@@ -1057,9 +1112,14 @@ class LLaVAModel_qwen3_5(BaseModel):
                     region_max_heatmap if region_max_heatmap is not None
                     else np.empty(mask.shape, dtype=np.float32)
                 ),
+                visual_tokens=visual_token_embeds,
+                visual_token_cosine=visual_token_cosine,
+                gated_visual_tokens=gated_visual_token_embeds,
+                gated_visual_token_cosine=gated_visual_token_cosine,
                 visual_to_region_attention=visual_to_region,
                 region_attention_heads=region_attn_heads,
                 visual_to_region_attention_heads=visual_to_region_heads,
+                composed_patch_attention_same_head=composed_patch_attention_same_head,
             )
             self._normalize_heatmap_image(mean_heatmap, mask).save(
                 os.path.join(case_dir, f'heatmap_mean{suffix}.png'))

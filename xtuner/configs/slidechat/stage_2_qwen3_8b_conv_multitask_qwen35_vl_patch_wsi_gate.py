@@ -31,7 +31,7 @@ setting = 'lora'
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 2e-5  # Reduced from 1e-4 for better stability
+    lr = 1e-4  # Reduced from 1e-4 for better stability
     ckpt_path = None
     # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
     max_epochs = 1
@@ -47,7 +47,7 @@ if setting == 'lora':
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v6/iter_3000.pth'
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v8_1token/iter_7500.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -61,7 +61,7 @@ if setting == 'full_param':
     
 resume = False
 
-model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
+model_type = 'text_patch'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
 kg_status='wo_knowledge'
 
@@ -88,7 +88,7 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v7_gate'
+exp_tag = 'v8_1token_keep'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
 vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 # vis_name = None
@@ -219,17 +219,21 @@ tokenizer = dict(
 if model_type in ('text_patch', 'multimodal'):
     prompt_resampler_cfg = dict(
         patch_dim=768,
-        resampler_dim=1024,
-        num_region_tokens=128,
-        num_visual_tokens=64,
-        num_heads=8,
+        resampler_dim=2048,
+        num_region_tokens=16,
+        num_visual_tokens=1,
+        num_heads=16,
         dropout=0.2,
         use_local_conv=True,
     )
 else:
     prompt_resampler_cfg = None
 
-wsi_feature_dims = [768, 1280] if model_type in ('text_wsi', 'multimodal') else None
+wsi_feature_source = 'both'
+wsi_feature_fields = dict(titan='slide_features_titan', prism='slide_features_prism', both='wsi_features')
+wsi_feature_dims_by_source = dict(titan=[768], prism=[1280], both=[768, 1280])
+wsi_feature_field = wsi_feature_fields[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else 'wsi_features'
+wsi_feature_dims = wsi_feature_dims_by_source[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else None
 
 model = dict(
     type=LLaVAModel_qwen3_5,
@@ -291,7 +295,8 @@ train_llava_dataset = dict(
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
-    load_wsi_features=model_type in ('text_wsi', 'multimodal'))
+    load_wsi_features=model_type in ('text_wsi', 'multimodal'),
+    wsi_feature_field=wsi_feature_field)
 
 train_dataloader = dict(
     batch_size=batch_size,
@@ -319,7 +324,8 @@ val_llava_dataset = dict(
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
-    load_wsi_features=model_type in ('text_wsi', 'multimodal'))
+    load_wsi_features=model_type in ('text_wsi', 'multimodal'),
+    wsi_feature_field=wsi_feature_field)
 
 val_dataloader = dict(
     batch_size=batch_size,
@@ -351,7 +357,8 @@ test_llava_dataset = dict(
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
-    load_wsi_features=model_type in ('text_wsi', 'multimodal'))
+    load_wsi_features=model_type in ('text_wsi', 'multimodal'),
+    wsi_feature_field=wsi_feature_field)
 
 test_dataloader = dict(
     batch_size=batch_size,

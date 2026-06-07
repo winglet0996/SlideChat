@@ -47,7 +47,7 @@ if setting == 'lora':
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v6/iter_3000.pth'
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v8_1token/iter_7500.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -72,8 +72,8 @@ llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
 val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/categories/test.json'
+test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/cptac_test/test.json'
+# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/tcga_test/test.json'
 
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
@@ -89,8 +89,8 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v7_gate'
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
+exp_tag = 'v8_1token'
+# work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
 # vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 vis_name = None
 
@@ -109,10 +109,8 @@ visualizer = None if vis_name is None else dict(
     ]
 )
 
-val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_results'
-save_attention_heatmap = True
-attention_heatmap_dir = test_output_path + '/attn_heatmap'
+val_output_path = None
+test_output_path = None
 
 # Save
 by_epoch = False
@@ -222,10 +220,10 @@ tokenizer = dict(
 if model_type in ('text_patch', 'multimodal'):
     prompt_resampler_cfg = dict(
         patch_dim=768,
-        resampler_dim=1024,
-        num_region_tokens=128,
-        num_visual_tokens=64,
-        num_heads=8,
+        resampler_dim=2048,
+        num_region_tokens=16,
+        num_visual_tokens=1,
+        num_heads=16,
         dropout=0.2,
         use_local_conv=True,
     )
@@ -273,8 +271,6 @@ model = dict(
     wsi_gate_mode='scalar',
     vision_token_scale=0.5,
     wsi_token_scale=2.0,
-    save_attention_heatmap=save_attention_heatmap,
-    attention_heatmap_dir=attention_heatmap_dir,
 )
 
 #######################################################################
@@ -352,7 +348,6 @@ test_llava_dataset = dict(
     max_patch_num=max_patch_num,
     per_image_length=per_image_length,
     mode='test',
-    crop_size=None,
     input_ids_with_output=True,
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,

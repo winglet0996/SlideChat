@@ -88,6 +88,13 @@ def main():
     elif cfg.get("work_dir", None) is None:
         cfg.work_dir = osp.join("./work_dirs", osp.splitext(osp.basename(args.config))[0])
 
+    # Keep evaluator outputs derived from the final runtime work_dir so CLI
+    # --work-dir controls result locations instead of config-time strings.
+    if cfg.get("val_evaluator", None) is not None:
+        cfg.val_evaluator["output_dir"] = osp.join(cfg.work_dir, "val_results")
+    if cfg.get("test_evaluator", None) is not None:
+        cfg.test_evaluator["output_dir"] = osp.join(cfg.work_dir, "test_results")
+
     # only pretrained weights
     runner = RUNNERS.build(cfg)
 

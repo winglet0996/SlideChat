@@ -175,7 +175,8 @@ class LLaVADataset(Dataset):
                  text_only=False,
                  preprocess_num_workers=None,
                  load_patch_features=True,
-                 load_wsi_features=True):
+                 load_wsi_features=True,
+                 wsi_feature_field='wsi_features'):
         super().__init__()
 
         self.max_patch_num = max_patch_num
@@ -186,6 +187,7 @@ class LLaVADataset(Dataset):
         self.preprocess_num_workers = preprocess_num_workers
         self.load_patch_features = load_patch_features
         self.load_wsi_features = load_wsi_features
+        self.wsi_feature_field = wsi_feature_field
         if max_patch_num is None:
             if mode == 'train':
                 if self.crop_size is not None:
@@ -441,7 +443,15 @@ class LLaVADataset(Dataset):
             data_dict.pop('image_file', None)
 
         # 2. 加载 WSI 全局特征
-        wsi_paths = data_dict.get('wsi_features')
+        wsi_paths = data_dict.get(self.wsi_feature_field)
+        if wsi_paths is None and self.wsi_feature_field != 'wsi_features':
+            wsi_paths = data_dict.get('wsi_features')
+        if self.wsi_feature_field != 'wsi_features' and isinstance(wsi_paths, (list, tuple)):
+            matched_wsi_paths = [p for p in wsi_paths if self.wsi_feature_field in str(p)]
+            if not matched_wsi_paths:
+                raise ValueError(
+                    f"No WSI feature path matching {self.wsi_feature_field!r} in {wsi_paths!r}")
+            wsi_paths = matched_wsi_paths[0]
         if self.load_wsi_features and wsi_paths:
             wsi_list = [wsi_paths] if isinstance(wsi_paths, str) else wsi_paths
             data_dict['wsi_features'] = load_wsi_global_features(wsi_list)
