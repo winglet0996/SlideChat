@@ -61,7 +61,7 @@ if setting == 'full_param':
     
 resume = False
 
-model_type = 'text_patch'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
+model_type = 'text_wsi'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
 kg_status='wo_knowledge'
 
@@ -74,24 +74,16 @@ train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipelin
 val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
 test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
 
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/regression__train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
-
 
 # ckpt_out_path = 's3://zhaoweike/ckpt'
 ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v9_1token_keep'
+exp_tag = 'v8_1token_prism'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
-vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
-# vis_name = None
+# vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
+vis_name = None
 
 
 # set visualizer
@@ -113,12 +105,12 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1500
+interval = 3000
 # interval = 1
 save_total_limit = 20
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1500  # More frequent evaluation for alignment debugging
+evaluation_freq = 3000  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -231,7 +223,7 @@ if model_type in ('text_patch', 'multimodal'):
 else:
     prompt_resampler_cfg = None
 
-wsi_feature_source = 'titan'
+wsi_feature_source = 'prism'
 wsi_feature_fields = dict(titan='slide_features_titan', prism='slide_features_prism', both='wsi_features')
 wsi_feature_dims_by_source = dict(titan=[768], prism=[1280], both=[768, 1280])
 wsi_feature_field = wsi_feature_fields[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else 'wsi_features'

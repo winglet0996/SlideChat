@@ -724,19 +724,67 @@ class MRoPEPositionIDGenerator(nn.Module):
         return pos
 
 
+class PatchDecoderBlock(nn.Module):
+    """Pre-norm query decoder block: self-attn, patch cross-attn, FFN."""
+
+    def __init__(self, dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        attn_kwargs = dict(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.self_norm = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(**attn_kwargs)
+        self.cross_norm = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(**attn_kwargs)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        patch_tokens: torch.Tensor,
+        patch_key_padding_mask: torch.Tensor,
+        need_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        normed = self.self_norm(x)
+        ctx, _ = self.self_attn(query=normed, key=normed, value=normed, need_weights=False)
+        x = x + self.dropout(ctx)
+
+        normed = self.cross_norm(x)
+        ctx, attn_heads = self.cross_attn(
+            query=normed,
+            key=patch_tokens,
+            value=patch_tokens,
+            key_padding_mask=patch_key_padding_mask,
+            need_weights=need_weights,
+            average_attn_weights=False,
+        )
+        x = x + self.dropout(ctx)
+        x = x + self.dropout(self.ffn(self.ffn_norm(x)))
+        return x, attn_heads
+
+
 class PromptConditionedPatchResampler(nn.Module):
-    """Two-stage prompt-conditioned cross-attention resampler for WSI patch grids."""
+    """Single-stage prompt-conditioned decoder stack for WSI patch grids."""
 
     def __init__(
         self,
         patch_dim: int = 768,
         llm_hidden_size: int = 2560,
         resampler_dim: int = 1024,
-        num_region_tokens: int = 128,
+        num_query: Optional[int] = None,
+        num_layers: int = 2,
+        num_region_tokens: Optional[int] = None,
         num_visual_tokens: Optional[int] = 64,
         num_heads: int = 8,
         dropout: float = 0.0,
         use_local_conv: bool = True,
+        query_init_std: float = 0.5,
+        output_gate_init: float = 1.0,
     ):
         super().__init__()
         if resampler_dim % num_heads != 0:
@@ -745,12 +793,18 @@ class PromptConditionedPatchResampler(nn.Module):
         self.patch_dim = int(patch_dim)
         self.llm_hidden_size = int(llm_hidden_size)
         self.resampler_dim = int(resampler_dim)
-        self.num_region_tokens = int(num_region_tokens)
-        self.num_visual_tokens = None if num_visual_tokens is None else int(num_visual_tokens)
-        if self.num_region_tokens <= 0:
-            raise ValueError(f"num_region_tokens must be positive, got {self.num_region_tokens}.")
-        if self.num_visual_tokens is not None and self.num_visual_tokens <= 0:
-            raise ValueError(f"num_visual_tokens must be positive or None, got {self.num_visual_tokens}.")
+        if num_query is None:
+            num_query = num_visual_tokens if num_visual_tokens is not None else num_region_tokens
+        self.num_query = 8 if num_query is None else int(num_query)
+        self.num_layers = int(num_layers)
+        self.query_init_std = float(query_init_std)
+        self.output_gate_init = float(output_gate_init)
+        if self.num_query <= 0:
+            raise ValueError(f"num_query must be positive, got {self.num_query}.")
+        if self.num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {self.num_layers}.")
+        if self.query_init_std <= 0:
+            raise ValueError(f"query_init_std must be positive, got {self.query_init_std}.")
 
         self.patch_proj = nn.Linear(self.patch_dim, self.resampler_dim)
         self.patch_norm = nn.LayerNorm(self.resampler_dim)
@@ -771,58 +825,23 @@ class PromptConditionedPatchResampler(nn.Module):
 
         self.prompt_proj = nn.Linear(self.llm_hidden_size, self.resampler_dim)
         self.prompt_norm = nn.LayerNorm(self.resampler_dim)
-        self.region_queries = nn.Parameter(torch.empty(self.num_region_tokens, self.resampler_dim))
-        if self.num_visual_tokens is not None:
-            self.visual_queries = nn.Parameter(torch.empty(self.num_visual_tokens, self.resampler_dim))
-        else:
-            self.visual_queries = None
-        self.region_prompt_bias = nn.Linear(self.resampler_dim, self.resampler_dim)
-        self.visual_prompt_bias = (
-            nn.Linear(self.resampler_dim, self.resampler_dim)
-            if self.num_visual_tokens is not None else None
-        )
-
+        self.query_tokens = nn.Parameter(torch.empty(self.num_query, self.resampler_dim))
+        self.query_id = nn.Parameter(torch.empty(self.num_query, self.resampler_dim))
         attn_kwargs = dict(embed_dim=self.resampler_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        self.region_prompt_attn = nn.MultiheadAttention(**attn_kwargs)
-        self.visual_prompt_attn = (
-            nn.MultiheadAttention(**attn_kwargs)
-            if self.num_visual_tokens is not None else None
-        )
-        self.region_cross_attn = nn.MultiheadAttention(**attn_kwargs)
-        self.visual_cross_attn = (
-            nn.MultiheadAttention(**attn_kwargs)
-            if self.num_visual_tokens is not None else None
-        )
-
-        self.region_norm = nn.LayerNorm(self.resampler_dim)
-        self.visual_norm = (
-            nn.LayerNorm(self.resampler_dim)
-            if self.num_visual_tokens is not None else None
-        )
-        self.region_ffn = nn.Sequential(
-            nn.LayerNorm(self.resampler_dim),
-            nn.Linear(self.resampler_dim, self.resampler_dim * 4),
-            nn.GELU(),
-            nn.Linear(self.resampler_dim * 4, self.resampler_dim),
-        )
-        self.visual_ffn = (
-            nn.Sequential(
-                nn.LayerNorm(self.resampler_dim),
-                nn.Linear(self.resampler_dim, self.resampler_dim * 4),
-                nn.GELU(),
-                nn.Linear(self.resampler_dim * 4, self.resampler_dim),
-            )
-            if self.num_visual_tokens is not None else None
-        )
+        self.prompt_attn = nn.MultiheadAttention(**attn_kwargs)
+        self.decoder_blocks = nn.ModuleList([
+            PatchDecoderBlock(self.resampler_dim, num_heads, dropout)
+            for _ in range(self.num_layers)
+        ])
         self.to_llm = nn.Linear(self.resampler_dim, self.llm_hidden_size)
         self.output_norm = nn.LayerNorm(self.llm_hidden_size)
+        self.output_gate = nn.Parameter(torch.tensor(self.output_gate_init, dtype=torch.float32))
         self.dropout = nn.Dropout(dropout)
         self._init_weights()
 
     def _init_weights(self):
-        trunc_normal_(self.region_queries, std=.02)
-        if self.visual_queries is not None:
-            trunc_normal_(self.visual_queries, std=.02)
+        trunc_normal_(self.query_tokens, std=self.query_init_std)
+        trunc_normal_(self.query_id, std=self.query_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 trunc_normal_(module.weight, std=.02)
@@ -889,18 +908,10 @@ class PromptConditionedPatchResampler(nn.Module):
             mask[empty, 0] = True
         return prompt_embeds, mask
 
-    @staticmethod
-    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        weight = mask.to(dtype=x.dtype).unsqueeze(-1)
-        return (x * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
-
-    def _condition_queries(self, query_bank, prompt_tokens, prompt_mask, prompt_bias, prompt_attn):
+    def _condition_queries(self, prompt_tokens, prompt_mask):
         batch_size = prompt_tokens.size(0)
-        summary = self._masked_mean(prompt_tokens, prompt_mask)
-        queries = query_bank.unsqueeze(0).expand(batch_size, -1, -1)
-        queries = queries + prompt_bias(summary).unsqueeze(1)
-        conditioned, _ = prompt_attn(
+        queries = (self.query_tokens + self.query_id).unsqueeze(0).expand(batch_size, -1, -1)
+        conditioned, _ = self.prompt_attn(
             query=queries,
             key=prompt_tokens,
             value=prompt_tokens,
@@ -950,7 +961,7 @@ class PromptConditionedPatchResampler(nn.Module):
         patch_tokens = patch_tokens + self.coord_proj(coords)
 
         if self.local_mixer is not None:
-            grid_tokens = patch_tokens.view(b, h, w, self.resampler_dim).permute(0, 3, 1, 2)
+            grid_tokens = patch_tokens.view(b, h, w, self.resampler_dim).permute(0, 3, 1, 2).contiguous()
             grid_tokens = grid_tokens * valid_mask.unsqueeze(1).to(dtype=grid_tokens.dtype)
             mixed = self.local_mixer(grid_tokens)
             mixed = mixed * valid_mask.unsqueeze(1).to(dtype=mixed.dtype)
@@ -971,53 +982,23 @@ class PromptConditionedPatchResampler(nn.Module):
         )
         self._raise_if_nonfinite('prompt_tokens', prompt_tokens, extra='after_prompt_proj_norm')
         prompt_tokens = prompt_tokens.to(dtype=prompt_dtype)
+
         patch_key_padding = ~valid_mask.flatten(1)
-        region_queries = self._condition_queries(
-            self.region_queries,
-            prompt_tokens,
-            prompt_attention_mask,
-            self.region_prompt_bias,
-            self.region_prompt_attn,
-        )
-        region_ctx, region_attn_heads = self.region_cross_attn(
-            query=region_queries,
-            key=patch_tokens,
-            value=patch_tokens,
-            key_padding_mask=patch_key_padding,
-            need_weights=True,
-            average_attn_weights=False,
-        )
-        region_attn = region_attn_heads.mean(dim=1)
-        region_tokens = self.region_norm(region_queries + self.dropout(region_ctx))
-        region_tokens = region_tokens + self.dropout(self.region_ffn(region_tokens))
-
-        if self.num_visual_tokens is None:
-            visual_tokens = region_tokens
-            visual_to_region_attn = None
-            visual_to_region_attn_heads = None
-            patch_attention = region_attn.float()
-            num_output_tokens = self.num_region_tokens
-        else:
-            visual_queries = self._condition_queries(
-                self.visual_queries,
-                prompt_tokens,
-                prompt_attention_mask,
-                self.visual_prompt_bias,
-                self.visual_prompt_attn,
+        visual_tokens = self._condition_queries(prompt_tokens, prompt_attention_mask)
+        patch_attn_heads = None
+        for layer_idx, block in enumerate(self.decoder_blocks):
+            visual_tokens, attn_heads = block(
+                visual_tokens,
+                patch_tokens,
+                patch_key_padding,
+                need_weights=layer_idx == len(self.decoder_blocks) - 1,
             )
-            visual_ctx, visual_to_region_attn_heads = self.visual_cross_attn(
-                query=visual_queries,
-                key=region_tokens,
-                value=region_tokens,
-                need_weights=True,
-                average_attn_weights=False,
-            )
-            visual_to_region_attn = visual_to_region_attn_heads.mean(dim=1)
-            visual_tokens = self.visual_norm(visual_queries + self.dropout(visual_ctx))
-            visual_tokens = visual_tokens + self.dropout(self.visual_ffn(visual_tokens))
-            patch_attention = torch.bmm(visual_to_region_attn.float(), region_attn.float())
-            num_output_tokens = self.num_visual_tokens
+            if attn_heads is not None:
+                patch_attn_heads = attn_heads
+        if patch_attn_heads is None:
+            raise RuntimeError("Decoder stack did not return final cross-attention weights.")
 
+        patch_attention = patch_attn_heads.mean(dim=1).float()
         patch_attention = patch_attention.masked_fill(~valid_mask.flatten(1).unsqueeze(1), 0.0)
         patch_attention = patch_attention / patch_attention.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
@@ -1025,19 +1006,20 @@ class PromptConditionedPatchResampler(nn.Module):
         token_positions = torch.bmm(patch_attention, coord_indices).round().long()
         token_positions[..., 0].clamp_(0, h - 1)
         token_positions[..., 1].clamp_(0, w - 1)
-        token_valid = torch.ones((b, num_output_tokens), dtype=torch.bool, device=features.device)
+        token_valid = torch.ones((b, self.num_query), dtype=torch.bool, device=features.device)
         llm_tokens = self.output_norm(self.to_llm(visual_tokens))
+        llm_tokens = llm_tokens * self.output_gate.to(device=llm_tokens.device, dtype=llm_tokens.dtype)
 
         return {
             'visual_tokens': llm_tokens,
             'token_positions': token_positions,
             'token_valid': token_valid,
-            'patch_attention': patch_attention.view(b, num_output_tokens, h, w),
+            'patch_attention': patch_attention.view(b, self.num_query, h, w),
             'patch_valid_mask': valid_mask,
-            'region_attention': region_attn,
-            'region_attention_heads': region_attn_heads,
-            'visual_to_region_attention': visual_to_region_attn,
-            'visual_to_region_attention_heads': visual_to_region_attn_heads,
+            'region_attention': patch_attention,
+            'region_attention_heads': patch_attn_heads,
+            'visual_to_region_attention': None,
+            'visual_to_region_attention_heads': None,
         }
 
 

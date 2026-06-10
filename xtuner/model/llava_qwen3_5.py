@@ -355,7 +355,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         lambda_srv: float = 1.0,
         prompt_resampler_cfg: Optional[Dict] = None,
         prompt_context_mode: str = 'llm_hidden',
-        prompt_context_layer: int = -1,
+        prompt_context_layer: Union[int, str] = 'auto',
         prompt_context_detach: bool = True,
         enable_nonfinite_checks: bool = False,
         wsi_feature_dims: Optional[List[int]] = None,
@@ -383,7 +383,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.lambda_srv = lambda_srv
         self.prompt_resampler_cfg = prompt_resampler_cfg
         self.prompt_context_mode = prompt_context_mode
-        self.prompt_context_layer = int(prompt_context_layer)
+        self.prompt_context_layer = prompt_context_layer if str(prompt_context_layer).lower() == 'auto' else int(prompt_context_layer)
         self.prompt_context_detach = bool(prompt_context_detach)
         self.enable_nonfinite_checks = bool(enable_nonfinite_checks)
         self.enable_vision = prompt_resampler_cfg is not None
@@ -437,12 +437,12 @@ class LLaVAModel_qwen3_5(BaseModel):
 
     def _init_token_gates(self) -> None:
         if self.vision_gate_mode == 'scalar':
-            self.vision_token_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+            self.vision_token_gate = nn.Parameter(torch.ones((), dtype=torch.float32))
         else:
             self.register_parameter('vision_token_gate', None)
 
         if self.wsi_gate_mode == 'scalar':
-            self.wsi_token_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+            self.wsi_token_gate = nn.Parameter(torch.ones((), dtype=torch.float32))
         else:
             self.register_parameter('wsi_token_gate', None)
 
@@ -627,12 +627,14 @@ class LLaVAModel_qwen3_5(BaseModel):
         cfg = dict(
             patch_dim=768,
             llm_hidden_size=self._get_llm_hidden_size(),
-            resampler_dim=min(1024, self._get_llm_hidden_size()),
-            num_region_tokens=128,
-            num_visual_tokens=64,
+            resampler_dim=min(2048, self._get_llm_hidden_size()),
+            num_query=8,
+            num_layers=2,
             num_heads=8,
             dropout=0.0,
             use_local_conv=True,
+            query_init_std=0.5,
+            output_gate_init=1.0,
         )
         cfg.update(self.prompt_resampler_cfg or {})
         cfg['llm_hidden_size'] = self._get_llm_hidden_size()
@@ -790,6 +792,18 @@ class LLaVAModel_qwen3_5(BaseModel):
                 for attr, old_value in old_values.items():
                     setattr(cfg, attr, old_value)
 
+    def _resolve_prompt_context_layer(self, hidden_states) -> int:
+        if str(self.prompt_context_layer).lower() == 'auto':
+            num_llm_layers = max(len(hidden_states) - 1, 1)
+            return min(len(hidden_states) - 1, max(1, round(num_llm_layers * 2 / 3)))
+        layer = int(self.prompt_context_layer)
+        if not (-len(hidden_states) <= layer < len(hidden_states)):
+            raise IndexError(
+                f"prompt_context_layer={layer} is out of range for "
+                f"{len(hidden_states)} hidden-state tensors."
+            )
+        return layer if layer >= 0 else len(hidden_states) + layer
+
     def _prompt_mask(self, data: Dict[str, Any]) -> torch.Tensor:
         input_ids = data['input_ids']
         labels = data.get('labels')
@@ -839,42 +853,24 @@ class LLaVAModel_qwen3_5(BaseModel):
         if self.prompt_context_mode == 'embedding':
             return prompt_inputs['inputs_embeds'], prompt_inputs['attention_mask']
 
-        layer = self.prompt_context_layer
         prompt_model = self._get_prompt_context_model()
-        if layer == -1:
-            outputs = self._run_prompt_context_model(
-                prompt_model,
-                inputs_embeds=prompt_inputs['inputs_embeds'],
-                attention_mask=prompt_inputs['attention_mask'],
-                position_ids=prompt_inputs['position_ids'],
-                return_dict=True,
-            )
-            context_embeds = getattr(outputs, 'last_hidden_state', None)
-            if context_embeds is None and isinstance(outputs, (tuple, list)) and len(outputs) > 0:
-                context_embeds = outputs[0]
-            if context_embeds is None:
-                raise TypeError(f"Prompt context model returned unsupported output type: {type(outputs)!r}")
-        else:
-            outputs = self._run_prompt_context_model(
-                prompt_model,
-                inputs_embeds=prompt_inputs['inputs_embeds'],
-                attention_mask=prompt_inputs['attention_mask'],
-                position_ids=prompt_inputs['position_ids'],
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            hidden_states = outputs.hidden_states
-            if not (-len(hidden_states) <= layer < len(hidden_states)):
-                raise IndexError(
-                    f"prompt_context_layer={layer} is out of range for "
-                    f"{len(hidden_states)} hidden-state tensors."
-                )
-            context_embeds = hidden_states[layer]
-            selected_layer = layer if layer >= 0 else len(hidden_states) + layer
-            if selected_layer == len(hidden_states) - 1:
-                final_norm = self._get_language_model_norm()
-                if final_norm is not None:
-                    context_embeds = final_norm(context_embeds)
+        outputs = self._run_prompt_context_model(
+            prompt_model,
+            inputs_embeds=prompt_inputs['inputs_embeds'],
+            attention_mask=prompt_inputs['attention_mask'],
+            position_ids=prompt_inputs['position_ids'],
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden_states = outputs.hidden_states
+        if hidden_states is None:
+            raise TypeError(f"Prompt context model did not return hidden_states: {type(outputs)!r}")
+        selected_layer = self._resolve_prompt_context_layer(hidden_states)
+        context_embeds = hidden_states[selected_layer]
+        if selected_layer == len(hidden_states) - 1:
+            final_norm = self._get_language_model_norm()
+            if final_norm is not None:
+                context_embeds = final_norm(context_embeds)
         self._maybe_raise_if_nonfinite(
             'prompt_context_embeds',
             context_embeds,
@@ -1875,6 +1871,52 @@ class LLaVAModel_qwen3_5(BaseModel):
     def init_weights(self) -> None:
         pass
 
+    def _special_token_row_items(self) -> List[Tuple[str, int]]:
+        items = []
+        if self.enable_regression and self.reg_token_id is not None:
+            items.append(('reg', int(self.reg_token_id)))
+        if self.enable_survival and self.srv_token_id is not None:
+            items.append(('srv', int(self.srv_token_id)))
+        return items
+
+    def _add_special_token_rows_to_state_dict(self, keep: OrderedDict) -> None:
+        token_items = self._special_token_row_items()
+        if not token_items:
+            return
+
+        emb = self.llm.get_input_embeddings()
+        if emb is not None and hasattr(emb, 'weight'):
+            for name, token_id in token_items:
+                if 0 <= token_id < emb.weight.size(0):
+                    keep[f'special_token_embeddings.input.{name}'] = emb.weight[token_id].detach().clone()
+
+        out = self.llm.get_output_embeddings()
+        if out is not None and out is not emb and hasattr(out, 'weight'):
+            for name, token_id in token_items:
+                if 0 <= token_id < out.weight.size(0):
+                    keep[f'special_token_embeddings.output.{name}'] = out.weight[token_id].detach().clone()
+
+    def _load_special_token_rows(self, rows: Dict[str, torch.Tensor]) -> None:
+        if not rows:
+            return
+        token_items = dict(self._special_token_row_items())
+
+        emb = self.llm.get_input_embeddings()
+        if emb is not None and hasattr(emb, 'weight'):
+            with torch.no_grad():
+                for name, token_id in token_items.items():
+                    key = f'special_token_embeddings.input.{name}'
+                    if key in rows and 0 <= token_id < emb.weight.size(0):
+                        emb.weight[token_id].copy_(rows[key].to(device=emb.weight.device, dtype=emb.weight.dtype))
+
+        out = self.llm.get_output_embeddings()
+        if out is not None and out is not emb and hasattr(out, 'weight'):
+            with torch.no_grad():
+                for name, token_id in token_items.items():
+                    key = f'special_token_embeddings.output.{name}'
+                    if key in rows and 0 <= token_id < out.weight.size(0):
+                        out.weight[token_id].copy_(rows[key].to(device=out.weight.device, dtype=out.weight.dtype))
+
     def state_dict(self, *args, **kwargs) -> OrderedDict:
         state_dict = super().state_dict(*args, **kwargs)
         keep = OrderedDict()
@@ -1890,7 +1932,55 @@ class LLaVAModel_qwen3_5(BaseModel):
             'special_lm_head.',
         ]
         keep.update({k: v for k, v in state_dict.items() if any(key in k for key in trainable_keys)})
+        gate_keys = ('vision_token_gate', 'wsi_token_gate')
+        keep.update({k: v for k, v in state_dict.items() if k in gate_keys})
+        self._add_special_token_rows_to_state_dict(keep)
         return keep
+
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = False):
+        state_dict = OrderedDict(state_dict)
+        special_rows = OrderedDict(
+            (k, state_dict.pop(k))
+            for k in list(state_dict.keys())
+            if k.startswith('special_token_embeddings.')
+        )
+
+        new_state_dict = OrderedDict()
+        is_lora_model = bool(self.use_llm_lora)
+        is_lora_ckpt = any(
+            k.startswith('llm.') and 'base_model.model' in k
+            for k in state_dict
+        )
+        mapped_count = 0
+        llm_keys_count = 0
+
+        for key, value in state_dict.items():
+            new_key = key
+            if key.startswith('llm.'):
+                llm_keys_count += 1
+                if is_lora_model and not is_lora_ckpt:
+                    new_key = key.replace('llm.', 'llm.base_model.model.', 1)
+                    mapped_count += 1
+                elif not is_lora_model and is_lora_ckpt:
+                    new_key = key.replace('llm.base_model.model.', 'llm.', 1)
+                    mapped_count += 1
+            new_state_dict[new_key] = value
+
+        incompatible = super().load_state_dict(new_state_dict, strict=strict)
+        self._load_special_token_rows(special_rows)
+        if is_main_process():
+            mode = 'LoRA' if is_lora_model else 'Full/Alignment'
+            ckpt_type = 'LoRA' if is_lora_ckpt else 'Full/Alignment'
+            missing = len(getattr(incompatible, 'missing_keys', []))
+            unexpected = len(getattr(incompatible, 'unexpected_keys', []))
+            print_log(
+                f'[WeightLoading] Loaded {len(state_dict)} keys | '
+                f'LLM: {llm_keys_count} | Remapped: {mapped_count} | '
+                f'Checkpoint: {ckpt_type} -> Model: {mode} | '
+                f'SpecialRows: {len(special_rows)} | Missing: {missing} | Unexpected: {unexpected}',
+                'current',
+            )
+        return incompatible
 
     @staticmethod
     def _is_kbit_model(model: nn.Module) -> bool:

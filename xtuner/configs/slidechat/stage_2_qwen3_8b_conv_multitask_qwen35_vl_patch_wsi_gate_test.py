@@ -31,10 +31,10 @@ setting = 'lora'
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 2e-5  # Reduced from 1e-4 for better stability
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_multitask_mcqa_srv/iter_16500.pth'
-    max_epochs = 1
+    lr = 5e-5  # Reduced from 1e-4 for better stability
+    # ckpt_path = None
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_text_patch_alignment_wo_knowledge_v9_1token_keep/iter_9615.pth'
+    max_epochs = 2
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
@@ -47,7 +47,7 @@ if setting == 'lora':
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v8_1token/iter_7500.pth'
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_text_patch_alignment_wo_knowledge_v9_1token_keep/iter_9615.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -61,7 +61,7 @@ if setting == 'full_param':
     
 resume = False
 
-model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
+model_type = 'text_wsi'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
 kg_status='wo_knowledge'
 
@@ -72,16 +72,7 @@ llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
 val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/cptac_test/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/tcga_test/test.json'
-
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/regression__train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
+test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/tcga_test/test.json'
 
 
 # ckpt_out_path = 's3://zhaoweike/ckpt'
@@ -89,8 +80,8 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v8_1token'
-# work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
+exp_tag = 'v8_1token_titan'
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
 # vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 vis_name = None
 
@@ -109,17 +100,17 @@ visualizer = None if vis_name is None else dict(
     ]
 )
 
-val_output_path = None
-test_output_path = None
+val_output_path = work_dir + 'val_results'
+test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1500
+interval = 3000
 # interval = 1
 save_total_limit = 20
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1500  # More frequent evaluation for alignment debugging
+evaluation_freq = 3000  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -221,16 +212,22 @@ if model_type in ('text_patch', 'multimodal'):
     prompt_resampler_cfg = dict(
         patch_dim=768,
         resampler_dim=2048,
-        num_region_tokens=16,
-        num_visual_tokens=1,
+        num_query=4,
+        num_layers=2,
         num_heads=16,
         dropout=0.2,
         use_local_conv=True,
+        query_init_std=0.5,
+        output_gate_init=1.0,
     )
 else:
     prompt_resampler_cfg = None
 
-wsi_feature_dims = [768, 1280] if model_type in ('text_wsi', 'multimodal') else None
+wsi_feature_source = 'titan'
+wsi_feature_fields = dict(titan='slide_features_titan', prism='slide_features_prism', both='wsi_features')
+wsi_feature_dims_by_source = dict(titan=[768], prism=[1280], both=[768, 1280])
+wsi_feature_field = wsi_feature_fields[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else 'wsi_features'
+wsi_feature_dims = wsi_feature_dims_by_source[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else None
 
 model = dict(
     type=LLaVAModel_qwen3_5,
@@ -261,7 +258,7 @@ model = dict(
     prompt_resampler_cfg=prompt_resampler_cfg,
     prompt_context_mode='llm_hidden',
     # prompt_context_mode='embedding',
-    prompt_context_layer=-1,
+    prompt_context_layer='auto',
     enable_nonfinite_checks=False,
     wsi_feature_dims=wsi_feature_dims,
     wsi_dropout=0.3,
@@ -292,7 +289,8 @@ train_llava_dataset = dict(
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
-    load_wsi_features=model_type in ('text_wsi', 'multimodal'))
+    load_wsi_features=model_type in ('text_wsi', 'multimodal'),
+    wsi_feature_field=wsi_feature_field)
 
 train_dataloader = dict(
     batch_size=batch_size,
@@ -320,7 +318,8 @@ val_llava_dataset = dict(
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
-    load_wsi_features=model_type in ('text_wsi', 'multimodal'))
+    load_wsi_features=model_type in ('text_wsi', 'multimodal'),
+    wsi_feature_field=wsi_feature_field)
 
 val_dataloader = dict(
     batch_size=batch_size,
@@ -352,7 +351,8 @@ test_llava_dataset = dict(
     text_only=model_type == 'text_only',
     preprocess_num_workers=preprocess_num_workers,
     load_patch_features=model_type in ('text_patch', 'multimodal'),
-    load_wsi_features=model_type in ('text_wsi', 'multimodal'))
+    load_wsi_features=model_type in ('text_wsi', 'multimodal'),
+    wsi_feature_field=wsi_feature_field)
 
 test_dataloader = dict(
     batch_size=batch_size,

@@ -25,10 +25,6 @@ import pandas as pd
 import h5py
 import numpy as np
 
-from . import huggingface as huggingface_module
-from . import utils as dataset_utils_module
-
-
 DATASET_CACHE_VERSION = 1
 
 
@@ -80,6 +76,14 @@ def _json_safe_signature(obj):
     }
 
 
+def _file_sha256(path, chunk_size=1024 * 1024):
+    hasher = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(chunk_size), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def _path_signature(path):
     if path is None:
         return None
@@ -89,12 +93,15 @@ def _path_signature(path):
         return {'path': abs_path, 'exists': False}
 
     stat = os.stat(abs_path)
-    return {
+    signature = {
         'path': abs_path,
         'exists': True,
         'size': stat.st_size,
-        'mtime_ns': stat.st_mtime_ns,
     }
+    if os.path.isfile(abs_path):
+        signature['content_hash'] = _file_sha256(abs_path)
+    return signature
+
 
 
 def _build_cache_signature(data_path,
@@ -119,11 +126,7 @@ def _build_cache_signature(data_path,
         'max_patch_num': max_patch_num,
         'input_ids_with_output': input_ids_with_output,
         'text_only': text_only,
-        'processing_sources': [
-            _path_signature(__file__),
-            _path_signature(getattr(huggingface_module, '__file__', None)),
-            _path_signature(getattr(dataset_utils_module, '__file__', None)),
-        ],
+        'dataset_processor': _json_safe_signature(process_hf_dataset),
     }
 
 
@@ -429,20 +432,24 @@ class LLaVADataset(Dataset):
             data_dict.pop('features', None)
             return data_dict
         
-        # 1. 加载 Patch 图像/特征
+        # 1. 保留原始图像/patch 路径作为稳定样本标识，供评测结果导出使用。
         images = data_dict.get('image')
-        if self.load_patch_features and images:
-            image_list = [images] if isinstance(images, str) else images
+        image_list = [images] if isinstance(images, str) else images
+        if image_list:
+            data_dict['image_file'] = image_list
+        else:
+            data_dict.pop('image_file', None)
+
+        # 2. 加载 Patch 图像/特征
+        if self.load_patch_features and image_list:
             res_list = [load_wsi_feature(f, self.max_patch_num, self.transform) if f.endswith('.h5') 
                         else load_image(f) for f in image_list]
 
             data_dict['features'] = res_list
-            data_dict['image_file'] = image_list
         else:
             data_dict.pop('features', None)
-            data_dict.pop('image_file', None)
 
-        # 2. 加载 WSI 全局特征
+        # 3. 加载 WSI 全局特征
         wsi_paths = data_dict.get(self.wsi_feature_field)
         if wsi_paths is None and self.wsi_feature_field != 'wsi_features':
             wsi_paths = data_dict.get('wsi_features')

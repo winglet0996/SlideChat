@@ -5,6 +5,7 @@ from .throughput_hook import ThroughputHook
 from .varlen_attn_args_to_messagehub_hook import VarlenAttnArgsToMessageHubHook
 from .evaluate_chat_hook_conv_longnet import EvaluateChatHook_conv_longnet
 from .evaluate_chat_hook_longnet import EvaluateChatHook_longnet
+from .wandb_step_logger_hook import WandbStepLoggerHook
 
 __all__ = [
     'DatasetInfoHook',
@@ -12,5 +13,6 @@ __all__ = [
     'VarlenAttnArgsToMessageHubHook',
     'HFCheckpointHook',
     'EvaluateChatHook_conv_longnet',
-    'EvaluateChatHook_longnet'
+    'EvaluateChatHook_longnet',
+    'WandbStepLoggerHook'
 ]

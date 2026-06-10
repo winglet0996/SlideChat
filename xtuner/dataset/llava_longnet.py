@@ -53,9 +53,7 @@ def _build_cache_signature(data_path,
         'per_image_length': per_image_length,
         'max_patch_num': max_patch_num,
         'input_ids_with_output': input_ids_with_output,
-        'processing_sources': [
-            _path_signature(__file__),
-        ],
+        'dataset_processor': _json_safe_signature(process_hf_dataset),
     }
 
 
