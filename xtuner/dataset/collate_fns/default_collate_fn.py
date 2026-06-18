@@ -97,12 +97,12 @@ def default_collate_fn(instances: Sequence[Dict],
 
     data_dict['category'] = [inst.get('category', None) for inst in instances]
     data_dict['project'] = [inst.get('project', None) for inst in instances]
+    data_dict['image_file'] = [inst.get('image_file', None) for inst in instances]
 
     if has_image:
 
         pixel_values = torch.stack(pixel_values)
         data_dict['pixel_values'] = pixel_values
-        data_dict['image_file'] = [inst.get('image_file', None) for inst in instances]
 
 
     if return_hf_format:

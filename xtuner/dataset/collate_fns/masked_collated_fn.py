@@ -170,6 +170,9 @@ def masked_collated_fn(instances: Sequence[Dict],
     data_dict['id'] = [
         inst.get('id', None) for inst in instances
     ]
+    data_dict['image_file'] = [
+        inst.get('image_file', None) for inst in instances
+    ]
 
     if has_image:
         # Pad features to the max size in the batch
@@ -188,9 +191,6 @@ def masked_collated_fn(instances: Sequence[Dict],
         data_dict['features'] = features
         data_dict['labels_text'] = [
             inst.get('conversations', [])[-1].get('value', '') for inst in instances
-        ]
-        data_dict['image_file'] = [
-            inst.get('image_file', None) for inst in instances
         ]
         # Add mapping from image to sample index
         data_dict['image_batch_indices'] = torch.as_tensor(

@@ -453,7 +453,20 @@ class LLaVADataset(Dataset):
         wsi_paths = data_dict.get(self.wsi_feature_field)
         if wsi_paths is None and self.wsi_feature_field != 'wsi_features':
             wsi_paths = data_dict.get('wsi_features')
-        if self.wsi_feature_field != 'wsi_features' and isinstance(wsi_paths, (list, tuple)):
+        if isinstance(self.wsi_feature_field, (list, tuple)):
+            if not isinstance(wsi_paths, (list, tuple)):
+                raise ValueError(
+                    f"WSI feature field {self.wsi_feature_field!r} requires a list of paths, "
+                    f"but got {type(wsi_paths).__name__}: {wsi_paths!r}")
+            matched_wsi_paths = []
+            for field_name in self.wsi_feature_field:
+                field_matches = [p for p in wsi_paths if field_name in str(p)]
+                if not field_matches:
+                    raise ValueError(
+                        f"No WSI feature path matching {field_name!r} in {wsi_paths!r}")
+                matched_wsi_paths.append(field_matches[0])
+            wsi_paths = matched_wsi_paths
+        elif self.wsi_feature_field != 'wsi_features' and isinstance(wsi_paths, (list, tuple)):
             matched_wsi_paths = [p for p in wsi_paths if self.wsi_feature_field in str(p)]
             if not matched_wsi_paths:
                 raise ValueError(

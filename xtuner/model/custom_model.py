@@ -784,7 +784,6 @@ class PromptConditionedPatchResampler(nn.Module):
         dropout: float = 0.0,
         use_local_conv: bool = True,
         query_init_std: float = 0.5,
-        output_gate_init: float = 1.0,
     ):
         super().__init__()
         if resampler_dim % num_heads != 0:
@@ -798,7 +797,6 @@ class PromptConditionedPatchResampler(nn.Module):
         self.num_query = 8 if num_query is None else int(num_query)
         self.num_layers = int(num_layers)
         self.query_init_std = float(query_init_std)
-        self.output_gate_init = float(output_gate_init)
         if self.num_query <= 0:
             raise ValueError(f"num_query must be positive, got {self.num_query}.")
         if self.num_layers <= 0:
@@ -835,7 +833,6 @@ class PromptConditionedPatchResampler(nn.Module):
         ])
         self.to_llm = nn.Linear(self.resampler_dim, self.llm_hidden_size)
         self.output_norm = nn.LayerNorm(self.llm_hidden_size)
-        self.output_gate = nn.Parameter(torch.tensor(self.output_gate_init, dtype=torch.float32))
         self.dropout = nn.Dropout(dropout)
         self._init_weights()
 
@@ -1008,7 +1005,6 @@ class PromptConditionedPatchResampler(nn.Module):
         token_positions[..., 1].clamp_(0, w - 1)
         token_valid = torch.ones((b, self.num_query), dtype=torch.bool, device=features.device)
         llm_tokens = self.output_norm(self.to_llm(visual_tokens))
-        llm_tokens = llm_tokens * self.output_gate.to(device=llm_tokens.device, dtype=llm_tokens.dtype)
 
         return {
             'visual_tokens': llm_tokens,
@@ -1930,9 +1926,6 @@ class WSIProjector(nn.Module):
         # Optional dropout after projection
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         
-        # Learnable scale factors for combining projections (optional enhancement)
-        self.scale_factors = nn.Parameter(torch.ones(len(wsi_input_dims)))
-        
     def forward(
         self,
         wsi_features: list,
@@ -1955,8 +1948,8 @@ class WSIProjector(nn.Module):
             )
         
         projected = []
-        for i, (feat, projector, norm, scale) in enumerate(
-                zip(wsi_features, self.projectors, self.post_norms, self.scale_factors)):
+        for i, (feat, projector, norm) in enumerate(
+                zip(wsi_features, self.projectors, self.post_norms)):
             # Validate input dimension
             if feat.size(-1) != self.wsi_input_dims[i]:
                 raise ValueError(
@@ -1966,9 +1959,6 @@ class WSIProjector(nn.Module):
             # Project
             proj = projector(feat)  # (B, llm_hidden_size)
             proj = norm(proj)
-            
-            # Apply scale factor
-            proj = proj * scale
             
             # Optional normalization
             if normalize:
@@ -1996,7 +1986,7 @@ class WSIProjector(nn.Module):
         if source_idx < 0 or source_idx >= self.num_sources:
             raise ValueError(f"Invalid source_idx {source_idx}, must be in [0, {self.num_sources})")
         
-        return self.dropout(self.projectors[source_idx](wsi_feature) * self.scale_factors[source_idx])
+        return self.dropout(self.post_norms[source_idx](self.projectors[source_idx](wsi_feature)))
     
     def get_output_sequence_length(self) -> int:
         """Return the number of WSI tokens that will be added to the sequence."""

@@ -116,6 +116,20 @@ def _raise_if_nonfinite(name: str, value: torch.Tensor, extra: str = "") -> None
     )
 
 
+def _sample_keep_mask(
+    value: Optional[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if value is None:
+        return torch.ones(batch_size, dtype=torch.bool, device=device)
+    value = value.to(device=device).bool().view(-1)
+    if value.numel() != batch_size:
+        raise ValueError(
+            f"sample keep mask must have {batch_size} entries, got {value.numel()}")
+    return value
+
+
 def _prepare_text_or_wsi_inputs(
     llm,
     input_ids: torch.Tensor,
@@ -123,6 +137,7 @@ def _prepare_text_or_wsi_inputs(
     attention_mask: Optional[torch.Tensor],
     wsi_embeddings: Optional[torch.Tensor],
     padding_side: str,
+    wsi_sample_keep: Optional[torch.Tensor] = None,
 ):
     pad_token_id = getattr(llm.config, 'pad_token_id', None)
     if pad_token_id is None:
@@ -148,17 +163,24 @@ def _prepare_text_or_wsi_inputs(
             'position_ids': _linear_position_ids(attention_mask),
         }
 
+    batch_size = input_ids.size(0)
+    wsi_sample_keep = _sample_keep_mask(wsi_sample_keep, batch_size, input_ids.device)
+
     embeds_list, labels_list, attention_list, pos_list = [], [], [], []
-    for b_idx in range(input_ids.size(0)):
+    for b_idx in range(batch_size):
         valid = attention_mask[b_idx]
         text = text_embeds[b_idx, valid]
         lbl = labels[b_idx, valid]
-        wsi = wsi_embeddings[b_idx].to(device=text.device, dtype=text.dtype)
-        cur_emb = torch.cat([wsi, text], dim=0)
-        cur_lbl = torch.cat([
-            torch.full((wsi.size(0),), IGNORE_INDEX, dtype=labels.dtype, device=labels.device),
-            lbl,
-        ])
+        if bool(wsi_sample_keep[b_idx].item()):
+            wsi = wsi_embeddings[b_idx].to(device=text.device, dtype=text.dtype)
+            cur_emb = torch.cat([wsi, text], dim=0)
+            cur_lbl = torch.cat([
+                torch.full((wsi.size(0),), IGNORE_INDEX, dtype=labels.dtype, device=labels.device),
+                lbl,
+            ])
+        else:
+            cur_emb = text
+            cur_lbl = lbl
         cur_attn = torch.ones(cur_emb.size(0), dtype=torch.bool, device=cur_emb.device)
         seq = torch.arange(cur_emb.size(0), device=cur_emb.device, dtype=torch.long)
         embeds_list.append(cur_emb)
@@ -180,6 +202,8 @@ def prepare_inputs_labels_for_qwen3_5(
     vision_token_positions: Optional[torch.Tensor] = None,
     vision_token_valid: Optional[torch.Tensor] = None,
     wsi_embeddings: Optional[torch.Tensor] = None,
+    patch_sample_keep: Optional[torch.Tensor] = None,
+    wsi_sample_keep: Optional[torch.Tensor] = None,
     vision_start_token_id: Optional[int] = None,
     vision_end_token_id: Optional[int] = None,
     position_generator: Optional[MRoPEPositionIDGenerator] = None,
@@ -187,10 +211,15 @@ def prepare_inputs_labels_for_qwen3_5(
     padding_side: str = 'right',
     **kwargs,
 ):
+    batch_size = input_ids.size(0)
+    patch_sample_keep = _sample_keep_mask(patch_sample_keep, batch_size, input_ids.device)
+    wsi_sample_keep = _sample_keep_mask(wsi_sample_keep, batch_size, input_ids.device)
     has_patch = pixel_values is not None and pixel_values.numel() > 0
     has_wsi = wsi_embeddings is not None and wsi_embeddings.numel() > 0
     if not has_patch:
-        return _prepare_text_or_wsi_inputs(llm, input_ids, labels, attention_mask, wsi_embeddings, padding_side)
+        return _prepare_text_or_wsi_inputs(
+            llm, input_ids, labels, attention_mask, wsi_embeddings, padding_side,
+            wsi_sample_keep=wsi_sample_keep)
 
     if labels is None:
         labels = torch.full_like(input_ids, IGNORE_INDEX)
@@ -214,7 +243,6 @@ def prepare_inputs_labels_for_qwen3_5(
     special_ids = torch.tensor([vision_start_token_id, vision_end_token_id], device=device, dtype=torch.long)
     vision_start_embed, vision_end_embed = token_embed(special_ids).view(2, 1, hidden_dim)
 
-    batch_size = input_ids.size(0)
     payloads_by_sample = [[] for _ in range(batch_size)]
     if image_batch_indices is None:
         image_batch_indices = torch.arange(pixel_values.size(0), device=device).clamp(max=batch_size - 1)
@@ -232,6 +260,8 @@ def prepare_inputs_labels_for_qwen3_5(
         image_positions = torch.where(cur_ids == IMAGE_TOKEN_INDEX)[0].tolist()
         boundaries = [-1] + image_positions + [cur_ids.numel()]
         payload_idx = 0
+        keep_patch = bool(patch_sample_keep[b_idx].item())
+        keep_wsi = has_wsi and bool(wsi_sample_keep[b_idx].item())
         wsi_inserted = False
         pieces_embeds, pieces_labels, pieces_attn, patch_blocks = [], [], [], []
 
@@ -249,13 +279,18 @@ def prepare_inputs_labels_for_qwen3_5(
 
             is_image_slot = seg_idx < len(boundaries) - 2
             if is_image_slot:
-                if has_wsi and not wsi_inserted:
+                if keep_wsi and not wsi_inserted:
                     cur_wsi = wsi_embeddings[b_idx].to(device=device, dtype=dtype)
                     pieces_embeds.append(cur_wsi)
                     pieces_labels.append(torch.full((cur_wsi.size(0),), IGNORE_INDEX,
                                                     dtype=labels.dtype, device=device))
                     pieces_attn.append(torch.ones(cur_wsi.size(0), dtype=torch.bool, device=device))
                     wsi_inserted = True
+
+                if not keep_patch:
+                    if payload_idx < len(payloads_by_sample[b_idx]):
+                        payload_idx += 1
+                    continue
 
                 if payload_idx >= len(payloads_by_sample[b_idx]):
                     raise ValueError(f"Sample {b_idx} has more <image> tokens than visual feature groups.")
@@ -282,7 +317,7 @@ def prepare_inputs_labels_for_qwen3_5(
 
         if payload_idx != len(payloads_by_sample[b_idx]):
             raise ValueError(f"Sample {b_idx} has unused visual feature groups.")
-        if has_wsi and not wsi_inserted:
+        if keep_wsi and not wsi_inserted:
             cur_wsi = wsi_embeddings[b_idx].to(device=device, dtype=dtype)
             pieces_embeds = [cur_wsi] + pieces_embeds
             pieces_labels = [torch.full((cur_wsi.size(0),), IGNORE_INDEX, dtype=labels.dtype, device=device)] + pieces_labels
@@ -338,6 +373,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         tokenizer,
         freeze_llm: bool = True,
         pretrained_pth: Optional[str] = None,
+        pretrained_patch_resampler: Optional[str] = None,
         llm_lora: Optional[Dict] = None,
         use_activation_checkpointing: bool = True,
         max_position_embeddings: Optional[int] = None,
@@ -362,10 +398,12 @@ class LLaVAModel_qwen3_5(BaseModel):
         wsi_dropout: float = 0.1,
         survival_head_dropout: float = 0.3,
         head_scaling: Union[float, List[float]] = (0.0, 0.0, 0.5),
-        vision_token_scale: float = 1.0,
-        wsi_token_scale: float = 1.0,
-        vision_gate_mode: str = 'none',
-        wsi_gate_mode: str = 'none',
+        patch_modality_dropout: float = 0.0,
+        wsi_modality_dropout: float = 0.0,
+        modality_dropout_allow_text_only: bool = False,
+        force_drop_patch: bool = False,
+        force_drop_wsi: bool = False,
+        trainable_module_prefixes: Optional[List[str]] = None,
         save_attention_heatmap: bool = False,
         attention_heatmap_dir: Optional[str] = None,
     ):
@@ -391,10 +429,12 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.enable_wsi_injection = wsi_feature_dims is not None and len(wsi_feature_dims) > 0
         self.wsi_dropout = float(wsi_dropout)
         self.survival_head_dropout = float(survival_head_dropout)
-        self.vision_token_scale = float(vision_token_scale)
-        self.wsi_token_scale = float(wsi_token_scale)
-        self.vision_gate_mode = str(vision_gate_mode)
-        self.wsi_gate_mode = str(wsi_gate_mode)
+        self.patch_modality_dropout = float(patch_modality_dropout)
+        self.wsi_modality_dropout = float(wsi_modality_dropout)
+        self.modality_dropout_allow_text_only = bool(modality_dropout_allow_text_only)
+        self.force_drop_patch = bool(force_drop_patch)
+        self.force_drop_wsi = bool(force_drop_wsi)
+        self.trainable_module_prefixes = trainable_module_prefixes
         self.save_attention_heatmap = bool(save_attention_heatmap)
         self.attention_heatmap_dir = attention_heatmap_dir
         self.use_llm_lora = llm_lora is not None
@@ -413,14 +453,15 @@ class LLaVAModel_qwen3_5(BaseModel):
                 raise ValueError("head_scaling must be a float or a length-3 list.")
         if self.prompt_context_mode not in ('embedding', 'llm_hidden'):
             raise ValueError("prompt_context_mode must be 'embedding' or 'llm_hidden'.")
-        if self.vision_gate_mode not in ('none', 'scalar'):
-            raise ValueError("vision_gate_mode must be 'none' or 'scalar'.")
-        if self.wsi_gate_mode not in ('none', 'scalar'):
-            raise ValueError("wsi_gate_mode must be 'none' or 'scalar'.")
+        for name, value in (
+            ('patch_modality_dropout', self.patch_modality_dropout),
+            ('wsi_modality_dropout', self.wsi_modality_dropout),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}.")
 
         self._init_llm(llm, max_position_embeddings)
         self._setup_tokenizer_and_tokens(tokenizer)
-        self._init_token_gates()
         if self.enable_vision:
             self._init_prompt_resampler()
         if self.enable_wsi_injection:
@@ -434,39 +475,9 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.input_composer = InputComposer()
         if pretrained_pth:
             self.load_state_dict(guess_load_checkpoint(pretrained_pth), strict=False)
-
-    def _init_token_gates(self) -> None:
-        if self.vision_gate_mode == 'scalar':
-            self.vision_token_gate = nn.Parameter(torch.ones((), dtype=torch.float32))
-        else:
-            self.register_parameter('vision_token_gate', None)
-
-        if self.wsi_gate_mode == 'scalar':
-            self.wsi_token_gate = nn.Parameter(torch.ones((), dtype=torch.float32))
-        else:
-            self.register_parameter('wsi_token_gate', None)
-
-        print_log(
-            f"[TokenGate] vision_gate_mode={self.vision_gate_mode} "
-            f"vision_token_scale={self.vision_token_scale} "
-            f"wsi_gate_mode={self.wsi_gate_mode} "
-            f"wsi_token_scale={self.wsi_token_scale}",
-            'current',
-        )
-
-    def _apply_vision_token_gate(self, tokens: torch.Tensor) -> torch.Tensor:
-        scale = self.vision_token_scale
-        if self.vision_gate_mode == 'scalar' and self.vision_token_gate is not None:
-            gate = torch.sigmoid(self.vision_token_gate).to(device=tokens.device, dtype=tokens.dtype)
-            scale = tokens.new_tensor(scale) * (2.0 * gate)
-        return tokens * scale
-
-    def _apply_wsi_token_gate(self, tokens: torch.Tensor) -> torch.Tensor:
-        scale = self.wsi_token_scale
-        if self.wsi_gate_mode == 'scalar' and self.wsi_token_gate is not None:
-            gate = torch.sigmoid(self.wsi_token_gate).to(device=tokens.device, dtype=tokens.dtype)
-            scale = tokens.new_tensor(scale) * (2.0 * gate)
-        return tokens * scale
+        if pretrained_patch_resampler:
+            self._load_pretrained_patch_resampler(pretrained_patch_resampler)
+        self._apply_trainable_module_filter()
 
     def _init_llm(self, llm, max_position_embeddings: Optional[int]) -> None:
         with LoadWoInit():
@@ -634,13 +645,74 @@ class LLaVAModel_qwen3_5(BaseModel):
             dropout=0.0,
             use_local_conv=True,
             query_init_std=0.5,
-            output_gate_init=1.0,
         )
         cfg.update(self.prompt_resampler_cfg or {})
         cfg['llm_hidden_size'] = self._get_llm_hidden_size()
         self.patch_resampler = PromptConditionedPatchResampler(**cfg)
         self.patch_resampler.set_output_rms(self._estimate_embedding_rms())
         print_log(f"[PromptResampler] cfg={cfg}", 'current')
+
+    def _load_pretrained_patch_resampler(self, ckpt_path: str) -> None:
+        """Initialize patch_resampler from a baseline perceiver checkpoint.
+
+        Accepts the baseline `3_linear_prob_v5_patch_baseline_perceiver.py`
+        outputs (e.g. `unified_perceiver_*.pt` / `unified_masked_mlp_*.pt`).
+        Those carry the resampler weights under `llava_patch_resampler`
+        (already prefixed `patch_resampler.`) with `perceiver`/`patch_resampler`
+        as fallbacks. Only `self.patch_resampler` is touched; everything else in
+        this model keeps its warm-start / fresh init. Initialization-only.
+        """
+        if not self.enable_vision or not hasattr(self, 'patch_resampler'):
+            print_log(
+                f"[PatchResamplerInit] vision disabled; skip {ckpt_path}",
+                'current')
+            return
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+        # Locate the resampler sub-state-dict and normalize keys to bare
+        # PromptConditionedPatchResampler names (strip a `patch_resampler.`
+        # prefix when present).
+        resampler_state = None
+        for block_key in ('llava_patch_resampler', 'patch_resampler', 'perceiver'):
+            block = ckpt.get(block_key) if isinstance(ckpt, dict) else None
+            if not isinstance(block, dict) or not block:
+                continue
+            if block_key == 'perceiver':
+                block = block.get('resampler') or block.get('patch_resampler')
+                if not isinstance(block, dict) or not block:
+                    continue
+            resampler_state = OrderedDict(
+                (k[len('patch_resampler.'):] if k.startswith('patch_resampler.') else k, v)
+                for k, v in block.items()
+            )
+            break
+        if resampler_state is None:
+            raise KeyError(
+                f"No patch-resampler weights found in {ckpt_path}; expected one "
+                "of keys 'llava_patch_resampler' / 'patch_resampler' / 'perceiver'.")
+
+        # Guard against silent dim mismatch (wrong Qwen size / patch_dim).
+        target = self.patch_resampler.state_dict()
+        mismatched = [
+            k for k, v in resampler_state.items()
+            if k in target and tuple(v.shape) != tuple(target[k].shape)
+        ]
+        if mismatched:
+            raise ValueError(
+                f"Patch-resampler shape mismatch loading {ckpt_path} "
+                f"(check Qwen hidden size / patch_dim): {mismatched[:5]}"
+                f"{' ...' if len(mismatched) > 5 else ''}")
+
+        incompatible = self.patch_resampler.load_state_dict(resampler_state, strict=False)
+        if is_main_process():
+            ck_query = ckpt.get('perceiver_num_query') if isinstance(ckpt, dict) else None
+            print_log(
+                f"[PatchResamplerInit] loaded {len(resampler_state)} tensors from "
+                f"{ckpt_path} | baseline_num_query={ck_query} "
+                f"model_num_query={self.patch_resampler.num_query} | "
+                f"missing={len(getattr(incompatible, 'missing_keys', []))} "
+                f"unexpected={len(getattr(incompatible, 'unexpected_keys', []))}",
+                'current')
 
     def _init_wsi_projector(self) -> None:
         self.wsi_projector = WSIProjector(
@@ -736,6 +808,24 @@ class LLaVAModel_qwen3_5(BaseModel):
             out.weight.requires_grad = False
         if use_activation_checkpointing:
             self.gradient_checkpointing_enable()
+        self._log_trainable_parameters()
+
+    def _apply_trainable_module_filter(self) -> None:
+        if self.trainable_module_prefixes is None:
+            return
+
+        prefixes = tuple(str(prefix) for prefix in self.trainable_module_prefixes)
+        for name, param in self.named_parameters():
+            param.requires_grad = any(
+                name == prefix or name.startswith(f'{prefix}.')
+                for prefix in prefixes
+            )
+
+        if is_main_process():
+            print_log(
+                f"[TrainableFilter] trainable_module_prefixes={list(prefixes)}",
+                'current',
+            )
         self._log_trainable_parameters()
 
     def _setup_generation(self, generation_kwargs: Optional[Dict], stop_words: Optional[List[str]]) -> None:
@@ -890,6 +980,49 @@ class LLaVAModel_qwen3_5(BaseModel):
         image_batch_indices = image_batch_indices.to(device=input_ids.device, dtype=torch.long)
         return prompt_embeds[image_batch_indices], prompt_mask[image_batch_indices]
 
+    def _make_modality_keep_masks(
+        self,
+        batch_size: int,
+        has_patch: bool,
+        has_wsi: bool,
+        device: torch.device,
+        mode: str,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        patch_keep = torch.ones(batch_size, dtype=torch.bool, device=device) if has_patch else None
+        wsi_keep = torch.ones(batch_size, dtype=torch.bool, device=device) if has_wsi else None
+
+        if patch_keep is not None and self.force_drop_patch:
+            patch_keep.zero_()
+        if wsi_keep is not None and self.force_drop_wsi:
+            wsi_keep.zero_()
+
+        if mode == 'loss' and self.training:
+            if patch_keep is not None and not self.force_drop_patch and self.patch_modality_dropout > 0:
+                patch_keep &= torch.rand(batch_size, device=device) >= self.patch_modality_dropout
+            if wsi_keep is not None and not self.force_drop_wsi and self.wsi_modality_dropout > 0:
+                wsi_keep &= torch.rand(batch_size, device=device) >= self.wsi_modality_dropout
+
+        if (
+            not self.modality_dropout_allow_text_only
+            and patch_keep is not None
+            and wsi_keep is not None
+        ):
+            both_dropped = ~patch_keep & ~wsi_keep
+            if both_dropped.any():
+                can_restore_patch = not self.force_drop_patch
+                can_restore_wsi = not self.force_drop_wsi
+                if can_restore_patch and can_restore_wsi:
+                    restore_patch = torch.rand(batch_size, device=device) < 0.5
+                    restore_patch &= both_dropped
+                    patch_keep |= restore_patch
+                    wsi_keep |= both_dropped & ~restore_patch
+                elif can_restore_patch:
+                    patch_keep |= both_dropped
+                elif can_restore_wsi:
+                    wsi_keep |= both_dropped
+
+        return patch_keep, wsi_keep
+
     def _project_vision_features(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         if not self.enable_vision:
             raise RuntimeError("Received patch features but prompt_resampler_cfg is None.")
@@ -907,13 +1040,11 @@ class LLaVAModel_qwen3_5(BaseModel):
             prompt_attention_mask=prompt_mask,
             feature_shapes=feature_shapes,
         )
-        gated_visual_tokens = self._apply_vision_token_gate(out['visual_tokens'])
         self._last_patch_attention = out['patch_attention'].detach()
         self._last_patch_valid_mask = out['patch_valid_mask'].detach()
         return {
-            'pixel_values': gated_visual_tokens,
+            'pixel_values': out['visual_tokens'],
             'visual_tokens': out['visual_tokens'],
-            'gated_visual_tokens': gated_visual_tokens,
             'vision_token_positions': out['token_positions'],
             'vision_token_valid': out['token_valid'],
             'patch_attention': out['patch_attention'],
@@ -970,7 +1101,6 @@ class LLaVAModel_qwen3_5(BaseModel):
         visual_to_region_attention = projected.get('visual_to_region_attention')
         visual_to_region_attention_heads = projected.get('visual_to_region_attention_heads')
         visual_tokens = projected.get('visual_tokens')
-        gated_visual_tokens = projected.get('gated_visual_tokens')
         token_positions = projected.get('token_positions')
         if patch_attention is None or valid_mask is None:
             return
@@ -987,8 +1117,6 @@ class LLaVAModel_qwen3_5(BaseModel):
             visual_to_region_attention_heads = visual_to_region_attention_heads.detach().float().cpu().numpy()
         if visual_tokens is not None:
             visual_tokens = visual_tokens.detach().float().cpu().numpy()
-        if gated_visual_tokens is not None:
-            gated_visual_tokens = gated_visual_tokens.detach().float().cpu().numpy()
         token_positions = token_positions.detach().cpu().numpy() if token_positions is not None else None
         feature_shapes = data.get('feature_shapes')
         if torch.is_tensor(feature_shapes):
@@ -1054,13 +1182,7 @@ class LLaVAModel_qwen3_5(BaseModel):
                 if visual_tokens is not None
                 else np.empty((0, 0), dtype=np.float32)
             )
-            gated_visual_token_embeds = (
-                gated_visual_tokens[image_idx]
-                if gated_visual_tokens is not None
-                else np.empty((0, 0), dtype=np.float32)
-            )
             visual_token_cosine = self._cosine_similarity_matrix(visual_token_embeds)
-            gated_visual_token_cosine = self._cosine_similarity_matrix(gated_visual_token_embeds)
             if visual_to_region_heads.size and region_attn_heads.size:
                 composed_patch_attention_same_head = np.einsum(
                     'hvr,hrp->hvp',
@@ -1110,8 +1232,6 @@ class LLaVAModel_qwen3_5(BaseModel):
                 ),
                 visual_tokens=visual_token_embeds,
                 visual_token_cosine=visual_token_cosine,
-                gated_visual_tokens=gated_visual_token_embeds,
-                gated_visual_token_cosine=gated_visual_token_cosine,
                 visual_to_region_attention=visual_to_region,
                 region_attention_heads=region_attn_heads,
                 visual_to_region_attention_heads=visual_to_region_heads,
@@ -1154,7 +1274,7 @@ class LLaVAModel_qwen3_5(BaseModel):
                 wsi_features[b][src_idx].to(device=param.device, dtype=param.dtype)
                 for b in range(batch_size)
             ]))
-        return self._apply_wsi_token_gate(self.wsi_projector(source_features))
+        return self.wsi_projector(source_features)
 
     def forward(self, data: Dict[str, Any], data_samples: Optional[List] = None, mode: str = 'loss') -> Any:
         data = dict(data)
@@ -1168,6 +1288,17 @@ class LLaVAModel_qwen3_5(BaseModel):
         survival_targets = data.pop('survival_targets', None)
         task_categories = data.get('category', None)
         has_visual = data.get('features') is not None
+        has_wsi_features = self.enable_wsi_injection and data.get('wsi_features') is not None
+        batch_size = int(data['input_ids'].size(0))
+        mask_device = data['input_ids'].device
+        patch_sample_keep, wsi_sample_keep = self._make_modality_keep_masks(
+            batch_size=batch_size,
+            has_patch=has_visual,
+            has_wsi=has_wsi_features,
+            device=mask_device,
+            mode=mode,
+        )
+
         if has_visual:
             projected = self._project_vision_features(data)
             if mode == 'predict':
@@ -1175,11 +1306,13 @@ class LLaVAModel_qwen3_5(BaseModel):
             data['pixel_values'] = projected['pixel_values']
             data['vision_token_positions'] = projected['vision_token_positions']
             data['vision_token_valid'] = projected['vision_token_valid']
+            data['patch_sample_keep'] = patch_sample_keep
         else:
             data['pixel_values'] = None
             data['vision_token_positions'] = None
             data['vision_token_valid'] = None
             data['image_batch_indices'] = None
+            data['patch_sample_keep'] = None
         data.pop('features', None)
         data.pop('feature_shapes', None)
         data.pop('feature_paths', None)
@@ -1190,6 +1323,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         else:
             data.pop('wsi_features', None)
         data['wsi_embeddings'] = wsi_embeddings
+        data['wsi_sample_keep'] = wsi_sample_keep
 
         if mode == 'predict':
             for key in ('input_ids', 'labels', 'attention_mask'):

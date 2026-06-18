@@ -31,9 +31,9 @@ setting = 'lora'
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
-    lr = 5e-5  # Reduced from 1e-4 for better stability
+    lr = 1e-4  # Reduced from 1e-4 for better stability
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_text_patch_alignment_wo_knowledge_v9_1token_keep/iter_9615.pth'
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v10_4token_keep_prism_titan/iter_13500.pth'
     max_epochs = 2
     save_best_metrics = None
 if setting == 'lora':
@@ -47,8 +47,8 @@ if setting == 'lora':
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_text_patch_alignment_wo_knowledge_v9_1token_keep/iter_9615.pth'
-    lr = 2e-5
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v10_4token_keep_prism_titan/iter_18000.pth'
+    lr = 3e-5
     freeze_llm = True
     max_epochs = 3
 if setting == 'full_param':
@@ -61,7 +61,7 @@ if setting == 'full_param':
     
 resume = False
 
-model_type = 'text_patch'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
+model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
 kg_status='wo_knowledge'
 
@@ -88,7 +88,7 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v9_1token_keep'
+exp_tag = 'v10_4token_keep_prism_titan'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
 vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 # vis_name = None
@@ -226,12 +226,11 @@ if model_type in ('text_patch', 'multimodal'):
         dropout=0.2,
         use_local_conv=True,
         query_init_std=0.5,
-        output_gate_init=1.0,
     )
 else:
     prompt_resampler_cfg = None
 
-wsi_feature_source = 'titan'
+wsi_feature_source = 'both'
 wsi_feature_fields = dict(titan='slide_features_titan', prism='slide_features_prism', both='wsi_features')
 wsi_feature_dims_by_source = dict(titan=[768], prism=[1280], both=[768, 1280])
 wsi_feature_field = wsi_feature_fields[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else 'wsi_features'
@@ -252,6 +251,10 @@ model = dict(
     generation_kwargs=dict(max_new_tokens=max_new_tokens, do_sample=False),
     stop_words=['<|im_end|>', '<|endoftext|>'],
     pretrained_pth=pretrained_pth,
+    # Optional: warm-start patch_resampler from a baseline perceiver checkpoint
+    # (3_linear_prob_v5_patch_baseline_perceiver.py -> unified_perceiver_*.pt).
+    # Resampler hparams above must match the baseline run. None disables it.
+    pretrained_patch_resampler=None,
     llm_lora=llm_lora,
     enable_regression=True,
     enable_survival=True,
@@ -269,13 +272,12 @@ model = dict(
     prompt_context_layer='auto',
     enable_nonfinite_checks=False,
     wsi_feature_dims=wsi_feature_dims,
-    wsi_dropout=0.3,
+    wsi_dropout=0.3,  # Projector hidden dropout, not modality dropout.
     survival_head_dropout=0.6,
     head_scaling=[0, 0, 0.5],
-    vision_gate_mode='scalar',
-    wsi_gate_mode='scalar',
-    vision_token_scale=0.5,
-    wsi_token_scale=2.0,
+    patch_modality_dropout=0.2,
+    wsi_modality_dropout=0.2,
+    modality_dropout_allow_text_only=False,
 )
 
 #######################################################################

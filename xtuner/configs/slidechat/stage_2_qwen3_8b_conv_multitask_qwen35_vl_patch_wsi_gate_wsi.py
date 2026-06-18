@@ -46,8 +46,8 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_text_patch_alignment_wo_knowledge_v9_1token_keep/iter_9615.pth'
+    ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_text_wsi_lora_v8_1token_prism/iter_48000.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -63,25 +63,26 @@ resume = False
 
 model_type = 'text_wsi'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
-kg_status='wo_knowledge'
 
 llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.5-{model_size}'
 # train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/train.json'
 # val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
 # test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
-train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
-val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-
+train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/train.json'
+val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test.json'
+test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test.json'
+# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/train.json'
+# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test.json'
+# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test.json'
 
 # ckpt_out_path = 's3://zhaoweike/ckpt'
 ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v8_1token_prism'
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
+exp_tag = 'v8_1token_titan'
+work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{exp_tag}/'
 # vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 vis_name = None
 
@@ -218,16 +219,37 @@ if model_type in ('text_patch', 'multimodal'):
         dropout=0.2,
         use_local_conv=True,
         query_init_std=0.5,
-        output_gate_init=1.0,
     )
 else:
     prompt_resampler_cfg = None
 
-wsi_feature_source = 'prism'
-wsi_feature_fields = dict(titan='slide_features_titan', prism='slide_features_prism', both='wsi_features')
-wsi_feature_dims_by_source = dict(titan=[768], prism=[1280], both=[768, 1280])
-wsi_feature_field = wsi_feature_fields[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else 'wsi_features'
-wsi_feature_dims = wsi_feature_dims_by_source[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else None
+wsi_feature_source = ('titan',)
+wsi_feature_specs = dict(
+    titan=dict(field='slide_features_titan', dim=768),
+    prism=dict(field='slide_features_prism', dim=1280),
+    chief=dict(field='slide_features_chief', dim=768),
+    gigapath=dict(field='slide_features_gigapath', dim=768),
+)
+if isinstance(wsi_feature_source, str):
+    wsi_feature_source = (wsi_feature_source,)
+valid_wsi_feature_sources = tuple(wsi_feature_specs)
+unknown_wsi_feature_sources = [src for src in wsi_feature_source if src not in wsi_feature_specs]
+if unknown_wsi_feature_sources:
+    raise ValueError(
+        f"Unknown wsi_feature_source: {unknown_wsi_feature_sources!r}. "
+        f"Expected subset of {valid_wsi_feature_sources!r}")
+if model_type in ('text_wsi', 'multimodal'):
+    if not wsi_feature_source:
+        raise ValueError(
+            f"model_type={model_type!r} requires at least one WSI feature source")
+    if len(wsi_feature_source) == 1:
+        wsi_feature_field = wsi_feature_specs[wsi_feature_source[0]]['field']
+    else:
+        wsi_feature_field = tuple(wsi_feature_specs[src]['field'] for src in wsi_feature_source)
+    wsi_feature_dims = [wsi_feature_specs[src]['dim'] for src in wsi_feature_source]
+else:
+    wsi_feature_field = 'wsi_features'
+    wsi_feature_dims = None
 
 model = dict(
     type=LLaVAModel_qwen3_5,
@@ -244,6 +266,7 @@ model = dict(
     generation_kwargs=dict(max_new_tokens=max_new_tokens, do_sample=False),
     stop_words=['<|im_end|>', '<|endoftext|>'],
     pretrained_pth=pretrained_pth,
+    pretrained_patch_resampler=None,
     llm_lora=llm_lora,
     enable_regression=True,
     enable_survival=True,
@@ -261,13 +284,12 @@ model = dict(
     prompt_context_layer='auto',
     enable_nonfinite_checks=False,
     wsi_feature_dims=wsi_feature_dims,
-    wsi_dropout=0.3,
+    wsi_dropout=0.3,  # Projector hidden dropout, not modality dropout.
     survival_head_dropout=0.6,
     head_scaling=[0, 0, 0.5],
-    vision_gate_mode='scalar',
-    wsi_gate_mode='scalar',
-    vision_token_scale=0.5,
-    wsi_token_scale=2.0,
+    patch_modality_dropout=0.0,
+    wsi_modality_dropout=0.0,
+    modality_dropout_allow_text_only=False,
 )
 
 #######################################################################
