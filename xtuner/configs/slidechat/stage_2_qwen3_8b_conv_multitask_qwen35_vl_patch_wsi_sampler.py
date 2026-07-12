@@ -16,6 +16,7 @@ from xtuner.configs.slidechat.eval_samples import evaluation_images, evaluation_
 from xtuner.dataset import LLaVADataset
 from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, llava_text_only_map_fn, template_map_fn_factory
+from xtuner.dataset.samplers import EffectiveBalancedSampler
 from xtuner.engine.hooks import DatasetInfoHook, ModalityDropoutSchedulerHook
 from xtuner.engine.runner import TrainLoop
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
@@ -26,28 +27,28 @@ from xtuner.utils import PROMPT_TEMPLATE
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'lora'
+setting = 'alignment'
 
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
     lr = 1e-4  # Reduced from 1e-4 for better stability
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v10_4token_keep_prism_titan/iter_13500.pth'
+    # ckpt_path = None
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v12_4token_keep_titan_dropout20_sampler/iter_6000.pth'
     max_epochs = 3
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=32,
+        r=64,
         lora_alpha=64,
         lora_dropout=0.2,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v11_4token_keep_titan/iter_28500.pth'
+    # ckpt_path = None
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_lora_wo_knowledge_v11_4token_keep_titan_dropout20_sampler/iter_18000.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -59,7 +60,7 @@ if setting == 'full_param':
     ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
-resume = False
+resume = True
 
 model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
@@ -72,9 +73,11 @@ llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.
 dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
 val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/tcga_zeroshot_reg_output_DX/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/slidechat_dataset/SlideBench_test_aligned.json'
+test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+
+# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test_1000.json'
+# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test_1000.json'
+# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/test_1000.json'
 
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
@@ -90,10 +93,10 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v11_4token_keep_titan'
+exp_tag = 'v12_4token_keep_titan_dropout20_sampler'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
-# vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
-vis_name = None
+vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
+# vis_name = None
 
 
 # set visualizer
@@ -111,16 +114,16 @@ visualizer = None if vis_name is None else dict(
 )
 
 val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_4token_keep_titan_slidebench'
+test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1500
+interval = 1000
 # interval = 1
 save_total_limit = 20
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1500  # More frequent evaluation for alignment debugging
+evaluation_freq = 1000  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -193,7 +196,29 @@ sample_type='wsi' # 'wsi'or'image'
 
 # Data worker settings
 preprocess_num_workers = 8
-dataloader_num_workers = 1
+dataloader_num_workers = 2
+
+# EffectiveBalancedSampler settings
+sampler_family_weights = dict(
+    mcqa=0.35,
+    regression=0.62,
+    survival=0.03,
+)
+sampler_size_alpha = 0.5
+sampler_original_mix_by_family = dict(
+    mcqa=0.6,
+    regression=1.0,
+    survival=1.0,
+)
+sampler_balance_mcqa_labels = True
+sampler_label_balance_power = 0.5
+sampler_min_group_size_for_label_balance = 32
+sampler_tiny_group_size = 32
+sampler_tiny_group_max_fraction = 0.05
+sampler_max_unit_repeats_per_epoch = 3
+sampler_survival_unit = 'patient'
+sampler_default_unit = 'slide'
+sampler_mix_within_batch = True
 
 # Scheduler & Optimizer
 batch_size = 16
@@ -276,15 +301,14 @@ model = dict(
     prompt_context_mode='llm_hidden',
     # prompt_context_mode='embedding',
     prompt_context_layer='auto',
+    patch_position_encoding='mrope',
     enable_nonfinite_checks=False,
     wsi_feature_dims=wsi_feature_dims,
     wsi_dropout=0.3,  # Projector hidden dropout, not modality dropout.
     survival_head_dropout=0.6,
     head_scaling=[0, 0, 0.5],
-    patch_modality_dropout=0,
-    wsi_modality_dropout=0,
-    force_drop_patch=False,
-    force_drop_wsi=False,
+    patch_modality_dropout=0.2,
+    wsi_modality_dropout=0.2,
     modality_dropout_allow_text_only=False,
 )
 
@@ -316,7 +340,24 @@ train_dataloader = dict(
     pin_memory=True,
     dataset=train_llava_dataset,
     # sampler=dict(type=CategoryProjectSampler, batch_size=batch_size, shuffle=True),
-    sampler=dict(type=DefaultSampler, shuffle=True),
+    sampler=dict(
+        type=EffectiveBalancedSampler,
+        batch_size=batch_size,
+        shuffle=True,
+        family_weights=sampler_family_weights,
+        size_alpha=sampler_size_alpha,
+        original_mix_by_family=sampler_original_mix_by_family,
+        balance_mcqa_labels=sampler_balance_mcqa_labels,
+        label_balance_power=sampler_label_balance_power,
+        min_group_size_for_label_balance=sampler_min_group_size_for_label_balance,
+        tiny_group_size=sampler_tiny_group_size,
+        tiny_group_max_fraction=sampler_tiny_group_max_fraction,
+        max_unit_repeats_per_epoch=sampler_max_unit_repeats_per_epoch,
+        survival_unit=sampler_survival_unit,
+        default_unit=sampler_default_unit,
+        mix_within_batch=sampler_mix_within_batch,
+        cache_dir=dataset_cache_dir,
+        verbose=True),
     collate_fn=dict(type=masked_collated_fn))
 
 val_llava_dataset = dict(
@@ -469,7 +510,7 @@ env_cfg = dict(
     # set multi process parameters
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
     # set distributed parameters
-    dist_cfg=dict(backend='nccl', timeout=3600),
+    dist_cfg=dict(backend='nccl'),
 )
 
 

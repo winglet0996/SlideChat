@@ -995,7 +995,13 @@ class PromptConditionedPatchResampler(nn.Module):
         if patch_attn_heads is None:
             raise RuntimeError("Decoder stack did not return final cross-attention weights.")
 
-        patch_attention = patch_attn_heads.mean(dim=1).float()
+        patch_attention_heads = patch_attn_heads.float()
+        patch_attention_heads = patch_attention_heads.masked_fill(
+            ~valid_mask.flatten(1).unsqueeze(1).unsqueeze(1), 0.0)
+        patch_attention_heads = patch_attention_heads / patch_attention_heads.sum(
+            dim=-1, keepdim=True).clamp_min(1e-6)
+
+        patch_attention = patch_attention_heads.mean(dim=1).float()
         patch_attention = patch_attention.masked_fill(~valid_mask.flatten(1).unsqueeze(1), 0.0)
         patch_attention = patch_attention / patch_attention.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
@@ -1013,7 +1019,7 @@ class PromptConditionedPatchResampler(nn.Module):
             'patch_attention': patch_attention.view(b, self.num_query, h, w),
             'patch_valid_mask': valid_mask,
             'region_attention': patch_attention,
-            'region_attention_heads': patch_attn_heads,
+            'region_attention_heads': patch_attention_heads,
             'visual_to_region_attention': None,
             'visual_to_region_attention_heads': None,
         }

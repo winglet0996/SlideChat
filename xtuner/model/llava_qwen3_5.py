@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Prompt-conditioned pathology adapter for Qwen3.5 text models."""
 
+import hashlib
 import json
 import math
 import os
@@ -9,6 +10,7 @@ from contextlib import contextmanager
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import h5py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -207,6 +209,7 @@ def prepare_inputs_labels_for_qwen3_5(
     vision_start_token_id: Optional[int] = None,
     vision_end_token_id: Optional[int] = None,
     position_generator: Optional[MRoPEPositionIDGenerator] = None,
+    patch_position_encoding: str = 'linear',
     composer: Optional[InputComposer] = None,
     padding_side: str = 'right',
     **kwargs,
@@ -226,6 +229,9 @@ def prepare_inputs_labels_for_qwen3_5(
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
     attention_mask = attention_mask.bool()
+    patch_position_encoding = str(patch_position_encoding).lower()
+    if patch_position_encoding not in ('linear', 'mrope'):
+        raise ValueError("patch_position_encoding must be 'linear' or 'mrope'.")
     if position_generator is None:
         position_generator = MRoPEPositionIDGenerator()
     if composer is None:
@@ -254,6 +260,7 @@ def prepare_inputs_labels_for_qwen3_5(
         ))
 
     embeds_list, labels_list, attention_list, positions_list = [], [], [], []
+    patch_spans_by_sample = []
     for b_idx in range(batch_size):
         cur_ids = input_ids[b_idx, attention_mask[b_idx]]
         cur_labels = labels[b_idx, attention_mask[b_idx]]
@@ -337,21 +344,33 @@ def prepare_inputs_labels_for_qwen3_5(
         cur_attn = torch.cat(pieces_attn, dim=0)
         seq_pos = torch.arange(cur_embeds.size(0), device=device, dtype=torch.long)
         cur_pos = seq_pos.unsqueeze(0).expand(4, -1).clone()
-        for patch_start, patch_positions, patch_valid, vision_end_idx in patch_blocks:
-            cur_pos = position_generator(
-                seq_pos,
-                patch_start=patch_start,
-                token_positions=patch_positions,
-                token_valid=patch_valid,
-                vision_end_index=vision_end_idx,
-                base_position_ids=cur_pos,
-            )
+        if patch_position_encoding == 'mrope':
+            for patch_start, patch_positions, patch_valid, vision_end_idx in patch_blocks:
+                cur_pos = position_generator(
+                    seq_pos,
+                    patch_start=patch_start,
+                    token_positions=patch_positions,
+                    token_valid=patch_valid,
+                    vision_end_index=vision_end_idx,
+                    base_position_ids=cur_pos,
+                )
         embeds_list.append(cur_embeds)
         labels_list.append(cur_labels)
         attention_list.append(cur_attn)
         positions_list.append(cur_pos)
+        patch_spans_by_sample.append([(int(start), int(end)) for start, _, _, end in patch_blocks])
 
     composed = composer(embeds_list, labels_list, attention_list, positions_list, padding_side, IGNORE_INDEX)
+    max_spans = max((len(spans) for spans in patch_spans_by_sample), default=0)
+    if max_spans > 0:
+        span_tensor = torch.full((batch_size, max_spans, 2), -1, dtype=torch.long, device=device)
+        max_len = composed['attention_mask'].size(1)
+        for b_idx, spans in enumerate(patch_spans_by_sample):
+            pad_offset = max_len - embeds_list[b_idx].size(0) if padding_side == 'left' else 0
+            for span_idx, (start, end) in enumerate(spans):
+                span_tensor[b_idx, span_idx, 0] = start + pad_offset
+                span_tensor[b_idx, span_idx, 1] = end + pad_offset
+        composed['vision_token_spans'] = span_tensor
     return {'input_ids': None, **composed}
 
 
@@ -393,6 +412,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         prompt_context_mode: str = 'llm_hidden',
         prompt_context_layer: Union[int, str] = 'auto',
         prompt_context_detach: bool = True,
+        patch_position_encoding: str = 'linear',
         enable_nonfinite_checks: bool = False,
         wsi_feature_dims: Optional[List[int]] = None,
         wsi_dropout: float = 0.1,
@@ -406,6 +426,9 @@ class LLaVAModel_qwen3_5(BaseModel):
         trainable_module_prefixes: Optional[List[str]] = None,
         save_attention_heatmap: bool = False,
         attention_heatmap_dir: Optional[str] = None,
+        save_patch_attention_h5: bool = False,
+        patch_attention_h5_dir: Optional[str] = None,
+        patch_attention_h5_dtype: str = 'float16',
     ):
         super().__init__()
         self.freeze_llm = freeze_llm
@@ -423,6 +446,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.prompt_context_mode = prompt_context_mode
         self.prompt_context_layer = prompt_context_layer if str(prompt_context_layer).lower() == 'auto' else int(prompt_context_layer)
         self.prompt_context_detach = bool(prompt_context_detach)
+        self.patch_position_encoding = str(patch_position_encoding).lower()
         self.enable_nonfinite_checks = bool(enable_nonfinite_checks)
         self.enable_vision = prompt_resampler_cfg is not None
         self.wsi_feature_dims = wsi_feature_dims
@@ -437,6 +461,11 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.trainable_module_prefixes = trainable_module_prefixes
         self.save_attention_heatmap = bool(save_attention_heatmap)
         self.attention_heatmap_dir = attention_heatmap_dir
+        self.save_patch_attention_h5 = bool(save_patch_attention_h5)
+        self.patch_attention_h5_dir = patch_attention_h5_dir
+        self.patch_attention_h5_dtype = str(patch_attention_h5_dtype)
+        if self.patch_attention_h5_dtype not in ('float16', 'float32'):
+            raise ValueError("patch_attention_h5_dtype must be 'float16' or 'float32'.")
         self.use_llm_lora = llm_lora is not None
         self._use_llm_lora = self.use_llm_lora
         self.reg_token_id = None
@@ -453,6 +482,8 @@ class LLaVAModel_qwen3_5(BaseModel):
                 raise ValueError("head_scaling must be a float or a length-3 list.")
         if self.prompt_context_mode not in ('embedding', 'llm_hidden'):
             raise ValueError("prompt_context_mode must be 'embedding' or 'llm_hidden'.")
+        if self.patch_position_encoding not in ('linear', 'mrope'):
+            raise ValueError("patch_position_encoding must be 'linear' or 'mrope'.")
         for name, value in (
             ('patch_modality_dropout', self.patch_modality_dropout),
             ('wsi_modality_dropout', self.wsi_modality_dropout),
@@ -1091,6 +1122,233 @@ class LLaVAModel_qwen3_5(BaseModel):
         sim = (flat @ flat.T) / (norms * norms.T)
         return sim.astype(np.float32, copy=False)
 
+    @staticmethod
+    def _write_h5_string(group, name: str, value: Any) -> None:
+        dtype = h5py.string_dtype(encoding='utf-8')
+        group.create_dataset(name, data='' if value is None else str(value), dtype=dtype)
+
+    @staticmethod
+    def _json_dumps(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(',', ':'), default=str)
+
+    def _patch_attention_np_dtype(self):
+        return np.float16 if self.patch_attention_h5_dtype == 'float16' else np.float32
+
+    def _source_patch_index_grid(self, feature_path: Optional[str], feature_shape: Tuple[int, int]) -> np.ndarray:
+        h_final, w_final = int(feature_shape[0]), int(feature_shape[1])
+        dense = np.full((max(h_final, 0), max(w_final, 0)), -1, dtype=np.int64)
+        if not feature_path or h_final <= 0 or w_final <= 0:
+            return dense.reshape(-1)
+
+        cache = getattr(self, '_patch_source_index_cache', None)
+        if cache is None:
+            cache = {}
+            self._patch_source_index_cache = cache
+        cache_key = (str(feature_path), h_final, w_final)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            with h5py.File(feature_path, 'r') as f:
+                coords = np.asarray(f['coords'][:], dtype=np.int64)
+                patch_size = int(f['coords'].attrs.get('patch_size_level0', 512))
+        except Exception:
+            cache[cache_key] = dense.reshape(-1)
+            return cache[cache_key]
+
+        if coords.size == 0:
+            cache[cache_key] = dense.reshape(-1)
+            return cache[cache_key]
+        grid_coords = coords // max(patch_size, 1)
+        min_coords = grid_coords.min(axis=0)
+        max_coords = grid_coords.max(axis=0)
+        shifted = grid_coords - min_coords
+        orig_h = int(max_coords[1] - min_coords[1] + 1)
+        orig_w = int(max_coords[0] - min_coords[0] + 1)
+        padded_h = max(orig_h, h_final)
+        padded_w = max(orig_w, w_final)
+        top = (padded_h - h_final) // 2
+        left = (padded_w - w_final) // 2
+        rows = shifted[:, 1] - top
+        cols = shifted[:, 0] - left
+        keep = (rows >= 0) & (rows < h_final) & (cols >= 0) & (cols < w_final)
+        for src_idx, row, col in zip(np.nonzero(keep)[0], rows[keep], cols[keep]):
+            dense[int(row), int(col)] = int(src_idx)
+        cache[cache_key] = dense.reshape(-1)
+        return cache[cache_key]
+
+    def _build_patch_attention_payload(self, data: Dict[str, Any], projected: Dict[str, torch.Tensor]) -> Optional[Dict[str, Any]]:
+        if not self.save_patch_attention_h5 or not self.patch_attention_h5_dir:
+            return None
+        heads = projected.get('region_attention_heads')
+        valid_mask = projected.get('patch_valid_mask')
+        if heads is None or valid_mask is None:
+            return None
+        image_batch_indices = data.get('image_batch_indices')
+        if torch.is_tensor(image_batch_indices):
+            image_batch_indices = image_batch_indices.detach().cpu().tolist()
+        else:
+            image_batch_indices = list(range(int(heads.size(0))))
+        feature_shapes = data.get('feature_shapes')
+        if torch.is_tensor(feature_shapes):
+            feature_shapes = feature_shapes.detach().cpu().tolist()
+        return {
+            'region_attention_heads': heads.detach(),
+            'patch_valid_mask': valid_mask.detach(),
+            'token_positions': projected.get('token_positions').detach() if projected.get('token_positions') is not None else None,
+            'vision_token_valid': projected.get('vision_token_valid').detach() if projected.get('vision_token_valid') is not None else None,
+            'image_batch_indices': image_batch_indices,
+            'feature_shapes': feature_shapes,
+            'feature_paths': list(data.get('feature_paths') or []),
+            'sample_ids': list(data.get('id') or []),
+            'categories': list(data.get('category') or []),
+            'projects': list(data.get('project') or []),
+            'divisions': list(data.get('division') or []),
+            'labels_text': list(data.get('labels_text') or []),
+            'raw_sample_json': list(data.get('raw_sample_json') or []),
+            'wsi_feature_paths': list(data.get('wsi_feature_paths') or []),
+        }
+
+    def _collect_next_token_visual_attention(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
+        if not self.save_patch_attention_h5 or not self.patch_attention_h5_dir:
+            return None
+        spans = data.get('vision_token_spans')
+        if spans is None or not torch.is_tensor(spans) or spans.numel() == 0:
+            return None
+        spans_cpu = spans.detach().cpu()
+        attention_mask = data.get('attention_mask')
+        if attention_mask is None:
+            return None
+        last_valid = attention_mask.bool().long()
+        seq_idx = torch.arange(attention_mask.size(1), device=attention_mask.device).unsqueeze(0)
+        last_valid = (seq_idx * last_valid).max(dim=1).values
+        llm_kwargs = {k: data[k] for k in ['inputs_embeds', 'attention_mask', 'position_ids'] if k in data}
+        with torch.no_grad(), self._temporary_attn_implementation('eager'):
+            outputs = self.llm(
+                **llm_kwargs,
+                use_cache=False,
+                output_attentions=True,
+                return_dict=True,
+            )
+        attentions = getattr(outputs, 'attentions', None)
+        if not attentions:
+            return None
+        batch_size, max_spans = spans_cpu.shape[:2]
+        max_query = int((spans_cpu[..., 1] - spans_cpu[..., 0]).clamp_min(0).max().item())
+        if max_query <= 0:
+            return None
+        num_layers = len(attentions)
+        num_heads = int(attentions[0].size(1))
+        out = np.zeros((batch_size, num_layers, num_heads, max_spans, max_query), dtype=self._patch_attention_np_dtype())
+        for layer_idx, layer_attn in enumerate(attentions):
+            for b_idx in range(batch_size):
+                target = int(last_valid[b_idx].item())
+                for span_idx in range(max_spans):
+                    start = int(spans_cpu[b_idx, span_idx, 0].item())
+                    end = int(spans_cpu[b_idx, span_idx, 1].item())
+                    if start < 0 or end <= start:
+                        continue
+                    row = layer_attn[b_idx, :, target, start:end].detach().float().cpu().numpy()
+                    out[b_idx, layer_idx, :, span_idx, :row.shape[-1]] = row.astype(out.dtype, copy=False)
+        return out
+
+    def _patch_attention_h5_path(self, sample_id: Any, category: Any, feature_path: Any, image_idx: int) -> str:
+        slide_stem = os.path.basename(str(feature_path or f'image_{image_idx}'))
+        if slide_stem.endswith('.h5'):
+            slide_stem = slide_stem[:-3]
+        safe_slide = self._safe_path_name(slide_stem, f'image_{image_idx}')
+        safe_id = self._safe_path_name(sample_id, f'sample_{image_idx}')
+        digest = hashlib.sha1(f'{sample_id}|{feature_path}|{image_idx}'.encode('utf-8')).hexdigest()[:8]
+        filename = f'{safe_slide}__{safe_id}__{digest}.attn.h5'
+        safe_category = self._safe_path_name(category, 'unknown_category')
+        shard = digest[:2]
+        return os.path.join(self.patch_attention_h5_dir, safe_category, shard, filename)
+
+    def _save_patch_attention_h5_files(
+        self,
+        payload: Optional[Dict[str, Any]],
+        llm_visual_attention: Optional[np.ndarray],
+        data_samples: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        if not payload or not self.save_patch_attention_h5 or not self.patch_attention_h5_dir:
+            return
+        attn_heads = payload['region_attention_heads'].float().cpu().numpy()
+        valid_masks = payload['patch_valid_mask'].cpu().numpy().astype(bool)
+        token_positions = payload.get('token_positions')
+        if token_positions is not None:
+            token_positions = token_positions.cpu().numpy()
+        token_valid = payload.get('vision_token_valid')
+        if token_valid is not None:
+            token_valid = token_valid.cpu().numpy().astype(bool)
+
+        dtype = self._patch_attention_np_dtype()
+        counts_by_sample = {}
+        for image_idx in range(attn_heads.shape[0]):
+            sample_idx = int(payload['image_batch_indices'][image_idx]) if image_idx < len(payload['image_batch_indices']) else image_idx
+            span_idx = counts_by_sample.get(sample_idx, 0)
+            counts_by_sample[sample_idx] = span_idx + 1
+            sample_id = payload['sample_ids'][sample_idx] if sample_idx < len(payload['sample_ids']) else None
+            category = payload['categories'][sample_idx] if sample_idx < len(payload['categories']) else None
+            project = payload['projects'][sample_idx] if sample_idx < len(payload['projects']) else None
+            division = payload['divisions'][sample_idx] if sample_idx < len(payload['divisions']) else None
+            feature_path = payload['feature_paths'][image_idx] if image_idx < len(payload['feature_paths']) else None
+            feature_shape = list(valid_masks[image_idx].shape)
+            if payload.get('feature_shapes') is not None and image_idx < len(payload['feature_shapes']):
+                feature_shape = [int(x) for x in payload['feature_shapes'][image_idx]]
+
+            mask_flat = valid_masks[image_idx].reshape(-1)
+            valid_flat = np.nonzero(mask_flat)[0].astype(np.int32)
+            sparse_attn = attn_heads[image_idx].reshape(attn_heads.shape[1], attn_heads.shape[2], -1)[:, :, valid_flat]
+            sparse_attn = sparse_attn.astype(dtype, copy=False)
+            source_grid = self._source_patch_index_grid(feature_path, tuple(feature_shape))
+            source_indices = source_grid[valid_flat].astype(np.int64, copy=False) if valid_flat.size else np.empty((0,), dtype=np.int64)
+
+            b_attn = np.empty((0, 0, 0), dtype=dtype)
+            if llm_visual_attention is not None and sample_idx < llm_visual_attention.shape[0] and span_idx < llm_visual_attention.shape[3]:
+                b_attn = llm_visual_attention[sample_idx, :, :, span_idx, :sparse_attn.shape[1]].astype(dtype, copy=False)
+
+            out_path = self._patch_attention_h5_path(sample_id, category, feature_path, image_idx)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            tmp_path = f'{out_path}.tmp'
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            with h5py.File(tmp_path, 'w') as h5:
+                h5.attrs['schema_version'] = 'patch_resampler_attention.v1'
+                h5.attrs['qa_id'] = '' if sample_id is None else str(sample_id)
+                h5.attrs['category'] = '' if category is None else str(category)
+                h5.attrs['project'] = '' if project is None else str(project)
+                h5.attrs['division'] = '' if division is None else str(division)
+                h5.attrs['patch_feature_path'] = '' if feature_path is None else str(feature_path)
+                h5.attrs['attention_dtype'] = self.patch_attention_h5_dtype
+                h5.attrs['llm_visual_attention_saved'] = bool(b_attn.size)
+
+                qa = h5.create_group('qa')
+                raw_json = payload['raw_sample_json'][sample_idx] if sample_idx < len(payload['raw_sample_json']) else ''
+                self._write_h5_string(qa, 'raw_sample_json', raw_json)
+                self._write_h5_string(qa, 'answer_text', payload['labels_text'][sample_idx] if sample_idx < len(payload['labels_text']) else '')
+                if data_samples is not None and sample_idx < len(data_samples):
+                    self._write_h5_string(qa, 'prediction_json', self._json_dumps(data_samples[sample_idx]))
+
+                ref = h5.create_group('patch_ref')
+                self._write_h5_string(ref, 'patch_feature_path', feature_path)
+                self._write_h5_string(ref, 'feature_key', 'features')
+                self._write_h5_string(ref, 'coords_key', 'coords')
+                ref.create_dataset('grid_shape', data=np.asarray(feature_shape, dtype=np.int32))
+                ref.create_dataset('valid_flat_indices', data=valid_flat, compression='lzf', shuffle=True)
+                ref.create_dataset('source_patch_indices', data=source_indices, compression='lzf', shuffle=True)
+                wsi_paths = payload['wsi_feature_paths'][sample_idx] if sample_idx < len(payload['wsi_feature_paths']) else None
+                self._write_h5_string(ref, 'wsi_feature_paths_json', self._json_dumps(wsi_paths))
+
+                attn = h5.create_group('attention')
+                attn.create_dataset('resampler_cross_attn', data=sparse_attn, compression='lzf', shuffle=True)
+                attn.create_dataset('next_token_source_attn', data=b_attn, compression='lzf', shuffle=True)
+                if token_positions is not None:
+                    attn.create_dataset('token_positions', data=token_positions[image_idx].astype(np.int16, copy=False))
+                if token_valid is not None:
+                    attn.create_dataset('token_valid', data=token_valid[image_idx])
+            os.replace(tmp_path, out_path)
+
     def _save_attention_heatmaps(self, data: Dict[str, Any], projected: Dict[str, torch.Tensor]) -> None:
         if not self.save_attention_heatmap or not self.attention_heatmap_dir:
             return
@@ -1299,10 +1557,12 @@ class LLaVAModel_qwen3_5(BaseModel):
             mode=mode,
         )
 
+        attention_save_payload = None
         if has_visual:
             projected = self._project_vision_features(data)
             if mode == 'predict':
                 self._save_attention_heatmaps(data, projected)
+                attention_save_payload = self._build_patch_attention_payload(data, projected)
             data['pixel_values'] = projected['pixel_values']
             data['vision_token_positions'] = projected['vision_token_positions']
             data['vision_token_valid'] = projected['vision_token_valid']
@@ -1337,9 +1597,12 @@ class LLaVAModel_qwen3_5(BaseModel):
             vision_start_token_id=self.vision_start_token_id,
             vision_end_token_id=self.vision_end_token_id,
             position_generator=self.position_generator,
+            patch_position_encoding=self.patch_position_encoding,
             composer=self.input_composer,
             **data,
         )
+        if attention_save_payload is not None:
+            data['_patch_attention_save_payload'] = attention_save_payload
         if mode == 'loss':
             return self.compute_loss(data, data_samples, regression_targets, survival_targets)
         if mode == 'tensor':
@@ -1498,6 +1761,8 @@ class LLaVAModel_qwen3_5(BaseModel):
             prefix_attention_mask = data['attention_mask']  # (B, Lp)
             prefix_position_ids = data.get('position_ids', None)
             B, Lp, _ = prefix_inputs_embeds.shape
+            attention_save_payload = data.get('_patch_attention_save_payload')
+            llm_visual_attention = self._collect_next_token_visual_attention(data) if attention_save_payload is not None else None
 
             # 1) Text generation with logits capture for MCQA
             with torch.no_grad(), self._temporary_attn_implementation('sdpa'):
@@ -1564,7 +1829,7 @@ class LLaVAModel_qwen3_5(BaseModel):
                 if first_step_logits is not None and i < first_step_logits.size(0):
                     logits_row = first_step_logits[i]
                     choice_logits = {}
-                    for letter in "ABCDE":
+                    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
                         tid = _choice_token_id(letter)
                         if tid is None:
                             continue
@@ -1601,11 +1866,12 @@ class LLaVAModel_qwen3_5(BaseModel):
 
             # If no sample generated any special tokens, return text-only predictions
             if not (any(has_regression) or any(has_survival)):
+                self._save_patch_attention_h5_files(attention_save_payload, llm_visual_attention, data_samples)
                 return data_samples
 
             # 2) Task predictions from generated special tokens
             with self._temporary_attn_implementation('sdpa'):
-                return self._predict_tasks_from_generation(
+                data_samples = self._predict_tasks_from_generation(
                     generate_ids=generate_ids,
                     data_samples=data_samples,
                     has_regression=has_regression,
@@ -1614,6 +1880,8 @@ class LLaVAModel_qwen3_5(BaseModel):
                     prefix_attention_mask=prefix_attention_mask,
                     prefix_position_ids=prefix_position_ids,
                 )
+            self._save_patch_attention_h5_files(attention_save_payload, llm_visual_attention, data_samples)
+            return data_samples
 
         finally:
             self._cleanup_prediction_state()

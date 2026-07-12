@@ -16,7 +16,7 @@ from xtuner.configs.slidechat.eval_samples import evaluation_images, evaluation_
 from xtuner.dataset import LLaVADataset
 from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, llava_text_only_map_fn, template_map_fn_factory
-from xtuner.engine.hooks import DatasetInfoHook
+from xtuner.engine.hooks import DatasetInfoHook, ModalityDropoutSchedulerHook
 from xtuner.engine.runner import TrainLoop
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 from xtuner.model import LLaVAModel_qwen3_5
@@ -32,23 +32,23 @@ if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
     lr = 1e-4  # Reduced from 1e-4 for better stability
-    # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v10_4token_keep_prism_titan/iter_13500.pth'
-    max_epochs = 2
+    ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v10_4token_keep_prism_titan/iter_13500.pth'
+    max_epochs = 3
     save_best_metrics = None
 if setting == 'lora':
     llm_lora = dict(
         type=LoraConfig,
-        r=128,
-        lora_alpha=128,
+        r=64,
+        lora_alpha=64,
         lora_dropout=0.2,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v10_4token_keep_prism_titan/iter_18000.pth'
-    lr = 3e-5
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v11_4token_keep_titan_dropout20/iter_29166.pth'
+    lr = 2e-5
     freeze_llm = True
     max_epochs = 3
 if setting == 'full_param':
@@ -88,7 +88,7 @@ ckpt_out_path = None
 
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-exp_tag = 'v10_4token_keep_prism_titan'
+exp_tag = 'v11_4token_keep_titan_dropout20'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
 vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
 # vis_name = None
@@ -202,6 +202,10 @@ rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
 warmup_ratio = 0.1
+patch_modality_dropout_start = 0
+wsi_modality_dropout_start = 0.8
+modality_dropout_begin_ratio = 0.2
+modality_dropout_end_ratio = 0.5
 
 
 SYSTEM = ''
@@ -230,7 +234,7 @@ if model_type in ('text_patch', 'multimodal'):
 else:
     prompt_resampler_cfg = None
 
-wsi_feature_source = 'both'
+wsi_feature_source = 'titan'
 wsi_feature_fields = dict(titan='slide_features_titan', prism='slide_features_prism', both='wsi_features')
 wsi_feature_dims_by_source = dict(titan=[768], prism=[1280], both=[768, 1280])
 wsi_feature_field = wsi_feature_fields[wsi_feature_source] if model_type in ('text_wsi', 'multimodal') else 'wsi_features'
@@ -423,7 +427,14 @@ test_cfg = dict(type="TestLoop")
 #######################################################################
 # Log the dialogue periodically during the training process, optional
 custom_hooks = [
-    dict(type=DatasetInfoHook, tokenizer=tokenizer)
+    dict(type=DatasetInfoHook, tokenizer=tokenizer),
+    # dict(
+    #     type=ModalityDropoutSchedulerHook,
+    #     patch_start_dropout=patch_modality_dropout_start,
+    #     wsi_start_dropout=wsi_modality_dropout_start,
+    #     begin_ratio=modality_dropout_begin_ratio,
+    #     end_ratio=modality_dropout_end_ratio,
+    # ),
 ]
 
 # configure default hooks

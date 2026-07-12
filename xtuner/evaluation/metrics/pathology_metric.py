@@ -39,6 +39,10 @@ class PathologyMetric(BaseMetric):
     
     # Pattern matching
     DIAGNOSIS_PATTERN = re.compile(r'Final diagnosis:\s*(.+?)(?:\n|$)', re.IGNORECASE | re.DOTALL)
+    CHOICE_LINE_PATTERN = re.compile(
+        r'^\s*([A-Z])(?:[\)\.\:]|\s)\s*(.+?)\s*$',
+        re.IGNORECASE,
+    )
 
     def __init__(self,
                  tokenizer: Union[Dict, Any],
@@ -287,6 +291,8 @@ class PathologyMetric(BaseMetric):
                              or sample.get('mcqa_logits'))
         if choice_logits is not None and not isinstance(choice_logits, dict):
             choice_logits = None
+        if isinstance(choice_logits, dict):
+            choice_logits = self._filter_choice_logits(choice_logits, input_str)
         
         self.results.append({
             'task_type': 'mcqa',
@@ -690,10 +696,49 @@ class PathologyMetric(BaseMetric):
         """Extract actual choice content from MCQA input text."""
         choices_text = self._extract_choices_block(input_text)
         if choices_text:
-            # Extract choice content after A), B), C), etc.
-            choice_contents = re.findall(r'^[A-Z]\)\s*(.+?)$', choices_text, re.MULTILINE)
-            return frozenset(c.strip() for c in choice_contents)
+            return frozenset(content for _, content in self._extract_choice_entries(choices_text))
         return frozenset()
+
+    def _extract_choice_letters_from_input(self, input_text: str) -> List[str]:
+        """Extract declared MCQA option letters from the prompt."""
+        block = self._extract_choices_block(input_text)
+        if not block:
+            return []
+        seen = set()
+        result = []
+        for letter, _ in self._extract_choice_entries(block):
+            letter = letter.upper()
+            if letter not in seen:
+                seen.add(letter)
+                result.append(letter)
+        return result
+
+    def _extract_choice_entries(self, choices_text: str) -> List[tuple]:
+        """Extract MCQA choice entries from a raw choices block."""
+        if not choices_text:
+            return []
+
+        entries = []
+        for line in choices_text.splitlines():
+            match = self.CHOICE_LINE_PATTERN.match(line)
+            if match:
+                entries.append((match.group(1).upper(), match.group(2).strip()))
+        return entries
+
+    def _filter_choice_logits(self, choice_logits: Dict[str, Any], input_text: str) -> Dict[str, float]:
+        """Keep logits for the actual choices declared in this sample."""
+        letters = self._extract_choice_letters_from_input(input_text)
+        if not letters:
+            letters = sorted(str(k).upper() for k in choice_logits.keys())
+        filtered = {}
+        for letter in letters:
+            if letter not in choice_logits:
+                continue
+            try:
+                filtered[letter] = float(choice_logits[letter])
+            except (TypeError, ValueError):
+                continue
+        return filtered
 
     def _map_choice_to_content(self, choice_letter: str, input_text: str) -> str:
         """Map choice letter (A/B/C/D/E) to actual choice content."""
@@ -706,21 +751,9 @@ class PathologyMetric(BaseMetric):
         # Extract choices block
         choices_text = self._extract_choices_block(input_text)
         if choices_text:
-            # Try multiple patterns to match the choice
-            patterns = [
-                rf'^{re.escape(choice_letter)}\)\s*(.+?)$',  # A) content
-                rf'^{re.escape(choice_letter)}\.\s*(.+?)$',  # A. content
-                rf'^{re.escape(choice_letter)}:\s*(.+?)$',   # A: content
-                rf'^{re.escape(choice_letter)}\s+(.+?)$',    # A content
-            ]
-            
-            for pattern in patterns:
-                content_match = re.search(pattern, choices_text, re.MULTILINE)
-                if content_match:
-                    mapped_content = content_match.group(1).strip()
-                    # Remove trailing punctuation/newlines
-                    mapped_content = re.sub(r'[\n\r]+.*$', '', mapped_content).strip()
-                    return mapped_content
+            for letter, content in self._extract_choice_entries(choices_text):
+                if letter == choice_letter:
+                    return content
         
         # Fallback: return original letter if mapping fails
         return choice_letter
@@ -730,9 +763,7 @@ class PathologyMetric(BaseMetric):
         block = self._extract_choices_block(input_text)
         if not block:
             return 0
-        raw_letters = re.findall(r'^\s*([A-E])[\)\.:]', block, flags=re.MULTILINE | re.IGNORECASE)
-        letters = {self._extract_mcqa_choice(x) for x in raw_letters}
-        letters.discard('')
+        letters = self._extract_choice_letters_from_input(input_text)
         if letters:
             return len(letters)
         # Fallback: count extracted contents
@@ -1273,6 +1304,9 @@ class PathologyMetric(BaseMetric):
     def _save_json_file(self, data: List[Dict], file_path: str, description: str) -> None:
         """Write JSON data to disk with logging."""
         try:
+            output_dir = os.path.dirname(file_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
             print_log(f"Saved {description} to {file_path}", 'current')

@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Dict, Sequence
+import json
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -172,6 +173,24 @@ def masked_collated_fn(instances: Sequence[Dict],
     ]
     data_dict['image_file'] = [
         inst.get('image_file', None) for inst in instances
+    ]
+    data_dict['division'] = [
+        inst.get('division', None) for inst in instances
+    ]
+    data_dict['wsi_feature_paths'] = [
+        inst.get('wsi_feature_paths', None) for inst in instances
+    ]
+    raw_drop_keys = {
+        'features', 'wsi_features', 'input_ids', 'labels', 'attention_mask',
+        'position_ids', 'cumulative_len'
+    }
+    data_dict['raw_sample_json'] = [
+        json.dumps(
+            {k: v for k, v in inst.items() if k not in raw_drop_keys},
+            ensure_ascii=False,
+            default=str,
+        )
+        for inst in instances
     ]
 
     if has_image:

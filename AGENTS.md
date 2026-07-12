@@ -18,7 +18,7 @@
 - The resampler decoder is a small stack of `PatchDecoderBlock`s. Each block performs query self-attention, cross-attention from query tokens to valid patch tokens, and an FFN. The final cross-attention weights are averaged over heads to produce `patch_attention` heatmaps with shape `(B_img, num_query, H, W)`; these weights also produce rounded `(row, col)` token positions used by Qwen multimodal position ids.
 - Resampler outputs are `visual_tokens` with shape `(B_img, num_query, llm_hidden_size)`, plus `token_positions`, `token_valid`, `patch_attention`, and `patch_valid_mask`. `visual_tokens` are normalized/projected to match the LLM embedding scale through `to_llm` and `output_norm`.
 - Patch token insertion happens in `prepare_inputs_labels_for_qwen3_5()`: each `<image>` placeholder in text is replaced by `<|vision_start|>`, the resampled patch tokens, and `<|vision_end|>`. Patch labels are set to `IGNORE_INDEX`, and patch attention validity comes from `token_valid`. If WSI embeddings are enabled they are inserted before the first image slot, or prepended if no image slot consumed them.
-- Position ids use `MRoPEPositionIDGenerator`. Text keeps sequential positions; patch tokens receive Qwen-style 4-row position ids where row 1 is the temporal/image block position and rows 2/3 are the patch grid row/column inferred from resampler attention. Tokens after `<|vision_end|>` resume after the max visual coordinate so text continuation remains ordered.
+- Patch position encoding is configurable via `patch_position_encoding` in `LLaVAModel_qwen3_5`: `linear` keeps patch tokens on the same sequential 4-row position ids as text/WSI tokens, while `mrope` restores the old `MRoPEPositionIDGenerator` behavior that writes resampler-inferred patch row/column coordinates into rows 2/3. The sampler config `stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_sampler.py` defaults to `linear`.
 - Optional WSI global features are handled separately from patch grids. `WSIProjector` takes one tensor per configured source dimension, applies source-specific MLPs and post norms, and emits one LLM-sized soft token per source. This path is controlled by `wsi_feature_dims`; it is not the same as `PromptConditionedPatchResampler`.
 - Modality dropout is sample-level. `patch_modality_dropout`, `wsi_modality_dropout`, `force_drop_patch`, and `force_drop_wsi` build keep masks in `_make_modality_keep_masks()`. Unless `modality_dropout_allow_text_only=True`, a sample with both patch and WSI available will keep at least one modality after dropout when possible.
 - Newly initialized trainable modules around the LLM, especially `PromptConditionedPatchResampler`, `WSIProjector`, `RegressionHead`, and `SurvivalHead`, should stay in FP32 even when the pretrained LLM runs in BF16. Casting these fresh trainable modules to BF16 can make AdamW updates numerically fragile.
@@ -32,3 +32,37 @@
 - For `text_wsi` with `wsi_feature_source='titan'`, the config sets `wsi_feature_field='slide_features_titan'` and `wsi_feature_dims=[768]`. Because the current JSON does not have a standalone `slide_features_titan` key, `LLaVADataset.__getitem__` falls back to `wsi_features` and filters the list for a path containing `slide_features_titan`, so only the TITAN global feature is loaded.
 - For `text_wsi` with `wsi_feature_source='prism'`, the same fallback/filtering behavior loads only the path containing `slide_features_prism`, and `wsi_feature_dims` should be `[1280]`.
 - To use both TITAN and PRISM WSI global features together with the current JSON structure, configure the dataset/model to read the full `wsi_features` list and set `wsi_feature_dims=[768, 1280]`. The model-side `WSIProjector` supports multiple WSI sources and will emit one WSI token per source; the order of paths in `wsi_features` must match the order of dimensions.
+
+# EffectiveBalancedSampler notes
+- `stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_sampler.py` uses `EffectiveBalancedSampler` from `xtuner/dataset/samplers/effective_balanced_sampler.py`.
+- `EffectiveBalancedSampler` supports an index cache via `cache_dir`; the sampler config points it at `dataset_cache_dir`, so cache files are stored under `/mnt/petrelfs/zhaoweike/project/TCGA/.cache/effective_balanced_sampler/`.
+- The sampler cache stores the expensive `family -> group -> effective unit -> row` index and group probabilities. Its cache key includes the processed dataset cache identity, dataset length, world size, batch/rounding settings, and sampler balancing knobs, but not epoch or seed.
+- On first launch or cache miss, the sampler still scans all rows once and then writes `Saved EffectiveBalancedSampler cache ...`; on later matching launches it should log `Loading EffectiveBalancedSampler cache ...` and skip the long startup scan.
+- If the train JSON, tokenizer/map preprocessing cache, world size, or sampler knobs change, the sampler cache key changes and a new sampler index cache is built.
+- Sampling is hierarchical: `family -> group -> effective unit -> row`.
+- There are now two sampling modes in `EffectiveBalancedSampler`:
+  - `mix_within_batch=True` means each sample in a batch independently draws `family -> group -> effective unit -> row`.
+  - `mix_within_batch=False` means one `family/group` is drawn for the whole batch, then all samples in that batch come from that same group.
+- The current sampler config in `stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_sampler.py` sets `sampler_mix_within_batch = True`.
+- Distributed behavior is only partially independent across ranks. In `EffectiveBalancedSampler.__iter__()`, `group_rng` is seeded as `seed + epoch * 1009` with no rank offset, while `sample_rng` adds `+ rank`. So with `mix_within_batch=True`, every rank sees the same per-sample `family/group` schedule, but each rank draws different units/rows inside that chosen group. This means local batches are task-mixed, yet the same sample slot across ranks is still task-aligned rather than fully rank-independent.
+- `original_mix_by_family` only controls how categories/projects are mixed inside one family. It does not control the top-level MCQA/regression/survival exposure ratio; that still comes from `family_weights`.
+- For the current PathOverse train JSON, the raw row ratio is approximately `mcqa=0.35`, `regression=0.62`, `survival=0.03`.
+- With `mix_within_batch=False` and `family_weights["survival"]=0.03`, only about 3% of optimizer steps are survival batches, so training logs can show `srv_loss=0` most of the time even though the global survival sample ratio is unchanged.
+- With `mix_within_batch=True`, the global sample ratio is still about `0.35 / 0.62 / 0.03`, but survival rows are spread across many more mixed batches. For `batch_size=16`, the probability that a batch contains at least one survival sample is about `1 - 0.97^16 ~= 38.6%`, which makes `srv_loss` appear in logs much more often and gives the shared model more continuous survival gradients.
+- `family` comes from `category`: `mcqa::*`, `regression::*`, `survival::*`.
+- `group` is the actual task bucket. For MCQA/regression it is `(family, category, "all")`; for survival it is `(family, category, project)`.
+- Current MCQA `category` is already fine-grained task name, e.g. `mcqa::cnv_EGFR`, `mcqa::snv_TP53`, `mcqa::HRD_Binary`, `mcqa::molecular_subtype_THYM`; it is not just broad `cnv` or `snv`.
+- The sampler can rebalance all categories by effective unit count, but it cannot assign a custom weight to a specific named task such as only `mcqa::cnv_EGFR` unless code/config is extended.
+- `effective unit` avoids treating many generated rows from one slide/patient as independent samples: non-survival uses slide by default; survival uses patient when `survival_unit="patient"`.
+- Group probability uses effective units, not raw row count: `prob = original_mix * n_eff + (1 - original_mix) * n_eff ** size_alpha`, normalized within each family.
+- `size_alpha < 1` and lower `original_mix` upweight smaller categories uniformly. `tiny_group_max_fraction` caps all very tiny categories together so noisy few-sample tasks do not dominate.
+- MCQA label balancing is inside each MCQA category only. `label_balance_power=0.5` upweights minority answer labels with inverse-sqrt frequency when the category has enough effective units.
+- Current sampler already handles family imbalance, category-size imbalance, repeated slide/patient rows, and part of MCQA answer-label imbalance.
+- Current sampler is still static and prior-based: it does not read eval metrics, task difficulty, noise level, or hand-written per-task importance; `set_epoch()` only changes the RNG seed.
+- Practical knobs:
+  - `family_weights`: MCQA/regression/survival exposure ratio.
+  - `size_alpha`: smaller value means more small-category upweighting.
+  - `original_mix`: smaller value means more tempered balancing, less raw-size weighting.
+  - `label_balance_power`: larger value means stronger MCQA minority-label upweighting.
+  - `tiny_group_max_fraction`: lower value protects against over-sampling extremely tiny/noisy categories.
+  - `max_unit_repeats_per_epoch`: limits repeated sampling of the same slide/patient within one epoch.

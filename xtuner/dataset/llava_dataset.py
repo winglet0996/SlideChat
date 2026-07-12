@@ -225,6 +225,9 @@ class LLaVADataset(Dataset):
                 logger='current',
                 level=logging.WARNING)
 
+        self.text_cache_key = None
+        self.text_cache_path = None
+        self.text_cache_signature = None
         if offline_processed_text_folder is not None:
             self.text_data = load_from_disk(offline_processed_text_folder)
         else:
@@ -279,6 +282,9 @@ class LLaVADataset(Dataset):
             cache_dataset_path = os.path.join(cache_path, 'dataset')
             cache_meta_path = os.path.join(cache_path, 'meta.json')
             lock_path = os.path.join(cache_dir, f'{cache_key}.lock')
+            self.text_cache_key = cache_key
+            self.text_cache_path = cache_path
+            self.text_cache_signature = cache_signature
 
             cached_dataset = self._try_load_cached_dataset(
                 cache_dataset_path=cache_dataset_path,
@@ -472,6 +478,10 @@ class LLaVADataset(Dataset):
                 raise ValueError(
                     f"No WSI feature path matching {self.wsi_feature_field!r} in {wsi_paths!r}")
             wsi_paths = matched_wsi_paths[0]
+        if wsi_paths:
+            data_dict['wsi_feature_paths'] = [wsi_paths] if isinstance(wsi_paths, str) else list(wsi_paths)
+        else:
+            data_dict.pop('wsi_feature_paths', None)
         if self.load_wsi_features and wsi_paths:
             wsi_list = [wsi_paths] if isinstance(wsi_paths, str) else wsi_paths
             data_dict['wsi_features'] = load_wsi_global_features(wsi_list)

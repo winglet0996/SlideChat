@@ -106,12 +106,12 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 3000
+interval = 1500
 # interval = 1
 save_total_limit = 20
 
 # Evaluate the generation performance during the training
-evaluation_freq = 3000  # More frequent evaluation for alignment debugging
+evaluation_freq = 1500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat

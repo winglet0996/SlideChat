@@ -19,7 +19,8 @@ from transformers import (AddedToken, AutoConfig, CLIPImageProcessor,
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from xtuner.registry import BUILDER
-from xtuner.utils import (DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, StopWordStoppingCriteria)
+from xtuner.utils import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX,
+                          StopWordStoppingCriteria)
 from .modules import ProjectorConfig, ProjectorModel, dispatch_modules
 from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
 from .utils import (LoadWoInit, find_all_linear_names,
@@ -319,6 +320,28 @@ class LLaVAModel_longnet(BaseModel):
         projected_features = self.projector(feat_to_proj.to(self.llm.dtype))
         return projected_features
 
+    def _strip_assistant_targets(self, data):
+        labels = data.get('labels')
+        input_ids = data.get('input_ids')
+        attention_mask = data.get('attention_mask')
+        if labels is None or input_ids is None or attention_mask is None:
+            return
+
+        pad_token_id = (
+            getattr(self.llm.config, 'pad_token_id', None)
+            or getattr(self.tokenizer, 'pad_token_id', None)
+            or getattr(self.tokenizer, 'eos_token_id', None)
+            or 0)
+        for batch_idx in range(input_ids.size(0)):
+            supervised = (labels[batch_idx] != IGNORE_INDEX).nonzero(
+                as_tuple=True)[0]
+            if supervised.numel() == 0:
+                continue
+            start = int(supervised[0].item())
+            input_ids[batch_idx, start:] = int(pad_token_id)
+            labels[batch_idx, start:] = IGNORE_INDEX
+            attention_mask[batch_idx, start:] = False
+
     def forward(self, data, data_samples=None, mode='loss'):
         if self.is_first_iter:
             # hardcode for qlora DeepSpeed ZeRO3, put buffers and QuantState to
@@ -330,6 +353,13 @@ class LLaVAModel_longnet(BaseModel):
             # Project vision features and update the data dictionary.
             projected_features = self._project_vision_features(data['pixel_values'])
             data['pixel_values'] = projected_features
+            if mode == 'predict':
+                data = data.copy()
+                for key in ('input_ids', 'labels', 'attention_mask',
+                            'position_ids'):
+                    if torch.is_tensor(data.get(key)):
+                        data[key] = data[key].clone()
+                self._strip_assistant_targets(data)
             data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
         if mode == 'loss':

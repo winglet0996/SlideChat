@@ -60,7 +60,8 @@ def llava_map_fn(example):
     for key in [
         'survival_targets',      # dict with target_y / at_risk_mask
         'regression_targets',    # scalar or list
-        'category', 'id', 'image'
+        'category', 'id', 'image', 'conversations', 'wsi_features',
+        'division', 'project', 'image_len'
     ]:
         if key in example:
             result[key] = example[key]
