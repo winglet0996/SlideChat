@@ -5,7 +5,123 @@ import math
 from timm.layers import trunc_normal_
 from transformers import InstructBlipQFormerConfig
 from transformers.models.instructblip.modeling_instructblip import InstructBlipQFormerEncoder
-from typing import Optional, Tuple, Iterable, Literal, Dict
+from typing import Optional, Tuple, Iterable, Literal, Dict, Sequence
+
+
+ROUTE_FAMILIES = (
+    'morphology_clinicopathology',
+    'molecular_biomarker',
+    'molecular_program',
+    'outcome',
+)
+
+
+class RoutedLoRAAdapter(nn.Module):
+    """A small additive LoRA branch kept in FP32 by default.
+
+    The up projection is zero-initialized so adding routed modules preserves
+    the pre-routed model output at initialization.
+    """
+
+    def __init__(self, in_features: int, out_features: int, rank: int,
+                 alpha: float, dropout: float = 0.0):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f'LoRA rank must be positive, got {rank}.')
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        self.scaling = float(alpha) / float(rank)
+        self.dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+
+
+class RoutedLoRALinear(nn.Module):
+    """Frozen linear + shared LoRA + per-sample family LoRA.
+
+    ``route_family`` is installed by :class:`LLaVAModel_qwen3_5` for the
+    duration of one forward/generation call. Routing always indexes dimension
+    zero. For flattened ``(batch * tokens, hidden)`` inputs, routes are
+    expanded with ``repeat_interleave``; no token-wise router is used.
+    """
+
+    def __init__(self, base_linear: nn.Linear, rank: int, alpha: float,
+                 dropout: float, route_families: Sequence[str] = ROUTE_FAMILIES):
+        super().__init__()
+        if not isinstance(base_linear, nn.Linear):
+            raise TypeError(f'Expected nn.Linear, got {type(base_linear)!r}.')
+        self.base_linear = base_linear
+        self.base_linear.requires_grad_(False)
+        self.shared_lora = RoutedLoRAAdapter(
+            base_linear.in_features, base_linear.out_features, rank, alpha, dropout)
+        self.family_lora = nn.ModuleDict({
+            family: RoutedLoRAAdapter(
+                base_linear.in_features, base_linear.out_features, rank, alpha, dropout)
+            for family in route_families
+        })
+        self.route_families = tuple(route_families)
+        self._route_family = None
+
+    def set_route_family(self, route_family: Optional[torch.Tensor]) -> None:
+        self._route_family = route_family
+
+    def _route_for_input(self, x: torch.Tensor) -> torch.Tensor:
+        route = self._route_family
+        if route is None:
+            raise RuntimeError(
+                'RoutedLoRALinear received no route_family. '
+                'Every routed forward must provide a per-sample route.')
+        route = route.to(device=x.device, dtype=torch.long).view(-1)
+        if x.ndim < 2:
+            raise ValueError(f'Routed LoRA expects at least 2D input, got {tuple(x.shape)}.')
+        if x.size(0) == route.numel():
+            return route
+        if route.numel() > 0 and x.size(0) % route.numel() == 0:
+            # Transformer kernels may flatten batch and token dimensions, and
+            # generation expands the leading batch dimension for beam search.
+            # Both layouts keep rows for one sample/beam contiguous.
+            return route.repeat_interleave(x.size(0) // route.numel())
+        raise ValueError(
+            f'Cannot align per-sample route shape {tuple(route.shape)} with '
+            f'linear input shape {tuple(x.shape)}.')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.base_linear(x) + self.shared_lora(x)
+        route = self._route_for_input(x)
+        residual = torch.zeros_like(out)
+        for family_id, family in enumerate(self.route_families):
+            idx = (route == family_id).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            family_out = self.family_lora[family](x.index_select(0, idx))
+            residual = residual.index_add(0, idx, family_out)
+        return out + residual
+
+
+def replace_linear_with_routed_lora(
+    module: nn.Module,
+    target_modules: Sequence[str],
+    rank: int,
+    alpha: float,
+    dropout: float,
+    route_families: Sequence[str] = ROUTE_FAMILIES,
+) -> int:
+    """Replace matching leaf linear modules in-place and return the count."""
+    target_modules = set(str(name) for name in target_modules)
+    replaced = 0
+    for child_name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear) and child_name in target_modules:
+            setattr(module, child_name, RoutedLoRALinear(
+                child, rank, alpha, dropout, route_families=route_families))
+            replaced += 1
+        else:
+            replaced += replace_linear_with_routed_lora(
+                child, target_modules, rank, alpha, dropout,
+                route_families=route_families)
+    return replaced
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
@@ -784,6 +900,7 @@ class PromptConditionedPatchResampler(nn.Module):
         dropout: float = 0.0,
         use_local_conv: bool = True,
         query_init_std: float = 0.5,
+        route_families: Sequence[str] = ROUTE_FAMILIES,
     ):
         super().__init__()
         if resampler_dim % num_heads != 0:
@@ -797,6 +914,9 @@ class PromptConditionedPatchResampler(nn.Module):
         self.num_query = 8 if num_query is None else int(num_query)
         self.num_layers = int(num_layers)
         self.query_init_std = float(query_init_std)
+        self.route_families = tuple(route_families)
+        if not self.route_families:
+            raise ValueError('route_families must not be empty.')
         if self.num_query <= 0:
             raise ValueError(f"num_query must be positive, got {self.num_query}.")
         if self.num_layers <= 0:
@@ -825,6 +945,10 @@ class PromptConditionedPatchResampler(nn.Module):
         self.prompt_norm = nn.LayerNorm(self.resampler_dim)
         self.query_tokens = nn.Parameter(torch.empty(self.num_query, self.resampler_dim))
         self.query_id = nn.Parameter(torch.empty(self.num_query, self.resampler_dim))
+        self.family_query_residual = nn.ParameterDict({
+            family: nn.Parameter(torch.zeros(self.num_query, self.resampler_dim))
+            for family in self.route_families
+        })
         attn_kwargs = dict(embed_dim=self.resampler_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.prompt_attn = nn.MultiheadAttention(**attn_kwargs)
         self.decoder_blocks = nn.ModuleList([
@@ -905,9 +1029,38 @@ class PromptConditionedPatchResampler(nn.Module):
             mask[empty, 0] = True
         return prompt_embeds, mask
 
-    def _condition_queries(self, prompt_tokens, prompt_mask):
+    def _normalize_route_family(self, route_family, batch_size: int, device: torch.device):
+        if route_family is None:
+            raise ValueError(
+                'Missing route_family. PromptConditionedPatchResampler requires '
+                'one route id per image.')
+        if torch.is_tensor(route_family):
+            route_ids = route_family.to(device=device, dtype=torch.long).view(-1)
+        else:
+            route_ids = torch.as_tensor(route_family, device=device, dtype=torch.long).view(-1)
+        if route_ids.numel() != batch_size:
+            raise ValueError(
+                f'route_family must be per-image with shape [{batch_size}], '
+                f'got {tuple(route_ids.shape)}.')
+        if bool(((route_ids < 0) | (route_ids >= len(self.route_families))).any().item()):
+            raise ValueError(f'Invalid route_family ids: {route_ids.tolist()}')
+        return route_ids
+
+    def _condition_queries(self, prompt_tokens, prompt_mask, route_family=None):
         batch_size = prompt_tokens.size(0)
-        queries = (self.query_tokens + self.query_id).unsqueeze(0).expand(batch_size, -1, -1)
+        route_ids = self._normalize_route_family(
+            route_family, batch_size, prompt_tokens.device)
+        shared_queries = (self.query_tokens + self.query_id).unsqueeze(0).expand(
+            batch_size, -1, -1)
+        residual = torch.zeros_like(shared_queries)
+        for family_id, family in enumerate(self.route_families):
+            idx = (route_ids == family_id).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            family_residual = self.family_query_residual[family].unsqueeze(0).expand(
+                idx.numel(), -1, -1)
+            residual = residual.index_add(0, idx, family_residual)
+        queries = shared_queries + residual
         conditioned, _ = self.prompt_attn(
             query=queries,
             key=prompt_tokens,
@@ -942,6 +1095,7 @@ class PromptConditionedPatchResampler(nn.Module):
         prompt_embeds: torch.Tensor,
         prompt_attention_mask: Optional[torch.Tensor] = None,
         feature_shapes: Optional[torch.Tensor] = None,
+        route_family: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if features.ndim != 4:
             raise ValueError(f"Expected features with shape (B, C, H, W), got {tuple(features.shape)}.")
@@ -981,7 +1135,8 @@ class PromptConditionedPatchResampler(nn.Module):
         prompt_tokens = prompt_tokens.to(dtype=prompt_dtype)
 
         patch_key_padding = ~valid_mask.flatten(1)
-        visual_tokens = self._condition_queries(prompt_tokens, prompt_attention_mask)
+        visual_tokens = self._condition_queries(
+            prompt_tokens, prompt_attention_mask, route_family=route_family)
         patch_attn_heads = None
         for layer_idx, block in enumerate(self.decoder_blocks):
             visual_tokens, attn_heads = block(

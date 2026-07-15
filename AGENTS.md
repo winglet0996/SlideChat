@@ -33,6 +33,16 @@
 - For `text_wsi` with `wsi_feature_source='prism'`, the same fallback/filtering behavior loads only the path containing `slide_features_prism`, and `wsi_feature_dims` should be `[1280]`.
 - To use both TITAN and PRISM WSI global features together with the current JSON structure, configure the dataset/model to read the full `wsi_features` list and set `wsi_feature_dims=[768, 1280]`. The model-side `WSIProjector` supports multiple WSI sources and will emit one WSI token per source; the order of paths in `wsi_features` must match the order of dimensions.
 
+# Qwen3.5 patch attention export
+- Attention is saved only in validation/test `mode='predict'` with patch input; training `mode='loss'` does not save it.
+- For HDF5 export, set `save_patch_attention_h5=True`, `patch_attention_h5_dir=<output_dir>`, and `patch_attention_h5_dtype='float16'` or `'float32'` in the model config. The 8-token sampler test config currently enables this export to `test_results/patch_attention_h5` with `float16`.
+- Saving follows the prediction flow: the patch resampler first produces visual tokens and query-to-patch weights; the model then runs one additional no-grad eager-attention LLM forward to collect the last prefix token's attention to those visual tokens. The H5 file is written after generation so that the prediction is included.
+- Files are organized as `<output_dir>/<category>/<hash-prefix>/*.attn.h5`, with one file per image/slide. They are first written to a temporary file and atomically renamed to avoid leaving incomplete H5 files after interruption.
+- Each H5 has three main groups: `qa/` stores the original sample, answer and prediction; `patch_ref/` stores source feature paths, grid shape and patch index mapping; `attention/` stores resampler attention, LLM visual-token attention, token positions and validity.
+- The main tensors are `attention/resampler_cross_attn` (`head × visual query × valid patch`) and `attention/next_token_source_attn` (`LLM layer × head × visual query`). Together they describe `LLM token → visual query → source patch`; the latter is not the attention of every generated token.
+- Use `patch_ref/source_patch_indices` to index the source patch H5 `coords` dataset and recover the corresponding WSI level-0 patch coordinates. Ignore entries with source index `-1`, which are fallback cells without a real patch mapping.
+- Because the extra LLM attention forward increases runtime and GPU memory use, prefer a controlled validation/test subset when resources are limited.
+
 # EffectiveBalancedSampler notes
 - `stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_sampler.py` uses `EffectiveBalancedSampler` from `xtuner/dataset/samplers/effective_balanced_sampler.py`.
 - `EffectiveBalancedSampler` supports an index cache via `cache_dir`; the sampler config points it at `dataset_cache_dir`, so cache files are stored under `/mnt/petrelfs/zhaoweike/project/TCGA/.cache/effective_balanced_sampler/`.

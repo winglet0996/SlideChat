@@ -96,6 +96,7 @@ def default_collate_fn(instances: Sequence[Dict],
         }
 
     data_dict['category'] = [inst.get('category', None) for inst in instances]
+    data_dict['route_family'] = [inst.get('route_family', None) for inst in instances]
     data_dict['project'] = [inst.get('project', None) for inst in instances]
     data_dict['image_file'] = [inst.get('image_file', None) for inst in instances]
 

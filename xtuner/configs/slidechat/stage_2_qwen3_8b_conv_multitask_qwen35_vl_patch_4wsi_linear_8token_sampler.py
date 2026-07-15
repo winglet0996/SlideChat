@@ -18,6 +18,7 @@ from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, llava_text_only_map_fn, template_map_fn_factory
 from xtuner.dataset.samplers import EffectiveBalancedSampler
 from xtuner.engine.hooks import DatasetInfoHook, ModalityDropoutSchedulerHook
+from xtuner.engine.optimizers import TwoGroupOptimWrapperConstructor
 from xtuner.engine.runner import TrainLoop
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 from xtuner.model import LLaVAModel_qwen3_5
@@ -28,6 +29,13 @@ from xtuner.utils import PROMPT_TEMPLATE
 #######################################################################
 
 setting = 'lora'
+route_families = (
+    'morphology_clinicopathology',
+    'molecular_biomarker',
+    'molecular_program',
+    'outcome',
+)
+vision_lr_mult = 0.1
 
 # Ablation knobs. Update these together for patch/WSI/position-encoding runs.
 ablation_version = 'v13'
@@ -358,6 +366,7 @@ model = dict(
     wsi_dropout=0.3,  # Projector hidden dropout, not modality dropout.
     survival_head_dropout=0.6,
     head_scaling=list(head_scaling),
+    route_families=list(route_families),
     patch_modality_dropout=0.2,
     wsi_modality_dropout=0.2,
     modality_dropout_allow_text_only=False,
@@ -485,6 +494,10 @@ test_evaluator = dict(type=PathologyMetric,
 
 optim_wrapper = dict(
     type=AmpOptimWrapper,
+    constructor='TwoGroupOptimWrapperConstructor',
+    paramwise_cfg=dict(
+        vision_prefixes=('patch_resampler.', 'wsi_projector.'),
+        vision_lr_mult=vision_lr_mult),
     optimizer=dict(
         # type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
         type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
@@ -564,6 +577,8 @@ env_cfg = dict(
     # set distributed parameters
     dist_cfg=dict(backend='nccl'),
 )
+
+model_wrapper_cfg = dict(find_unused_parameters=True)
 
 
 # set log level

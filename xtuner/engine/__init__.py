@@ -5,6 +5,7 @@ from .hooks import (DatasetInfoHook,
                     EvaluateChatHook_longnet,
                     ThroughputHook,
                     VarlenAttnArgsToMessageHubHook)
+from .optimizers import TwoGroupOptimWrapperConstructor
 from .runner import TrainLoop
 
 __all__ = [
@@ -14,5 +15,6 @@ __all__ = [
     'ThroughputHook',
     'VarlenAttnArgsToMessageHubHook',
     'DeepSpeedStrategy',
+    'TwoGroupOptimWrapperConstructor',
     'TrainLoop'
 ]

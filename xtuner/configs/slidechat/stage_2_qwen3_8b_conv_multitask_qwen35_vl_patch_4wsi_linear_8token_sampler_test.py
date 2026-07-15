@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Qwen3.5 multitask config with prompt-conditioned WSI patch resampling."""
-from os import listdir
+from os import environ, listdir
 from os.path import basename, isdir, isfile, join
 
 from mmengine.dataset import DefaultSampler
@@ -18,6 +18,7 @@ from xtuner.dataset.collate_fns import masked_collated_fn
 from xtuner.dataset.map_fns import llava_map_fn, llava_text_only_map_fn, template_map_fn_factory
 from xtuner.dataset.samplers import EffectiveBalancedSampler
 from xtuner.engine.hooks import DatasetInfoHook, ModalityDropoutSchedulerHook
+from xtuner.engine.optimizers import TwoGroupOptimWrapperConstructor
 from xtuner.engine.runner import TrainLoop
 from xtuner.evaluation.metrics.pathology_metric import PathologyMetric
 from xtuner.model import LLaVAModel_qwen3_5
@@ -28,15 +29,22 @@ from xtuner.utils import PROMPT_TEMPLATE
 #######################################################################
 
 setting = 'lora'
+route_families = (
+    'morphology_clinicopathology',
+    'molecular_biomarker',
+    'molecular_program',
+    'outcome',
+)
+vision_lr_mult = 0.1
 
 # Ablation knobs. Update these together for patch/WSI/position-encoding runs.
-ablation_version = 'v12'
+ablation_version = 'v13'
 patch_keep_tokens = 8
 wsi_feature_source = ('titan', 'prism', 'gigapath', 'chief')
 patch_position_encoding = 'linear'  # 'linear' or 'mrope'
 head_scaling = (0.5, 0, 0.5) # regression, survival, wsi_projector
-lora_r = 128
-lora_alpha = 128
+lora_r = 64
+lora_alpha = 64
 run_suffix = 'lr2e-5_sampler'
 
 if setting == 'alignment':
@@ -44,7 +52,7 @@ if setting == 'alignment':
     freeze_llm = True
     lr = 1e-4  # Reduced from 1e-4 for better stability
     ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v12_4token_keep_4wsi_dropout20_sampler/iter_3000.pth'
+    # ckpt_path = '/home/ps/pathology/codes/project/TCGA/9B_multimodal_alignment_wo_knowledge_v12_4token_keep_4wsi_dropout20_sampler/iter_3000.pth'
     max_epochs = 3
     save_best_metrics = None
 if setting == 'lora':
@@ -57,8 +65,8 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v12_8token_4wsi_linear_sampler/iter_19440.pth'
+    ckpt_path = None
+    # ckpt_path = '/home/ps/pathology/codes/project/TCGA/9B_multimodal_alignment_wo_knowledge_v12_8token_4wsi_linear_sampler/iter_19440.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -67,35 +75,37 @@ if setting == 'full_param':
     freeze_llm = False
     lr = 1e-5
     save_best_metrics = ['eval/reg_overall_rmse']
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
+    ckpt_path = '/home/ps/pathology/codes/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
     
 resume = False
 
 model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
-model_size = '9B'
+model_size = '4B'
 kg_status='wo_knowledge'
 
-llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.5-{model_size}'
-# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/train.json'
-# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
-dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
-# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
-# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+llm_name_or_path = f'/home/ps/pathology/model_weights/model_zoo/Qwen3.5-{model_size}'
+# train_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/train.json'
+# val_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
+# test_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
+dataset_cache_dir = '/home/ps/pathology/codes/project/TCGA/.cache/'
+# train_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
+# val_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+# test_data_path = f'/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
 
-train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/chief_gigapath_prism_titan/train.json'
-val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/chief_gigapath_prism_titan/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/chief_gigapath_prism_titan/test.json'
+test_data_path = environ.get(
+    'XTUNER_TEST_DATA_PATH',
+    '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline_v2/all_data/test_1000_with_route_family.json')
+train_data_path = test_data_path
+val_data_path = test_data_path
 
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
+# train_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
+# val_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
+# test_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
 
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/regression__train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
+# train_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/regression__train.json'
+# val_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
+# test_data_path = '/home/ps/pathology/codes/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
 
 
 # ckpt_out_path = 's3://zhaoweike/ckpt'
@@ -131,11 +141,11 @@ exp_tag = f'{ablation_version}_{ablation_tag}'
 if run_suffix:
     exp_tag = f'{exp_tag}_{run_suffix}'
 
-# work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
+# work_dir = f'/home/ps/pathology/codes/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
-vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
-# vis_name = None
+work_dir = f'/home/ps/pathology/codes/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
+# vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
+vis_name = None
 
 
 # set visualizer
@@ -154,6 +164,14 @@ visualizer = None if vis_name is None else dict(
 
 val_output_path = work_dir + 'val_results'
 test_output_path = work_dir + 'test_results'
+metric_output_path = environ.get('XTUNER_METRIC_OUTPUT_PATH', test_output_path)
+
+# Patch attention HDF5 export. Only used in validation/test predict mode.
+save_patch_attention_h5 = True
+patch_attention_h5_dir = environ.get(
+    'XTUNER_PATCH_ATTENTION_H5_DIR',
+    test_output_path + '/patch_attention_h5')
+patch_attention_h5_dtype = 'float16'
 
 # Save
 by_epoch = False
@@ -261,6 +279,7 @@ sampler_mix_within_batch = True
 
 # Scheduler & Optimizer
 batch_size = 16
+test_batch_size = int(environ.get('XTUNER_TEST_BATCH_SIZE', batch_size))
 accumulative_counts = 1
 optim_type = AdamW
 betas = (0.9, 0.999)
@@ -353,6 +372,10 @@ model = dict(
     patch_modality_dropout=0.2,
     wsi_modality_dropout=0.2,
     modality_dropout_allow_text_only=False,
+    save_patch_attention_h5=save_patch_attention_h5,
+    patch_attention_h5_dir=patch_attention_h5_dir,
+    patch_attention_h5_dtype=patch_attention_h5_dtype,
+    route_families=list(route_families),
 )
 
 #######################################################################
@@ -424,7 +447,7 @@ val_llava_dataset = dict(
     wsi_feature_field=wsi_feature_field)
 
 val_dataloader = dict(
-    batch_size=batch_size,
+    batch_size=test_batch_size,
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=val_llava_dataset,
@@ -433,7 +456,7 @@ val_dataloader = dict(
 
 val_evaluator = dict(type=PathologyMetric,
             tokenizer=tokenizer,
-            output_dir= val_output_path
+            output_dir=metric_output_path
             )
 
 test_llava_dataset = dict(
@@ -457,7 +480,7 @@ test_llava_dataset = dict(
     wsi_feature_field=wsi_feature_field)
 
 test_dataloader = dict(
-    batch_size=batch_size,
+    batch_size=test_batch_size,
     num_workers=dataloader_num_workers,
     pin_memory=True,
     dataset=test_llava_dataset,
@@ -467,7 +490,7 @@ test_dataloader = dict(
 
 test_evaluator = dict(type=PathologyMetric,
             tokenizer=tokenizer,
-            output_dir=test_output_path
+            output_dir=metric_output_path
             )
 
 #######################################################################
@@ -476,6 +499,10 @@ test_evaluator = dict(type=PathologyMetric,
 
 optim_wrapper = dict(
     type=AmpOptimWrapper,
+    constructor='TwoGroupOptimWrapperConstructor',
+    paramwise_cfg=dict(
+        vision_prefixes=('patch_resampler.', 'wsi_projector.'),
+        vision_lr_mult=vision_lr_mult),
     optimizer=dict(
         # type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
         type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
@@ -555,6 +582,10 @@ env_cfg = dict(
     # set distributed parameters
     dist_cfg=dict(backend='nccl'),
 )
+
+# Routed family experts can be absent on an individual DDP rank in a mixed
+# batch. Let DDP accept those intentionally unused parameters.
+model_wrapper_cfg = dict(find_unused_parameters=True)
 
 
 # set log level

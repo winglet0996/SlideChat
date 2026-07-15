@@ -37,7 +37,6 @@ xtuner/configs/deepspeed/deepspeed_zero2_offload.json
 xtuner/configs/deepspeed/deepspeed_zero3.json
 xtuner/configs/deepspeed/deepspeed_zero3_offload.json
 xtuner/configs/slidechat/eval_samples.py
-xtuner/configs/slidechat/eval_samples_raw.json
 xtuner/configs/slidechat/generate_eval_samples.py
 xtuner/configs/slidechat/stage_1.py
 xtuner/configs/slidechat/stage_1_ds_qwen3_8b_conv_longnet.py
@@ -48,8 +47,28 @@ xtuner/configs/slidechat/stage_1_qwen3_8b_conv_qformer_test.py
 xtuner/configs/slidechat/stage_1_qwen3_8b_conv_test.py
 xtuner/configs/slidechat/stage_1_qwen3_8b_longnet.py
 xtuner/configs/slidechat/stage_2.py
+xtuner/configs/slidechat/stage_2_qwen3_5_multitask.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_4wsi_linear_4token_sampler.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_4wsi_linear_4token_sampler_r128a128.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_4wsi_linear_4token_sampler_test.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_4wsi_linear_8token_sampler.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_4wsi_linear_8token_sampler_test.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_titan_linear_1token_sampler.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_titan_linear_4token_sampler.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_titan_linear_8token_sampler.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_titan_mrope_4token_sampler.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_alignment.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_gate.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_gate_test.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_gate_wsi.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_kg.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_sampler.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_patch_wsi_test.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen35_vl_srv.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_3mut.py
@@ -58,6 +77,9 @@ xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_all.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_all_alignment.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_all_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_allmut.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_allmut_kg.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_srv.py
+xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_srv_alignment.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_qwen3_vl_srv_cp.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_multitask_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_no_knowledge.py
@@ -68,6 +90,7 @@ xtuner/configs/slidechat/stage_2_qwen3_8b_conv_test.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_unified.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_unified_alignment.py
 xtuner/configs/slidechat/stage_2_qwen3_8b_conv_unified_test.py
+xtuner/configs/slidechat/stage_2_slidechat_original_longnet_h5_test.py
 xtuner/dataset/__init__.py
 xtuner/dataset/concat_dataset.py
 xtuner/dataset/huggingface.py
@@ -112,6 +135,7 @@ xtuner/dataset/map_fns/dataset_map_fns/tiny_codes_map_fn.py
 xtuner/dataset/map_fns/dataset_map_fns/wizardlm_map_fn.py
 xtuner/dataset/samplers/__init__.py
 xtuner/dataset/samplers/category_project_sampler.py
+xtuner/dataset/samplers/effective_balanced_sampler.py
 xtuner/dataset/samplers/intern_repo.py
 xtuner/dataset/samplers/length_grouped.py
 xtuner/engine/__init__.py
@@ -122,8 +146,10 @@ xtuner/engine/hooks/dataset_info_hook.py
 xtuner/engine/hooks/evaluate_chat_hook_conv_longnet.py
 xtuner/engine/hooks/evaluate_chat_hook_longnet.py
 xtuner/engine/hooks/hf_checkpoint_hook.py
+xtuner/engine/hooks/modality_dropout_scheduler_hook.py
 xtuner/engine/hooks/throughput_hook.py
 xtuner/engine/hooks/varlen_attn_args_to_messagehub_hook.py
+xtuner/engine/hooks/wandb_step_logger_hook.py
 xtuner/engine/runner/__init__.py
 xtuner/engine/runner/loops.py
 xtuner/evaluation/__init__.py
@@ -142,6 +168,7 @@ xtuner/model/llava_conv_qformer.py
 xtuner/model/llava_conv_qwen3_vl.py
 xtuner/model/llava_conv_unified.py
 xtuner/model/llava_longnet.py
+xtuner/model/llava_qwen3_5.py
 xtuner/model/orpo.py
 xtuner/model/reward.py
 xtuner/model/sft.py
@@ -253,4 +280,5 @@ xtuner/utils/fileio.py
 xtuner/utils/handle_moe_load_and_save.py
 xtuner/utils/stop_criteria.py
 xtuner/utils/templates.py
+xtuner/utils/wandb_backend.py
 xtuner/utils/zero_to_any_dtype.py

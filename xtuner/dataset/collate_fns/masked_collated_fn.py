@@ -165,6 +165,9 @@ def masked_collated_fn(instances: Sequence[Dict],
     data_dict['category'] = [
         inst.get('category', None) for inst in instances
     ]
+    data_dict['route_family'] = [
+        inst.get('route_family', None) for inst in instances
+    ]
     data_dict['project'] = [
         inst.get('project', None) for inst in instances
     ]

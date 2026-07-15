@@ -21,7 +21,10 @@ def llava_image_only_map_fn(example):
             input = ''
         else:
             raise NotImplementedError
-    return {'conversation': conversation}
+    result = {'conversation': conversation}
+    if 'route_family' in example:
+        result['route_family'] = example['route_family']
+    return result
 
 
 @MAP_FUNC.register_module('llava_map_fn')
@@ -60,7 +63,7 @@ def llava_map_fn(example):
     for key in [
         'survival_targets',      # dict with target_y / at_risk_mask
         'regression_targets',    # scalar or list
-        'category', 'id', 'image', 'conversations', 'wsi_features',
+        'category', 'route_family', 'id', 'image', 'conversations', 'wsi_features',
         'division', 'project', 'image_len'
     ]:
         if key in example:
@@ -99,7 +102,7 @@ def llava_text_only_map_fn(example):
         'wsi_features': None,
         'image_len': 0,
     }
-    for key in ['survival_targets', 'regression_targets', 'category', 'id', 'project']:
+    for key in ['survival_targets', 'regression_targets', 'category', 'route_family', 'id', 'project']:
         if key in example:
             result[key] = example[key]
 

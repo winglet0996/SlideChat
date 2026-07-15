@@ -114,11 +114,14 @@ def _enable_deepspeed(cfg, deepspeed_path):
             gradient_clipping=grad_clip,
             exclude_frozen_parameters=exclude_frozen_parameters,
             sequence_parallel_size=getattr(cfg, 'sequence_parallel_size', 1)))
-    cfg.__setitem__(
-        'optim_wrapper',
-        dict(
-            type='DeepSpeedOptimWrapper',
-            optimizer=optimizer))
+    deepspeed_optim_wrapper = dict(
+        type='DeepSpeedOptimWrapper',
+        optimizer=optimizer)
+    if optim_wrapper is not None and optim_wrapper.get('constructor', None) is not None:
+        deepspeed_optim_wrapper['constructor'] = optim_wrapper.constructor
+    if optim_wrapper is not None and optim_wrapper.get('paramwise_cfg', None) is not None:
+        deepspeed_optim_wrapper['paramwise_cfg'] = optim_wrapper.paramwise_cfg
+    cfg.__setitem__('optim_wrapper', deepspeed_optim_wrapper)
     cfg.runner_type = 'FlexibleRunner'
 
 
@@ -188,7 +191,7 @@ def main():
         cfg.test_evaluator["output_dir"] = osp.join(cfg.work_dir, "test_results")
 
     if args.deepspeed:
-        pretrained_pth = _as_model_checkpoint_file(args.checkpoint)
+        pretrained_pth = _as_model_checkpoint_file(args.checkpoint) if args.checkpoint else None
         cfg.model.pretrained_pth = pretrained_pth
         cfg.load_from = None
         # Reuse the train-time validation path, but feed it the requested test set.
@@ -247,8 +250,11 @@ def main():
         runner.model.test_step = MethodType(_debug_test_step, runner.model)
 
     if args.deepspeed:
-        runner.logger.info(
-            f"Checkpoint will be warm-started via model.pretrained_pth from {cfg.model.pretrained_pth}.")
+        if cfg.model.pretrained_pth:
+            runner.logger.info(
+                f"Checkpoint will be warm-started via model.pretrained_pth from {cfg.model.pretrained_pth}.")
+        else:
+            runner.logger.info('No checkpoint supplied; evaluating the configured base model initialization.')
         _run_deepspeed_val_with_optimizer(runner)
     else:
         runner.model.eval()

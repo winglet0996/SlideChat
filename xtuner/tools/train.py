@@ -359,9 +359,18 @@ def main():
                                                    'sequence_parallel_size',
                                                    1))
                 cfg.__setitem__('strategy', strategy)
+                paramwise_cfg = cfg.optim_wrapper.get('paramwise_cfg', None)
                 optim_wrapper = dict(
                     type='DeepSpeedOptimWrapper',
                     optimizer=cfg.optim_wrapper.optimizer)
+                constructor = cfg.optim_wrapper.get('constructor', None)
+                if constructor is not None:
+                    optim_wrapper['constructor'] = constructor
+                if paramwise_cfg is not None:
+                    # DeepSpeed still uses MMEngine's optimizer constructor;
+                    # preserve the parameter-wise LR groups when replacing
+                    # AmpOptimWrapper with DeepSpeedOptimWrapper.
+                    optim_wrapper['paramwise_cfg'] = paramwise_cfg
                 cfg.__setitem__('optim_wrapper', optim_wrapper)
                 cfg.runner_type = 'FlexibleRunner'
 

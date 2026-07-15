@@ -31,11 +31,14 @@ from .custom_model import (
     InputComposer,
     MRoPEPositionIDGenerator,
     PromptConditionedPatchResampler,
+    ROUTE_FAMILIES,
+    RoutedLoRALinear,
     RegressionHead,
     SurvivalHead,
     WSIProjector,
     cox_ph_loss,
     logistic_hazard_loss,
+    replace_linear_with_routed_lora,
 )
 from .modules import dispatch_modules
 from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
@@ -429,8 +432,15 @@ class LLaVAModel_qwen3_5(BaseModel):
         save_patch_attention_h5: bool = False,
         patch_attention_h5_dir: Optional[str] = None,
         patch_attention_h5_dtype: str = 'float16',
+        route_families: Optional[List[str]] = None,
     ):
         super().__init__()
+        self.route_families = tuple(route_families or ROUTE_FAMILIES)
+        if self.route_families != ROUTE_FAMILIES:
+            raise ValueError(
+                f'route_families must use the fixed keys {ROUTE_FAMILIES!r}, '
+                f'got {self.route_families!r}.')
+        self._route_family_context = None
         self.freeze_llm = freeze_llm
         self.enable_regression = enable_regression
         self.enable_survival = enable_survival
@@ -468,6 +478,7 @@ class LLaVAModel_qwen3_5(BaseModel):
             raise ValueError("patch_attention_h5_dtype must be 'float16' or 'float32'.")
         self.use_llm_lora = llm_lora is not None
         self._use_llm_lora = self.use_llm_lora
+        self.routed_lora_enabled = False
         self.reg_token_id = None
         self.srv_token_id = None
         self._last_hidden_state = None
@@ -679,6 +690,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         )
         cfg.update(self.prompt_resampler_cfg or {})
         cfg['llm_hidden_size'] = self._get_llm_hidden_size()
+        cfg['route_families'] = self.route_families
         self.patch_resampler = PromptConditionedPatchResampler(**cfg)
         self.patch_resampler.set_output_rms(self._estimate_embedding_rms())
         print_log(f"[PromptResampler] cfg={cfg}", 'current')
@@ -812,20 +824,43 @@ class LLaVAModel_qwen3_5(BaseModel):
     def _configure_training(self, llm_lora: Optional[Dict], use_activation_checkpointing: bool) -> None:
         if llm_lora is not None:
             lora_cfg = self._build_from_cfg_or_module(llm_lora)
-            uses_kbit = self._is_kbit_model(self.llm)
-            if uses_kbit:
-                self.llm = prepare_model_for_kbit_training(self.llm, use_gradient_checkpointing=use_activation_checkpointing)
+            rank = int(getattr(lora_cfg, 'r', 0))
+            alpha = float(getattr(lora_cfg, 'lora_alpha', rank))
+            dropout = float(getattr(lora_cfg, 'lora_dropout', 0.0) or 0.0)
+            if rank <= 0:
+                raise ValueError(f'LoRA config must define a positive r, got {rank}.')
+
+            # Freeze the complete Qwen base before inserting the additive
+            # routed branches. This also keeps the base weights out of the
+            # optimizer and makes Stage 1/Stage 2 boundaries explicit.
+            self.llm.requires_grad_(False)
             if getattr(lora_cfg, 'target_modules', None) is None:
                 # For Qwen3-VL, we must avoid targeting 'proj' which matches Conv3d in visual encoder.
                 # Searching only in language_model avoids finding 'proj' from vision blocks.
                 target_model = getattr(self.llm, 'model', self.llm)
                 target_model = getattr(target_model, 'language_model', target_model)
                 lora_cfg.target_modules = find_all_linear_names(target_model)
-            self.llm = self._get_peft_model_without_bnb_dispatch(
-                self.llm,
-                lora_cfg,
-                disable_bnb_dispatch=not uses_kbit,
+            target_model = getattr(self.llm, 'model', self.llm)
+            target_model = getattr(target_model, 'language_model', target_model)
+            replaced = replace_linear_with_routed_lora(
+                target_model,
+                lora_cfg.target_modules,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+                route_families=self.route_families,
             )
+            if replaced == 0:
+                raise RuntimeError(
+                    f'No language-model linear layers matched LoRA targets '
+                    f'{lora_cfg.target_modules!r}.')
+            self.routed_lora_enabled = True
+            if is_main_process():
+                print_log(
+                    f'[RoutedLoRA] replaced {replaced} linear layers; '
+                    f'rank={rank}, alpha={alpha}, dropout={dropout}, '
+                    f'families={self.route_families}',
+                    'current')
         elif self.freeze_llm:
             self.llm.requires_grad_(False)
 
@@ -861,6 +896,9 @@ class LLaVAModel_qwen3_5(BaseModel):
 
     def _setup_generation(self, generation_kwargs: Optional[Dict], stop_words: Optional[List[str]]) -> None:
         gen_kwargs = dict(generation_kwargs or {})
+        # Training disables the model-level cache for gradient checkpointing,
+        # but autoregressive inference should explicitly re-enable it.
+        gen_kwargs.setdefault('use_cache', True)
         if 'eos_token_id' not in gen_kwargs and self.tokenizer.eos_token_id is not None:
             gen_kwargs['eos_token_id'] = self.tokenizer.eos_token_id
         if 'pad_token_id' not in gen_kwargs and self.tokenizer.pad_token_id is not None:
@@ -1011,6 +1049,78 @@ class LLaVAModel_qwen3_5(BaseModel):
         image_batch_indices = image_batch_indices.to(device=input_ids.device, dtype=torch.long)
         return prompt_embeds[image_batch_indices], prompt_mask[image_batch_indices]
 
+    def _normalize_route_family(self, route_family: Any, batch_size: int,
+                                device: torch.device) -> torch.Tensor:
+        """Validate and encode the required per-sample route field."""
+        if route_family is None:
+            raise ValueError(
+                'Missing route_family. Every sample must provide one of '
+                f'{self.route_families!r}; route is never inferred from the prompt.')
+        if torch.is_tensor(route_family):
+            if route_family.dtype.is_floating_point:
+                raise ValueError('route_family tensor must contain integer ids, not floats.')
+            route_ids = route_family.to(device=device, dtype=torch.long).view(-1)
+        else:
+            if isinstance(route_family, str):
+                route_family = [route_family]
+            try:
+                route_values = list(route_family)
+            except TypeError as exc:
+                raise ValueError('route_family must be a per-sample sequence.') from exc
+            if len(route_values) != batch_size:
+                raise ValueError(
+                    f'route_family must have {batch_size} entries, got {len(route_values)}.')
+            route_to_id = {family: idx for idx, family in enumerate(self.route_families)}
+            invalid = [value for value in route_values if value not in route_to_id]
+            if invalid:
+                raise ValueError(
+                    f'Invalid route_family values {invalid!r}; expected one of '
+                    f'{self.route_families!r}.')
+            route_ids = torch.tensor(
+                [route_to_id[value] for value in route_values],
+                device=device,
+                dtype=torch.long,
+            )
+        if route_ids.numel() != batch_size:
+            raise ValueError(
+                f'route_family must be per-sample with shape [{batch_size}], '
+                f'got {tuple(route_ids.shape)}.')
+        if bool(((route_ids < 0) | (route_ids >= len(self.route_families))).any().item()):
+            raise ValueError(
+                f'Invalid route_family ids {route_ids.tolist()}; expected '
+                f'0..{len(self.route_families) - 1}.')
+        return route_ids
+
+    @contextmanager
+    def _routed_lora_context(self, route_family: Optional[torch.Tensor]):
+        """Install one route for all LoRA calls in a forward/generation pass."""
+        if not self.routed_lora_enabled:
+            yield
+            return
+        previous = []
+        for module in self.llm.modules():
+            if isinstance(module, RoutedLoRALinear):
+                previous.append((module, module._route_family))
+                module.set_route_family(route_family)
+        if not previous:
+            raise RuntimeError('routed_lora_enabled=True but no routed linear modules exist.')
+        try:
+            yield
+        finally:
+            # Gradient-checkpointed transformer blocks are recomputed during
+            # backward, after this forward context has exited. Keep the route
+            # installed until the next serial training forward overwrites it;
+            # otherwise recomputation sees route=None. Eval/generation has no
+            # deferred recomputation and can restore the previous context.
+            keep_for_backward = (
+                self.training
+                and torch.is_grad_enabled()
+                and bool(getattr(self.llm, 'is_gradient_checkpointing', False))
+            )
+            if not keep_for_backward:
+                for module, old_route in previous:
+                    module.set_route_family(old_route)
+
     def _make_modality_keep_masks(
         self,
         batch_size: int,
@@ -1054,7 +1164,11 @@ class LLaVAModel_qwen3_5(BaseModel):
 
         return patch_keep, wsi_keep
 
-    def _project_vision_features(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    def _project_vision_features(
+        self,
+        data: Dict[str, Any],
+        route_family: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         if not self.enable_vision:
             raise RuntimeError("Received patch features but prompt_resampler_cfg is None.")
         param = next(self.patch_resampler.parameters())
@@ -1065,11 +1179,23 @@ class LLaVAModel_qwen3_5(BaseModel):
         prompt_embeds, prompt_mask = self._prompt_embeds_for_images(data)
         prompt_embeds = prompt_embeds.to(device=param.device, dtype=param.dtype)
         prompt_mask = prompt_mask.to(device=param.device)
+        image_batch_indices = data.get('image_batch_indices')
+        if image_batch_indices is None:
+            image_batch_indices = torch.arange(
+                features.size(0), device=route_family.device, dtype=torch.long)
+        image_batch_indices = image_batch_indices.to(
+            device=route_family.device, dtype=torch.long).view(-1)
+        if image_batch_indices.numel() != features.size(0):
+            raise ValueError(
+                'image_batch_indices must contain one sample index per image: '
+                f'{image_batch_indices.numel()} vs {features.size(0)}.')
+        image_route_family = route_family.index_select(0, image_batch_indices)
         out = self.patch_resampler(
             features=features,
             prompt_embeds=prompt_embeds,
             prompt_attention_mask=prompt_mask,
             feature_shapes=feature_shapes,
+            route_family=image_route_family,
         )
         self._last_patch_attention = out['patch_attention'].detach()
         self._last_patch_valid_mask = out['patch_valid_mask'].detach()
@@ -1534,7 +1660,22 @@ class LLaVAModel_qwen3_5(BaseModel):
             ]))
         return self.wsi_projector(source_features)
 
-    def forward(self, data: Dict[str, Any], data_samples: Optional[List] = None, mode: str = 'loss') -> Any:
+    def forward(self, data: Dict[str, Any], data_samples: Optional[List] = None,
+                mode: str = 'loss') -> Any:
+        routed_data = dict(data)
+        batch_size = int(routed_data['input_ids'].size(0))
+        route_family = routed_data.pop('route_family', None)
+        if route_family is None:
+            route_family = routed_data.get('route_family_ids')
+        route_family_ids = self._normalize_route_family(
+            route_family, batch_size, routed_data['input_ids'].device)
+        routed_data['route_family_ids'] = route_family_ids
+        with self._routed_lora_context(route_family_ids):
+            return self._forward_impl(routed_data, data_samples, mode)
+
+    def _forward_impl(self, data: Dict[str, Any],
+                      data_samples: Optional[List] = None,
+                      mode: str = 'loss') -> Any:
         data = dict(data)
         if self.is_first_iter:
             first_tensor = next((v for v in data.values() if torch.is_tensor(v)), None)
@@ -1559,7 +1700,7 @@ class LLaVAModel_qwen3_5(BaseModel):
 
         attention_save_payload = None
         if has_visual:
-            projected = self._project_vision_features(data)
+            projected = self._project_vision_features(data, data['route_family_ids'])
             if mode == 'predict':
                 self._save_attention_heatmaps(data, projected)
                 attention_save_payload = self._build_patch_attention_payload(data, projected)
@@ -1826,8 +1967,9 @@ class LLaVAModel_qwen3_5(BaseModel):
                 data_samples[i]['prediction_text'] = clean_text
 
                 # Attach choice logits for MCQA metrics
-                if first_step_logits is not None and i < first_step_logits.size(0):
-                    logits_row = first_step_logits[i]
+                if first_step_logits is not None and first_step_logits.size(0) >= batch_size:
+                    beam_factor = first_step_logits.size(0) // batch_size
+                    logits_row = first_step_logits[i * beam_factor]
                     choice_logits = {}
                     for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
                         tid = _choice_token_id(letter)
@@ -2319,10 +2461,45 @@ class LLaVAModel_qwen3_5(BaseModel):
                     if key in rows and 0 <= token_id < out.weight.size(0):
                         out.weight[token_id].copy_(rows[key].to(device=out.weight.device, dtype=out.weight.dtype))
 
+    @staticmethod
+    def _routed_external_key(key: str) -> Optional[str]:
+        """Map an internal wrapped-LLM key to a stable checkpoint key."""
+        if not key.startswith('llm.'):
+            return None
+        shared_marker = '.shared_lora.'
+        if shared_marker in key:
+            layer, parameter = key[4:].split(shared_marker, 1)
+            return f'routed_lora.shared.{layer}.{parameter}'
+        family_marker = '.family_lora.'
+        if family_marker in key:
+            layer, family_and_parameter = key[4:].split(family_marker, 1)
+            family, parameter = family_and_parameter.split('.', 1)
+            return f'routed_lora.family.{family}.{layer}.{parameter}'
+        return None
+
+    @staticmethod
+    def _routed_internal_key(key: str) -> Optional[str]:
+        """Map stable routed checkpoint keys back to wrapped-LLM keys."""
+        if key.startswith('routed_lora.shared.'):
+            rest = key[len('routed_lora.shared.'):]
+            layer, parameter = rest.rsplit('.', 2)[0], '.'.join(rest.rsplit('.', 2)[1:])
+            return f'llm.{layer}.shared_lora.{parameter}'
+        if key.startswith('routed_lora.family.'):
+            rest = key[len('routed_lora.family.'):]
+            family, rest = rest.split('.', 1)
+            layer, parameter = rest.rsplit('.', 2)[0], '.'.join(rest.rsplit('.', 2)[1:])
+            return f'llm.{layer}.family_lora.{family}.{parameter}'
+        return None
+
     def state_dict(self, *args, **kwargs) -> OrderedDict:
         state_dict = super().state_dict(*args, **kwargs)
         keep = OrderedDict()
-        if self.use_llm_lora:
+        if self.routed_lora_enabled:
+            for key, value in state_dict.items():
+                external_key = self._routed_external_key(key)
+                if external_key is not None:
+                    keep[external_key] = value
+        elif self.use_llm_lora:
             keep.update(get_peft_model_state_dict(self.llm, state_dict=state_dict))
         elif not self.freeze_llm:
             keep.update({k: v for k, v in state_dict.items() if k.startswith('llm.')})
@@ -2348,25 +2525,78 @@ class LLaVAModel_qwen3_5(BaseModel):
         )
 
         new_state_dict = OrderedDict()
-        is_lora_model = bool(self.use_llm_lora)
-        is_lora_ckpt = any(
-            k.startswith('llm.') and 'base_model.model' in k
-            for k in state_dict
-        )
+        is_lora_model = bool(self.routed_lora_enabled or self.use_llm_lora)
+        is_lora_ckpt = any('lora_A' in k or 'routed_lora.' in k for k in state_dict)
         mapped_count = 0
         llm_keys_count = 0
 
         for key, value in state_dict.items():
             new_key = key
+            if self.routed_lora_enabled:
+                routed_key = self._routed_internal_key(key)
+                if routed_key is not None:
+                    new_state_dict[routed_key] = value
+                    continue
             if key.startswith('llm.'):
                 llm_keys_count += 1
-                if is_lora_model and not is_lora_ckpt:
-                    new_key = key.replace('llm.', 'llm.base_model.model.', 1)
+                if self.routed_lora_enabled and ('lora_A' in key or 'lora_B' in key):
+                    # Old PEFT checkpoints are treated as the shared branch;
+                    # newly introduced family branches retain their zero init.
+                    new_key = key.replace('llm.base_model.model.', 'llm.', 1)
+                    if '.lora_A.default.' in new_key:
+                        new_key = new_key.replace('.lora_A.default.', '.shared_lora.lora_A.')
+                    elif '.lora_A.' in new_key:
+                        new_key = new_key.replace('.lora_A.', '.shared_lora.lora_A.')
+                    if '.lora_B.default.' in new_key:
+                        new_key = new_key.replace('.lora_B.default.', '.shared_lora.lora_B.')
+                    elif '.lora_B.' in new_key:
+                        new_key = new_key.replace('.lora_B.', '.shared_lora.lora_B.')
                     mapped_count += 1
                 elif not is_lora_model and is_lora_ckpt:
                     new_key = key.replace('llm.base_model.model.', 'llm.', 1)
                     mapped_count += 1
             new_state_dict[new_key] = value
+
+        if not strict:
+            full_model_keys = set(super().state_dict().keys())
+            unexpected_keys = sorted(set(new_state_dict) - full_model_keys)
+
+            checkpoint_keys = {
+                key for key in full_model_keys
+                if (
+                    '.shared_lora.' in key
+                    or '.family_lora.' in key
+                    or key.startswith('patch_resampler.')
+                    or key.startswith('wsi_projector.')
+                    or key.startswith('regression_head.')
+                    or key.startswith('survival_head.')
+                    or key.startswith('special_lm_head.')
+                    or key in ('vision_token_gate', 'wsi_token_gate')
+                )
+            }
+            missing_checkpoint_keys = sorted(checkpoint_keys - set(new_state_dict))
+            is_legacy_checkpoint = not any(
+                key.startswith('routed_lora.') for key in state_dict)
+            if is_legacy_checkpoint:
+                missing_checkpoint_keys = [
+                    key for key in missing_checkpoint_keys
+                    if not (
+                        '.shared_lora.' in key
+                        or '.family_lora.' in key
+                        or key.startswith('patch_resampler.family_query_residual.')
+                    )
+                ]
+            if missing_checkpoint_keys or unexpected_keys:
+                details = []
+                if missing_checkpoint_keys:
+                    details.append(
+                        f'missing non-routed keys: {missing_checkpoint_keys[:20]!r}')
+                if unexpected_keys:
+                    details.append(
+                        f'unexpected keys: {unexpected_keys[:20]!r}')
+                raise RuntimeError(
+                    'Checkpoint is incompatible with the current model; '
+                    + '; '.join(details))
 
         incompatible = super().load_state_dict(new_state_dict, strict=strict)
         self._load_special_token_rows(special_rows)
