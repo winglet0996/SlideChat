@@ -139,6 +139,7 @@ xtuner/dataset/samplers/effective_balanced_sampler.py
 xtuner/dataset/samplers/intern_repo.py
 xtuner/dataset/samplers/length_grouped.py
 xtuner/engine/__init__.py
+xtuner/engine/optimizers.py
 xtuner/engine/_strategy/__init__.py
 xtuner/engine/_strategy/deepspeed.py
 xtuner/engine/hooks/__init__.py

@@ -11,7 +11,9 @@ from typing import Optional, Tuple, Iterable, Literal, Dict, Sequence
 ROUTE_FAMILIES = (
     'morphology_clinicopathology',
     'molecular_biomarker',
-    'molecular_program',
+    'protein_program',
+    'transcriptomic_program',
+    'immune_microenvironment',
     'outcome',
 )
 
@@ -49,17 +51,22 @@ class RoutedLoRALinear(nn.Module):
     """
 
     def __init__(self, base_linear: nn.Linear, rank: int, alpha: float,
-                 dropout: float, route_families: Sequence[str] = ROUTE_FAMILIES):
+                 dropout: float, route_families: Sequence[str] = ROUTE_FAMILIES,
+                 family_rank: Optional[int] = None,
+                 family_alpha: Optional[float] = None):
         super().__init__()
         if not isinstance(base_linear, nn.Linear):
             raise TypeError(f'Expected nn.Linear, got {type(base_linear)!r}.')
         self.base_linear = base_linear
         self.base_linear.requires_grad_(False)
+        family_rank = rank if family_rank is None else int(family_rank)
+        family_alpha = alpha if family_alpha is None else float(family_alpha)
         self.shared_lora = RoutedLoRAAdapter(
             base_linear.in_features, base_linear.out_features, rank, alpha, dropout)
         self.family_lora = nn.ModuleDict({
             family: RoutedLoRAAdapter(
-                base_linear.in_features, base_linear.out_features, rank, alpha, dropout)
+                base_linear.in_features, base_linear.out_features,
+                family_rank, family_alpha, dropout)
             for family in route_families
         })
         self.route_families = tuple(route_families)
@@ -108,6 +115,8 @@ def replace_linear_with_routed_lora(
     alpha: float,
     dropout: float,
     route_families: Sequence[str] = ROUTE_FAMILIES,
+    family_rank: Optional[int] = None,
+    family_alpha: Optional[float] = None,
 ) -> int:
     """Replace matching leaf linear modules in-place and return the count."""
     target_modules = set(str(name) for name in target_modules)
@@ -115,12 +124,14 @@ def replace_linear_with_routed_lora(
     for child_name, child in list(module.named_children()):
         if isinstance(child, nn.Linear) and child_name in target_modules:
             setattr(module, child_name, RoutedLoRALinear(
-                child, rank, alpha, dropout, route_families=route_families))
+                child, rank, alpha, dropout, route_families=route_families,
+                family_rank=family_rank, family_alpha=family_alpha))
             replaced += 1
         else:
             replaced += replace_linear_with_routed_lora(
                 child, target_modules, rank, alpha, dropout,
-                route_families=route_families)
+                route_families=route_families, family_rank=family_rank,
+                family_alpha=family_alpha)
     return replaced
 
 class DropPath(nn.Module):

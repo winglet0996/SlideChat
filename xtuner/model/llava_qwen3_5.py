@@ -433,14 +433,26 @@ class LLaVAModel_qwen3_5(BaseModel):
         patch_attention_h5_dir: Optional[str] = None,
         patch_attention_h5_dtype: str = 'float16',
         route_families: Optional[List[str]] = None,
+        routed_lora_family_rank: Optional[int] = None,
+        routed_lora_family_alpha: Optional[float] = None,
+        routed_lora_trainable: str = 'all',
+        freeze_patch_route_residual: bool = False,
     ):
         super().__init__()
         self.route_families = tuple(route_families or ROUTE_FAMILIES)
-        if self.route_families != ROUTE_FAMILIES:
+        if not self.route_families or len(set(self.route_families)) != len(self.route_families):
             raise ValueError(
-                f'route_families must use the fixed keys {ROUTE_FAMILIES!r}, '
+                'route_families must contain unique non-empty family names, '
                 f'got {self.route_families!r}.')
         self._route_family_context = None
+        self.routed_lora_family_rank = routed_lora_family_rank
+        self.routed_lora_family_alpha = routed_lora_family_alpha
+        self.routed_lora_trainable = str(routed_lora_trainable).lower()
+        if self.routed_lora_trainable not in ('all', 'family_only', 'shared_only'):
+            raise ValueError(
+                "routed_lora_trainable must be 'all', 'family_only', or "
+                f"'shared_only', got {routed_lora_trainable!r}.")
+        self.freeze_patch_route_residual = bool(freeze_patch_route_residual)
         self.freeze_llm = freeze_llm
         self.enable_regression = enable_regression
         self.enable_survival = enable_survival
@@ -506,6 +518,8 @@ class LLaVAModel_qwen3_5(BaseModel):
         self._setup_tokenizer_and_tokens(tokenizer)
         if self.enable_vision:
             self._init_prompt_resampler()
+            if self.freeze_patch_route_residual:
+                self.patch_resampler.family_query_residual.requires_grad_(False)
         if self.enable_wsi_injection:
             self._init_wsi_projector()
         if self.enable_regression or self.enable_survival:
@@ -520,6 +534,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         if pretrained_patch_resampler:
             self._load_pretrained_patch_resampler(pretrained_patch_resampler)
         self._apply_trainable_module_filter()
+        self._apply_routed_lora_trainable_filter()
 
     def _init_llm(self, llm, max_position_embeddings: Optional[int]) -> None:
         with LoadWoInit():
@@ -827,8 +842,18 @@ class LLaVAModel_qwen3_5(BaseModel):
             rank = int(getattr(lora_cfg, 'r', 0))
             alpha = float(getattr(lora_cfg, 'lora_alpha', rank))
             dropout = float(getattr(lora_cfg, 'lora_dropout', 0.0) or 0.0)
+            family_rank = (
+                rank if self.routed_lora_family_rank is None
+                else int(self.routed_lora_family_rank))
+            family_alpha = (
+                alpha if self.routed_lora_family_alpha is None
+                else float(self.routed_lora_family_alpha))
             if rank <= 0:
                 raise ValueError(f'LoRA config must define a positive r, got {rank}.')
+            if family_rank <= 0:
+                raise ValueError(
+                    'routed_lora_family_rank must be positive, '
+                    f'got {family_rank}.')
 
             # Freeze the complete Qwen base before inserting the additive
             # routed branches. This also keeps the base weights out of the
@@ -849,6 +874,8 @@ class LLaVAModel_qwen3_5(BaseModel):
                 alpha=alpha,
                 dropout=dropout,
                 route_families=self.route_families,
+                family_rank=family_rank,
+                family_alpha=family_alpha,
             )
             if replaced == 0:
                 raise RuntimeError(
@@ -858,7 +885,9 @@ class LLaVAModel_qwen3_5(BaseModel):
             if is_main_process():
                 print_log(
                     f'[RoutedLoRA] replaced {replaced} linear layers; '
-                    f'rank={rank}, alpha={alpha}, dropout={dropout}, '
+                    f'shared_rank={rank}, shared_alpha={alpha}, '
+                    f'family_rank={family_rank}, family_alpha={family_alpha}, '
+                    f'dropout={dropout}, '
                     f'families={self.route_families}',
                     'current')
         elif self.freeze_llm:
@@ -874,7 +903,8 @@ class LLaVAModel_qwen3_5(BaseModel):
             out.weight.requires_grad = False
         if use_activation_checkpointing:
             self.gradient_checkpointing_enable()
-        self._log_trainable_parameters()
+        if self.routed_lora_trainable == 'all':
+            self._log_trainable_parameters()
 
     def _apply_trainable_module_filter(self) -> None:
         if self.trainable_module_prefixes is None:
@@ -892,6 +922,30 @@ class LLaVAModel_qwen3_5(BaseModel):
                 f"[TrainableFilter] trainable_module_prefixes={list(prefixes)}",
                 'current',
             )
+        self._log_trainable_parameters()
+
+    def _apply_routed_lora_trainable_filter(self) -> None:
+        mode = self.routed_lora_trainable
+        if mode == 'all':
+            return
+        if not self.routed_lora_enabled:
+            raise ValueError(
+                f'routed_lora_trainable={mode!r} requires routed LoRA.')
+
+        marker = '.family_lora.' if mode == 'family_only' else '.shared_lora.'
+        trainable = 0
+        for name, param in self.named_parameters():
+            param.requires_grad_(marker in name)
+            if param.requires_grad:
+                trainable += param.numel()
+        if trainable == 0:
+            raise RuntimeError(
+                f'routed_lora_trainable={mode!r} selected no parameters.')
+        if is_main_process():
+            print_log(
+                f'[RoutedLoRA] trainable_mode={mode}; '
+                f'trainable_parameters={trainable:,}',
+                'current')
         self._log_trainable_parameters()
 
     def _setup_generation(self, generation_kwargs: Optional[Dict], stop_words: Optional[List[str]]) -> None:

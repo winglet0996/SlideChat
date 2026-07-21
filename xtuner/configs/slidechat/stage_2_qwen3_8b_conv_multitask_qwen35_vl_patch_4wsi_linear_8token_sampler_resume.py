@@ -32,23 +32,26 @@ setting = 'lora'
 route_families = (
     'morphology_clinicopathology',
     'molecular_biomarker',
-    'molecular_program',
+    'protein_program',
+    'transcriptomic_program',
+    'immune_microenvironment',
     'outcome',
 )
-vision_lr_mult = 1.0 if setting == 'alignment' else 0.05
-family_lora_lr_mult = None if setting != 'lora' else 0.5
+routed_lora_trainable = 'all'
+vision_lr_mult = 0.05
+family_lora_lr_mult = 1.0
 
 # Ablation knobs. Update these together for patch/WSI/position-encoding runs.
-ablation_version = 'v15'
+ablation_version = 'v16'
 patch_keep_tokens = 8
 wsi_feature_source = ('titan', 'prism', 'gigapath', 'chief')
 patch_position_encoding = 'linear'  # 'linear' or 'mrope'
 head_scaling = (0, 0, 0) # regression, survival, wsi_projector
 lora_shared_r = 64
 lora_shared_alpha = 64
-lora_family_r = 16
-lora_family_alpha = 16
-run_suffix = 'route'
+lora_family_r = 64
+lora_family_alpha = 64
+run_suffix = 'route6_joint_from_v14_align'
 
 if setting == 'alignment':
     llm_lora = None
@@ -63,13 +66,13 @@ if setting == 'lora':
         type=LoraConfig,
         r=lora_shared_r,
         lora_alpha=lora_shared_alpha,
-        lora_dropout=0.05,
+        lora_dropout=0.1,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
     # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v15_8token_4wsi_linear_hs_0_0_0_route/iter_19440.pth'
+    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v14_8token_4wsi_linear_hs_0_0_0_regsampler/iter_19440.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -281,14 +284,14 @@ sampler_default_unit = 'slide'
 sampler_mix_within_batch = True
 
 # Scheduler & Optimizer
-batch_size = 16
+batch_size = 11
 accumulative_counts = 1
 optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
-warmup_ratio = 0.1
+warmup_ratio = 0.05
 patch_modality_dropout_start = 0
 wsi_modality_dropout_start = 0.8
 modality_dropout_begin_ratio = 0.2
@@ -374,9 +377,9 @@ model = dict(
     route_families=list(route_families),
     routed_lora_family_rank=lora_family_r,
     routed_lora_family_alpha=lora_family_alpha,
-    # LoRA changes the prompt hidden space; keep routed visual queries adaptive
-    # at the much smaller vision LR instead of freezing their alignment state.
-    freeze_patch_route_residual=False,
+    routed_lora_trainable=routed_lora_trainable,
+    # The v14 checkpoint has no route residuals; keep their zero init fixed.
+    freeze_patch_route_residual=True,
     patch_modality_dropout=0.2,
     wsi_modality_dropout=0.2,
     modality_dropout_allow_text_only=False,
