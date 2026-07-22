@@ -911,7 +911,6 @@ class PromptConditionedPatchResampler(nn.Module):
         dropout: float = 0.0,
         use_local_conv: bool = True,
         query_init_std: float = 0.5,
-        route_families: Sequence[str] = ROUTE_FAMILIES,
     ):
         super().__init__()
         if resampler_dim % num_heads != 0:
@@ -925,9 +924,6 @@ class PromptConditionedPatchResampler(nn.Module):
         self.num_query = 8 if num_query is None else int(num_query)
         self.num_layers = int(num_layers)
         self.query_init_std = float(query_init_std)
-        self.route_families = tuple(route_families)
-        if not self.route_families:
-            raise ValueError('route_families must not be empty.')
         if self.num_query <= 0:
             raise ValueError(f"num_query must be positive, got {self.num_query}.")
         if self.num_layers <= 0:
@@ -956,10 +952,6 @@ class PromptConditionedPatchResampler(nn.Module):
         self.prompt_norm = nn.LayerNorm(self.resampler_dim)
         self.query_tokens = nn.Parameter(torch.empty(self.num_query, self.resampler_dim))
         self.query_id = nn.Parameter(torch.empty(self.num_query, self.resampler_dim))
-        self.family_query_residual = nn.ParameterDict({
-            family: nn.Parameter(torch.zeros(self.num_query, self.resampler_dim))
-            for family in self.route_families
-        })
         attn_kwargs = dict(embed_dim=self.resampler_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.prompt_attn = nn.MultiheadAttention(**attn_kwargs)
         self.decoder_blocks = nn.ModuleList([
@@ -1040,38 +1032,10 @@ class PromptConditionedPatchResampler(nn.Module):
             mask[empty, 0] = True
         return prompt_embeds, mask
 
-    def _normalize_route_family(self, route_family, batch_size: int, device: torch.device):
-        if route_family is None:
-            raise ValueError(
-                'Missing route_family. PromptConditionedPatchResampler requires '
-                'one route id per image.')
-        if torch.is_tensor(route_family):
-            route_ids = route_family.to(device=device, dtype=torch.long).view(-1)
-        else:
-            route_ids = torch.as_tensor(route_family, device=device, dtype=torch.long).view(-1)
-        if route_ids.numel() != batch_size:
-            raise ValueError(
-                f'route_family must be per-image with shape [{batch_size}], '
-                f'got {tuple(route_ids.shape)}.')
-        if bool(((route_ids < 0) | (route_ids >= len(self.route_families))).any().item()):
-            raise ValueError(f'Invalid route_family ids: {route_ids.tolist()}')
-        return route_ids
-
-    def _condition_queries(self, prompt_tokens, prompt_mask, route_family=None):
-        batch_size = prompt_tokens.size(0)
-        route_ids = self._normalize_route_family(
-            route_family, batch_size, prompt_tokens.device)
+    def _condition_queries(self, prompt_tokens, prompt_mask):
         shared_queries = (self.query_tokens + self.query_id).unsqueeze(0).expand(
-            batch_size, -1, -1)
-        residual = torch.zeros_like(shared_queries)
-        for family_id, family in enumerate(self.route_families):
-            idx = (route_ids == family_id).nonzero(as_tuple=True)[0]
-            if idx.numel() == 0:
-                continue
-            family_residual = self.family_query_residual[family].unsqueeze(0).expand(
-                idx.numel(), -1, -1)
-            residual = residual.index_add(0, idx, family_residual)
-        queries = shared_queries + residual
+            prompt_tokens.size(0), -1, -1)
+        queries = shared_queries
         conditioned, _ = self.prompt_attn(
             query=queries,
             key=prompt_tokens,
@@ -1106,7 +1070,6 @@ class PromptConditionedPatchResampler(nn.Module):
         prompt_embeds: torch.Tensor,
         prompt_attention_mask: Optional[torch.Tensor] = None,
         feature_shapes: Optional[torch.Tensor] = None,
-        route_family: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if features.ndim != 4:
             raise ValueError(f"Expected features with shape (B, C, H, W), got {tuple(features.shape)}.")
@@ -1146,8 +1109,7 @@ class PromptConditionedPatchResampler(nn.Module):
         prompt_tokens = prompt_tokens.to(dtype=prompt_dtype)
 
         patch_key_padding = ~valid_mask.flatten(1)
-        visual_tokens = self._condition_queries(
-            prompt_tokens, prompt_attention_mask, route_family=route_family)
+        visual_tokens = self._condition_queries(prompt_tokens, prompt_attention_mask)
         patch_attn_heads = None
         for layer_idx, block in enumerate(self.decoder_blocks):
             visual_tokens, attn_heads = block(

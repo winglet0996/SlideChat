@@ -378,8 +378,6 @@ model = dict(
     routed_lora_family_rank=lora_family_r,
     routed_lora_family_alpha=lora_family_alpha,
     routed_lora_trainable=routed_lora_trainable,
-    # The v14 checkpoint has no route residuals; keep their zero init fixed.
-    freeze_patch_route_residual=True,
     patch_modality_dropout=0.2,
     wsi_modality_dropout=0.2,
     modality_dropout_allow_text_only=False,

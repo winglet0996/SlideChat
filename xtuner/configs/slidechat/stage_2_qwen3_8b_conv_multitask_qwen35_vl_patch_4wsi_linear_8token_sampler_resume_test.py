@@ -32,23 +32,26 @@ setting = 'lora'
 route_families = (
     'morphology_clinicopathology',
     'molecular_biomarker',
-    'molecular_program',
+    'protein_program',
+    'transcriptomic_program',
+    'immune_microenvironment',
     'outcome',
 )
-vision_lr_mult = 1.0 if setting == 'alignment' else 0.05
-family_lora_lr_mult = None if setting != 'lora' else 0.5
+routed_lora_trainable = 'all'
+vision_lr_mult = 0.05
+family_lora_lr_mult = 1.0
 
 # Ablation knobs. Update these together for patch/WSI/position-encoding runs.
-ablation_version = 'v15'
+ablation_version = 'v16'
 patch_keep_tokens = 8
 wsi_feature_source = ('titan', 'prism', 'gigapath', 'chief')
 patch_position_encoding = 'linear'  # 'linear' or 'mrope'
 head_scaling = (0, 0, 0) # regression, survival, wsi_projector
 lora_shared_r = 64
 lora_shared_alpha = 64
-lora_family_r = 16
-lora_family_alpha = 16
-run_suffix = 'route'
+lora_family_r = 64
+lora_family_alpha = 64
+run_suffix = 'route6_joint_from_v14_align'
 
 if setting == 'alignment':
     llm_lora = None
@@ -63,13 +66,13 @@ if setting == 'lora':
         type=LoraConfig,
         r=lora_shared_r,
         lora_alpha=lora_shared_alpha,
-        lora_dropout=0.05,
+        lora_dropout=0.1,
         bias='none',
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    # ckpt_path = None
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v15_8token_4wsi_linear_hs_0_0_0_route/iter_19440.pth'
+    ckpt_path = None
+    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v14_8token_4wsi_linear_hs_0_0_0_regsampler/iter_19440.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -98,7 +101,7 @@ dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
 
 train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/routed/train.json'
 val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/routed/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/routed/test.json'
+test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/cptac_test/routed/test.json'
 
 # train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
 # val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
@@ -147,8 +150,8 @@ if run_suffix:
 # work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
 # vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
 work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
-vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
-# vis_name = None
+# vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
+vis_name = None
 
 
 # set visualizer
@@ -166,7 +169,7 @@ visualizer = None if vis_name is None else dict(
 )
 
 val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_results'
+test_output_path = work_dir + 'test_results_cptac_iter20000'
 
 # Save
 by_epoch = False
@@ -281,14 +284,14 @@ sampler_default_unit = 'slide'
 sampler_mix_within_batch = True
 
 # Scheduler & Optimizer
-batch_size = 16
+batch_size = 11
 accumulative_counts = 1
 optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
-warmup_ratio = 0.1
+warmup_ratio = 0.05
 patch_modality_dropout_start = 0
 wsi_modality_dropout_start = 0.8
 modality_dropout_begin_ratio = 0.2
@@ -374,6 +377,7 @@ model = dict(
     route_families=list(route_families),
     routed_lora_family_rank=lora_family_r,
     routed_lora_family_alpha=lora_family_alpha,
+    routed_lora_trainable=routed_lora_trainable,
     patch_modality_dropout=0.2,
     wsi_modality_dropout=0.2,
     modality_dropout_allow_text_only=False,

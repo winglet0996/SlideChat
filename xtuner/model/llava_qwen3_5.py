@@ -436,7 +436,6 @@ class LLaVAModel_qwen3_5(BaseModel):
         routed_lora_family_rank: Optional[int] = None,
         routed_lora_family_alpha: Optional[float] = None,
         routed_lora_trainable: str = 'all',
-        freeze_patch_route_residual: bool = False,
     ):
         super().__init__()
         self.route_families = tuple(route_families or ROUTE_FAMILIES)
@@ -452,7 +451,6 @@ class LLaVAModel_qwen3_5(BaseModel):
             raise ValueError(
                 "routed_lora_trainable must be 'all', 'family_only', or "
                 f"'shared_only', got {routed_lora_trainable!r}.")
-        self.freeze_patch_route_residual = bool(freeze_patch_route_residual)
         self.freeze_llm = freeze_llm
         self.enable_regression = enable_regression
         self.enable_survival = enable_survival
@@ -518,8 +516,6 @@ class LLaVAModel_qwen3_5(BaseModel):
         self._setup_tokenizer_and_tokens(tokenizer)
         if self.enable_vision:
             self._init_prompt_resampler()
-            if self.freeze_patch_route_residual:
-                self.patch_resampler.family_query_residual.requires_grad_(False)
         if self.enable_wsi_injection:
             self._init_wsi_projector()
         if self.enable_regression or self.enable_survival:
@@ -705,7 +701,6 @@ class LLaVAModel_qwen3_5(BaseModel):
         )
         cfg.update(self.prompt_resampler_cfg or {})
         cfg['llm_hidden_size'] = self._get_llm_hidden_size()
-        cfg['route_families'] = self.route_families
         self.patch_resampler = PromptConditionedPatchResampler(**cfg)
         self.patch_resampler.set_output_rms(self._estimate_embedding_rms())
         print_log(f"[PromptResampler] cfg={cfg}", 'current')
@@ -1243,13 +1238,11 @@ class LLaVAModel_qwen3_5(BaseModel):
             raise ValueError(
                 'image_batch_indices must contain one sample index per image: '
                 f'{image_batch_indices.numel()} vs {features.size(0)}.')
-        image_route_family = route_family.index_select(0, image_batch_indices)
         out = self.patch_resampler(
             features=features,
             prompt_embeds=prompt_embeds,
             prompt_attention_mask=prompt_mask,
             feature_shapes=feature_shapes,
-            route_family=image_route_family,
         )
         self._last_patch_attention = out['patch_attention'].detach()
         self._last_patch_valid_mask = out['patch_valid_mask'].detach()
@@ -2572,6 +2565,11 @@ class LLaVAModel_qwen3_5(BaseModel):
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = False):
         state_dict = OrderedDict(state_dict)
+        obsolete_prefix = 'patch_resampler.family_query_residual.'
+        state_dict = OrderedDict(
+            (key, value) for key, value in state_dict.items()
+            if not key.startswith(obsolete_prefix)
+        )
         special_rows = OrderedDict(
             (k, state_dict.pop(k))
             for k in list(state_dict.keys())
@@ -2637,7 +2635,6 @@ class LLaVAModel_qwen3_5(BaseModel):
                     if not (
                         '.shared_lora.' in key
                         or '.family_lora.' in key
-                        or key.startswith('patch_resampler.family_query_residual.')
                     )
                 ]
             if missing_checkpoint_keys or unexpected_keys:
