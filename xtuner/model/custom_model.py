@@ -5,7 +5,7 @@ import math
 from timm.layers import trunc_normal_
 from transformers import InstructBlipQFormerConfig
 from transformers.models.instructblip.modeling_instructblip import InstructBlipQFormerEncoder
-from typing import Optional, Tuple, Iterable, Literal, Dict, Sequence
+from typing import Optional, Tuple, Iterable, Literal, Dict, Mapping, Sequence, Union
 
 
 ROUTE_FAMILIES = (
@@ -16,6 +16,94 @@ ROUTE_FAMILIES = (
     'immune_microenvironment',
     'outcome',
 )
+
+
+def zero_grad_anchor(value: torch.Tensor) -> torch.Tensor:
+    """Return an exact scalar zero whose backward still traverses ``value``.
+
+    Summing an empty view avoids reading the tensor values, so non-finite values
+    cannot leak into the loss. The empty slice's backward materializes a zero
+    gradient for the full tensor and therefore keeps upstream gradient hooks
+    consistent across data-parallel ranks.
+    """
+    return value.reshape(-1)[:0].sum()
+
+
+def normalize_routed_lora_family_config(
+    route_families: Sequence[str],
+    family_rank: Optional[Union[int, Mapping[str, int]]],
+    family_alpha: Optional[Union[float, Mapping[str, float]]],
+    default_rank: int,
+    default_alpha: float,
+) -> Tuple[Dict[str, int], Dict[str, float]]:
+    """Expand scalar or per-family routed-LoRA rank/alpha settings."""
+    route_families = tuple(route_families)
+    expected = set(route_families)
+
+    def _expand(value, default, cast, name):
+        value = default if value is None else value
+        if isinstance(value, Mapping):
+            provided = set(value)
+            if provided != expected:
+                missing = sorted(expected - provided)
+                unexpected = sorted(provided - expected)
+                raise ValueError(
+                    f'{name} mapping keys must exactly match route_families; '
+                    f'missing={missing!r}, unexpected={unexpected!r}.')
+            resolved = {family: cast(value[family]) for family in route_families}
+        else:
+            resolved = {family: cast(value) for family in route_families}
+        invalid = {family: value for family, value in resolved.items() if value <= 0}
+        if invalid:
+            raise ValueError(f'{name} values must be positive, got {invalid!r}.')
+        return resolved
+
+    ranks = _expand(family_rank, default_rank, int, 'family_rank')
+    alphas = _expand(family_alpha, default_alpha, float, 'family_alpha')
+    return ranks, alphas
+
+
+class _RoutedLoRARouteCache:
+    """Share immutable route indices across all routed LoRA layers."""
+
+    def __init__(self, route_family: torch.Tensor, num_families: int):
+        self.route_family = route_family
+        self.num_families = int(num_families)
+        self._routes: Dict[Tuple[torch.device, int], torch.Tensor] = {}
+        self._indices: Dict[
+            Tuple[torch.device, int], Tuple[torch.Tensor, ...]
+        ] = {}
+
+    def route_for_input(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim < 2:
+            raise ValueError(
+                f'Routed LoRA expects at least 2D input, got {tuple(x.shape)}.')
+        key = (x.device, int(x.size(0)))
+        if key not in self._routes:
+            route = self.route_family.to(
+                device=x.device, dtype=torch.long).view(-1)
+            if x.size(0) == route.numel():
+                expanded_route = route
+            elif route.numel() > 0 and x.size(0) % route.numel() == 0:
+                expanded_route = route.repeat_interleave(
+                    x.size(0) // route.numel())
+            else:
+                raise ValueError(
+                    f'Cannot align per-sample route shape {tuple(route.shape)} '
+                    f'with linear input shape {tuple(x.shape)}.')
+            self._routes[key] = expanded_route
+        return self._routes[key]
+
+    def indices_for_input(
+            self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        key = (x.device, int(x.size(0)))
+        if key not in self._indices:
+            route = self.route_for_input(x)
+            self._indices[key] = tuple(
+                (route == family_id).nonzero(as_tuple=True)[0]
+                for family_id in range(self.num_families)
+            )
+        return self._indices[key]
 
 
 class RoutedLoRAAdapter(nn.Module):
@@ -52,27 +140,32 @@ class RoutedLoRALinear(nn.Module):
 
     def __init__(self, base_linear: nn.Linear, rank: int, alpha: float,
                  dropout: float, route_families: Sequence[str] = ROUTE_FAMILIES,
-                 family_rank: Optional[int] = None,
-                 family_alpha: Optional[float] = None):
+                 family_rank: Optional[Union[int, Mapping[str, int]]] = None,
+                 family_alpha: Optional[Union[float, Mapping[str, float]]] = None):
         super().__init__()
         if not isinstance(base_linear, nn.Linear):
             raise TypeError(f'Expected nn.Linear, got {type(base_linear)!r}.')
         self.base_linear = base_linear
         self.base_linear.requires_grad_(False)
-        family_rank = rank if family_rank is None else int(family_rank)
-        family_alpha = alpha if family_alpha is None else float(family_alpha)
+        family_ranks, family_alphas = normalize_routed_lora_family_config(
+            route_families, family_rank, family_alpha, rank, alpha)
         self.shared_lora = RoutedLoRAAdapter(
             base_linear.in_features, base_linear.out_features, rank, alpha, dropout)
         self.family_lora = nn.ModuleDict({
             family: RoutedLoRAAdapter(
                 base_linear.in_features, base_linear.out_features,
-                family_rank, family_alpha, dropout)
+                family_ranks[family], family_alphas[family], dropout)
             for family in route_families
         })
+        self.family_ranks = family_ranks
+        self.family_alphas = family_alphas
         self.route_families = tuple(route_families)
         self._route_family = None
 
-    def set_route_family(self, route_family: Optional[torch.Tensor]) -> None:
+    def set_route_family(
+            self,
+            route_family: Optional[
+                Union[torch.Tensor, _RoutedLoRARouteCache]]) -> None:
         self._route_family = route_family
 
     def _route_for_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -81,6 +174,8 @@ class RoutedLoRALinear(nn.Module):
             raise RuntimeError(
                 'RoutedLoRALinear received no route_family. '
                 'Every routed forward must provide a per-sample route.')
+        if isinstance(route, _RoutedLoRARouteCache):
+            return route.route_for_input(x)
         route = route.to(device=x.device, dtype=torch.long).view(-1)
         if x.ndim < 2:
             raise ValueError(f'Routed LoRA expects at least 2D input, got {tuple(x.shape)}.')
@@ -95,12 +190,22 @@ class RoutedLoRALinear(nn.Module):
             f'Cannot align per-sample route shape {tuple(route.shape)} with '
             f'linear input shape {tuple(x.shape)}.')
 
+    def _route_indices_for_input(
+            self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        route = self._route_family
+        if isinstance(route, _RoutedLoRARouteCache):
+            return route.indices_for_input(x)
+        route = self._route_for_input(x)
+        return tuple(
+            (route == family_id).nonzero(as_tuple=True)[0]
+            for family_id in range(len(self.route_families))
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base_linear(x) + self.shared_lora(x)
-        route = self._route_for_input(x)
         residual = torch.zeros_like(out)
-        for family_id, family in enumerate(self.route_families):
-            idx = (route == family_id).nonzero(as_tuple=True)[0]
+        route_indices = self._route_indices_for_input(x)
+        for family, idx in zip(self.route_families, route_indices):
             if idx.numel() == 0:
                 continue
             family_out = self.family_lora[family](x.index_select(0, idx))
@@ -115,8 +220,8 @@ def replace_linear_with_routed_lora(
     alpha: float,
     dropout: float,
     route_families: Sequence[str] = ROUTE_FAMILIES,
-    family_rank: Optional[int] = None,
-    family_alpha: Optional[float] = None,
+    family_rank: Optional[Union[int, Mapping[str, int]]] = None,
+    family_alpha: Optional[Union[float, Mapping[str, float]]] = None,
 ) -> int:
     """Replace matching leaf linear modules in-place and return the count."""
     target_modules = set(str(name) for name in target_modules)

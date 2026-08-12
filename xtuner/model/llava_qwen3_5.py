@@ -33,12 +33,15 @@ from .custom_model import (
     PromptConditionedPatchResampler,
     ROUTE_FAMILIES,
     RoutedLoRALinear,
+    _RoutedLoRARouteCache,
     RegressionHead,
     SurvivalHead,
     WSIProjector,
     cox_ph_loss,
     logistic_hazard_loss,
+    normalize_routed_lora_family_config,
     replace_linear_with_routed_lora,
+    zero_grad_anchor,
 )
 from .modules import dispatch_modules
 from .modules.dispatch import SUPPORT_FLASH1, SUPPORT_FLASH2
@@ -433,9 +436,10 @@ class LLaVAModel_qwen3_5(BaseModel):
         patch_attention_h5_dir: Optional[str] = None,
         patch_attention_h5_dtype: str = 'float16',
         route_families: Optional[List[str]] = None,
-        routed_lora_family_rank: Optional[int] = None,
-        routed_lora_family_alpha: Optional[float] = None,
+        routed_lora_family_rank: Optional[Union[int, Dict[str, int]]] = None,
+        routed_lora_family_alpha: Optional[Union[float, Dict[str, float]]] = None,
         routed_lora_trainable: str = 'all',
+        routed_lora_route_cache: bool = True,
     ):
         super().__init__()
         self.route_families = tuple(route_families or ROUTE_FAMILIES)
@@ -447,6 +451,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.routed_lora_family_rank = routed_lora_family_rank
         self.routed_lora_family_alpha = routed_lora_family_alpha
         self.routed_lora_trainable = str(routed_lora_trainable).lower()
+        self.routed_lora_route_cache = bool(routed_lora_route_cache)
         if self.routed_lora_trainable not in ('all', 'family_only', 'shared_only'):
             raise ValueError(
                 "routed_lora_trainable must be 'all', 'family_only', or "
@@ -837,18 +842,15 @@ class LLaVAModel_qwen3_5(BaseModel):
             rank = int(getattr(lora_cfg, 'r', 0))
             alpha = float(getattr(lora_cfg, 'lora_alpha', rank))
             dropout = float(getattr(lora_cfg, 'lora_dropout', 0.0) or 0.0)
-            family_rank = (
-                rank if self.routed_lora_family_rank is None
-                else int(self.routed_lora_family_rank))
-            family_alpha = (
-                alpha if self.routed_lora_family_alpha is None
-                else float(self.routed_lora_family_alpha))
+            family_ranks, family_alphas = normalize_routed_lora_family_config(
+                self.route_families,
+                self.routed_lora_family_rank,
+                self.routed_lora_family_alpha,
+                rank,
+                alpha,
+            )
             if rank <= 0:
                 raise ValueError(f'LoRA config must define a positive r, got {rank}.')
-            if family_rank <= 0:
-                raise ValueError(
-                    'routed_lora_family_rank must be positive, '
-                    f'got {family_rank}.')
 
             # Freeze the complete Qwen base before inserting the additive
             # routed branches. This also keeps the base weights out of the
@@ -869,8 +871,8 @@ class LLaVAModel_qwen3_5(BaseModel):
                 alpha=alpha,
                 dropout=dropout,
                 route_families=self.route_families,
-                family_rank=family_rank,
-                family_alpha=family_alpha,
+                family_rank=family_ranks,
+                family_alpha=family_alphas,
             )
             if replaced == 0:
                 raise RuntimeError(
@@ -881,7 +883,7 @@ class LLaVAModel_qwen3_5(BaseModel):
                 print_log(
                     f'[RoutedLoRA] replaced {replaced} linear layers; '
                     f'shared_rank={rank}, shared_alpha={alpha}, '
-                    f'family_rank={family_rank}, family_alpha={family_alpha}, '
+                    f'family_ranks={family_ranks}, family_alphas={family_alphas}, '
                     f'dropout={dropout}, '
                     f'families={self.route_families}',
                     'current')
@@ -1146,11 +1148,15 @@ class LLaVAModel_qwen3_5(BaseModel):
         if not self.routed_lora_enabled:
             yield
             return
+        route_context = route_family
+        if self.routed_lora_route_cache and route_family is not None:
+            route_context = _RoutedLoRARouteCache(
+                route_family, len(self.route_families))
         previous = []
         for module in self.llm.modules():
             if isinstance(module, RoutedLoRALinear):
                 previous.append((module, module._route_family))
-                module.set_route_family(route_family)
+                module.set_route_family(route_context)
         if not previous:
             raise RuntimeError('routed_lora_enabled=True but no routed linear modules exist.')
         try:
@@ -1746,8 +1752,13 @@ class LLaVAModel_qwen3_5(BaseModel):
         )
 
         attention_save_payload = None
+        # Keep projector hooks identical across ranks even when one rank drops
+        # every sample of a modality. The anchor is exactly zero in the loss.
+        modality_grad_anchor = None
         if has_visual:
             projected = self._project_vision_features(data, data['route_family_ids'])
+            if mode == 'loss':
+                modality_grad_anchor = zero_grad_anchor(projected['pixel_values'])
             if mode == 'predict':
                 self._save_attention_heatmaps(data, projected)
                 attention_save_payload = self._build_patch_attention_payload(data, projected)
@@ -1768,6 +1779,12 @@ class LLaVAModel_qwen3_5(BaseModel):
         wsi_embeddings = None
         if self.enable_wsi_injection and data.get('wsi_features') is not None:
             wsi_embeddings = self._project_wsi_features(data.pop('wsi_features'))
+            if mode == 'loss' and wsi_embeddings is not None:
+                wsi_anchor = zero_grad_anchor(wsi_embeddings)
+                modality_grad_anchor = (
+                    wsi_anchor if modality_grad_anchor is None
+                    else modality_grad_anchor + wsi_anchor
+                )
         else:
             data.pop('wsi_features', None)
         data['wsi_embeddings'] = wsi_embeddings
@@ -1789,6 +1806,8 @@ class LLaVAModel_qwen3_5(BaseModel):
             composer=self.input_composer,
             **data,
         )
+        if modality_grad_anchor is not None:
+            data['_modality_grad_anchor'] = modality_grad_anchor
         if attention_save_payload is not None:
             data['_patch_attention_save_payload'] = attention_save_payload
         if mode == 'loss':
@@ -1883,6 +1902,9 @@ class LLaVAModel_qwen3_5(BaseModel):
         self._maybe_raise_if_nonfinite('reg_loss', reg_loss)
         self._maybe_raise_if_nonfinite('srv_loss', srv_loss)
         loss = self.lambda_llm * lm_loss + self.lambda_reg * reg_loss + self.lambda_srv * srv_loss
+        modality_grad_anchor = data.get('_modality_grad_anchor')
+        if modality_grad_anchor is not None:
+            loss = loss + modality_grad_anchor.to(device=loss.device, dtype=loss.dtype)
         return {
             'lm_loss': lm_loss.detach(),
             'reg_loss': reg_loss.detach(),

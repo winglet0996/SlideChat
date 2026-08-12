@@ -32,7 +32,9 @@ setting = 'lora'
 route_families = (
     'morphology_clinicopathology',
     'molecular_biomarker',
-    'molecular_program',
+    'protein_program',
+    'transcriptomic_program',
+    'immune_microenvironment',
     'outcome',
 )
 vision_lr_mult = 0.1

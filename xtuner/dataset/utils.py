@@ -343,6 +343,7 @@ class CenterFixedSizeCrop:
     """
     Performs a center crop with a fixed output size.
     If the image is smaller than the crop size, it is padded first.
+    If the center crop contains no features, returns the full grid instead.
     """
     def __init__(self, crop_size):
         if isinstance(crop_size, int):
@@ -357,6 +358,7 @@ class CenterFixedSizeCrop:
         Returns:
             torch.Tensor: Cropped feature grid.
         """
+        full_grid = sample
         grid = sample
         
         _, h, w = grid.shape
@@ -376,7 +378,10 @@ class CenterFixedSizeCrop:
         i = (h - th) // 2
         j = (w - tw) // 2
         
-        return grid[:, i:i+th, j:j+tw]
+        cropped_grid = grid[:, i:i+th, j:j+tw]
+        if torch.count_nonzero(cropped_grid).item() == 0:
+            return full_grid
+        return cropped_grid
 
 
 class RandomVariableCrop:
