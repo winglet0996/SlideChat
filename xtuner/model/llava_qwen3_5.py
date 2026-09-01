@@ -383,6 +383,15 @@ def prepare_inputs_labels_for_qwen3_5(
 class LLaVAModel_qwen3_5(BaseModel):
     """Qwen3.5 multimodal model with prompt-conditioned patch resampling."""
 
+    # ``state_dict`` below is intentionally a *task-delta* checkpoint for
+    # alignment and routed-LoRA runs.  In particular, it does not contain the
+    # frozen Qwen backbone.  Keep an explicit, tensor-only marker in the
+    # state-dict so a truncated new-format LoRA checkpoint cannot be mistaken
+    # for an old alignment checkpoint during a warm-start.
+    _CHECKPOINT_FORMAT_VERSION = 1
+    _CHECKPOINT_FORMAT_KEY = '_slidechat_checkpoint.format_version'
+    _CHECKPOINT_ROUTED_LORA_KEY = '_slidechat_checkpoint.has_routed_lora'
+
     SUPPORT_CONFIGS = {
         'SDPA': ('LlamaConfig', 'GemmaConfig', 'MistralConfig', 'MixtralConfig',
                  'Qwen2Config', 'Qwen2MoeConfig', 'Starcoder2Config', 'Phi3Config',
@@ -2509,6 +2518,96 @@ class LLaVAModel_qwen3_5(BaseModel):
                 if 0 <= token_id < out.weight.size(0):
                     keep[f'special_token_embeddings.output.{name}'] = out.weight[token_id].detach().clone()
 
+    def _expected_special_token_row_keys(self) -> set:
+        """Return the special-token rows a sparse checkpoint must carry."""
+        expected = set()
+        if not self._special_token_row_items():
+            return expected
+
+        emb = self.llm.get_input_embeddings()
+        if emb is not None and hasattr(emb, 'weight'):
+            expected.update(
+                f'special_token_embeddings.input.{name}'
+                for name, _ in self._special_token_row_items())
+
+        out = self.llm.get_output_embeddings()
+        if out is not None and out is not emb and hasattr(out, 'weight'):
+            expected.update(
+                f'special_token_embeddings.output.{name}'
+                for name, _ in self._special_token_row_items())
+        return expected
+
+    def _checkpoint_marker_tensor(
+            self, state_dict: OrderedDict, value: int) -> torch.Tensor:
+        """Create checkpoint metadata on the same device as model weights."""
+        reference = next(
+            (value for value in state_dict.values()
+             if isinstance(value, torch.Tensor)), None)
+        device = reference.device if reference is not None else None
+        return torch.tensor(value, dtype=torch.int64, device=device)
+
+    @staticmethod
+    def _checkpoint_marker_value(value: Any, key: str) -> int:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise RuntimeError(
+                    f'Invalid {key}: expected a scalar tensor, got '
+                    f'shape={tuple(value.shape)}.')
+            return int(value.detach().cpu().item())
+        try:
+            return int(value)
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(
+                f'Invalid {key}: expected an integer marker.') from e
+
+    def _uses_sparse_checkpoint(self) -> bool:
+        """Whether this model deliberately omits frozen base-LLM weights."""
+        return bool(self.freeze_llm or self.routed_lora_enabled
+                    or self.use_llm_lora)
+
+    @staticmethod
+    def _is_routed_lora_key(key: str) -> bool:
+        return (key.startswith('routed_lora.')
+                or '.shared_lora.' in key
+                or '.family_lora.' in key)
+
+    def _required_checkpoint_model_keys(self, full_model_keys: set) -> set:
+        """Keys that make a task delta usable, independent of ``requires_grad``."""
+        task_prefixes = (
+            'patch_resampler.',
+            'wsi_projector.',
+            'regression_head.',
+            'survival_head.',
+            'special_lm_head.',
+        )
+        required = {
+            key for key in full_model_keys
+            if (key.startswith(task_prefixes)
+                or key in ('vision_token_gate', 'wsi_token_gate'))
+        }
+        if self.routed_lora_enabled:
+            required.update(
+                key for key in full_model_keys
+                if '.shared_lora.' in key or '.family_lora.' in key)
+        elif self.use_llm_lora:
+            # Preserve the same contract for a non-routed PEFT model should
+            # one be used in the future.
+            required.update(
+                key for key in full_model_keys
+                if '.lora_A.' in key or '.lora_B.' in key)
+        return required
+
+    @staticmethod
+    def _contains_full_llm_weights(state_dict: Dict[str, torch.Tensor]) -> bool:
+        """Distinguish base-model weights from routed/PEFT adapter weights."""
+        return any(
+            key.startswith('llm.')
+            and '.shared_lora.' not in key
+            and '.family_lora.' not in key
+            and '.lora_A.' not in key
+            and '.lora_B.' not in key
+            for key in state_dict)
+
     def _load_special_token_rows(self, rows: Dict[str, torch.Tensor]) -> None:
         if not rows:
             return
@@ -2583,10 +2682,42 @@ class LLaVAModel_qwen3_5(BaseModel):
         gate_keys = ('vision_token_gate', 'wsi_token_gate')
         keep.update({k: v for k, v in state_dict.items() if k in gate_keys})
         self._add_special_token_rows_to_state_dict(keep)
+        # Metadata is intentionally part of the module state (rather than a
+        # sidecar) so it survives both DeepSpeed and plain torch checkpoints.
+        # ``load_state_dict`` pops it before delegating to PyTorch.
+        keep[self._CHECKPOINT_FORMAT_KEY] = self._checkpoint_marker_tensor(
+            keep, self._CHECKPOINT_FORMAT_VERSION)
+        keep[self._CHECKPOINT_ROUTED_LORA_KEY] = (
+            self._checkpoint_marker_tensor(keep, int(self.routed_lora_enabled)))
         return keep
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = False):
         state_dict = OrderedDict(state_dict)
+        format_marker = state_dict.pop(self._CHECKPOINT_FORMAT_KEY, None)
+        routed_marker = state_dict.pop(self._CHECKPOINT_ROUTED_LORA_KEY, None)
+        format_version = None
+        source_has_routed_lora = any(
+            self._is_routed_lora_key(key) for key in state_dict)
+        if format_marker is not None or routed_marker is not None:
+            if format_marker is None or routed_marker is None:
+                raise RuntimeError(
+                    'Incomplete SlideChat checkpoint metadata; both '
+                    f'{self._CHECKPOINT_FORMAT_KEY!r} and '
+                    f'{self._CHECKPOINT_ROUTED_LORA_KEY!r} are required.')
+            format_version = self._checkpoint_marker_value(
+                format_marker, self._CHECKPOINT_FORMAT_KEY)
+            if format_version != self._CHECKPOINT_FORMAT_VERSION:
+                raise RuntimeError(
+                    'Unsupported SlideChat checkpoint format version '
+                    f'{format_version}; expected '
+                    f'{self._CHECKPOINT_FORMAT_VERSION}.')
+            marked_has_routed_lora = bool(self._checkpoint_marker_value(
+                routed_marker, self._CHECKPOINT_ROUTED_LORA_KEY))
+            if marked_has_routed_lora != source_has_routed_lora:
+                raise RuntimeError(
+                    'Checkpoint metadata and routed-LoRA weights disagree; '
+                    'the checkpoint is incomplete or corrupted.')
+            source_has_routed_lora = marked_has_routed_lora
         obsolete_prefix = 'patch_resampler.family_query_residual.'
         state_dict = OrderedDict(
             (key, value) for key, value in state_dict.items()
@@ -2631,27 +2762,25 @@ class LLaVAModel_qwen3_5(BaseModel):
                     mapped_count += 1
             new_state_dict[new_key] = value
 
-        if not strict:
+        # Sparse alignment/LoRA checkpoints intentionally omit frozen Qwen
+        # keys.  DeepSpeed restores those from ``frozen_param_fragments`` only
+        # *after* this call returns, so passing strict=True to PyTorch here
+        # aborts a valid resume before the fragments are applied.  Validate the
+        # explicit task-delta contract ourselves instead.
+        validate_delta_contract = not strict or self._uses_sparse_checkpoint()
+        if validate_delta_contract:
             full_model_keys = set(super().state_dict().keys())
             unexpected_keys = sorted(set(new_state_dict) - full_model_keys)
 
-            checkpoint_keys = {
-                key for key in full_model_keys
-                if (
-                    '.shared_lora.' in key
-                    or '.family_lora.' in key
-                    or key.startswith('patch_resampler.')
-                    or key.startswith('wsi_projector.')
-                    or key.startswith('regression_head.')
-                    or key.startswith('survival_head.')
-                    or key.startswith('special_lm_head.')
-                    or key in ('vision_token_gate', 'wsi_token_gate')
-                )
-            }
-            missing_checkpoint_keys = sorted(checkpoint_keys - set(new_state_dict))
-            is_legacy_checkpoint = not any(
-                key.startswith('routed_lora.') for key in state_dict)
-            if is_legacy_checkpoint:
+            required_keys = self._required_checkpoint_model_keys(full_model_keys)
+            missing_checkpoint_keys = sorted(required_keys - set(new_state_dict))
+            # An alignment checkpoint is a valid warm-start for a routed-LoRA
+            # run: its new adapters start from their prescribed zero init.  A
+            # new-format routed checkpoint, on the other hand, must contain
+            # every shared and family branch even in ``family_only`` mode.
+            is_alignment_warm_start = (
+                self.routed_lora_enabled and not source_has_routed_lora)
+            if is_alignment_warm_start:
                 missing_checkpoint_keys = [
                     key for key in missing_checkpoint_keys
                     if not (
@@ -2659,11 +2788,22 @@ class LLaVAModel_qwen3_5(BaseModel):
                         or '.family_lora.' in key
                     )
                 ]
-            if missing_checkpoint_keys or unexpected_keys:
+            expected_special_rows = self._expected_special_token_row_keys()
+            missing_special_rows = []
+            if not self._contains_full_llm_weights(new_state_dict):
+                missing_special_rows = sorted(
+                    expected_special_rows - set(special_rows))
+            if (missing_checkpoint_keys or missing_special_rows
+                    or unexpected_keys):
                 details = []
                 if missing_checkpoint_keys:
                     details.append(
-                        f'missing non-routed keys: {missing_checkpoint_keys[:20]!r}')
+                        f'missing required keys: '
+                        f'{missing_checkpoint_keys[:20]!r}')
+                if missing_special_rows:
+                    details.append(
+                        f'missing special-token rows: '
+                        f'{missing_special_rows[:20]!r}')
                 if unexpected_keys:
                     details.append(
                         f'unexpected keys: {unexpected_keys[:20]!r}')
@@ -2671,7 +2811,10 @@ class LLaVAModel_qwen3_5(BaseModel):
                     'Checkpoint is incompatible with the current model; '
                     + '; '.join(details))
 
-        incompatible = super().load_state_dict(new_state_dict, strict=strict)
+        # See the sparse-checkpoint note above.  Full-parameter checkpoints
+        # retain PyTorch's regular strict behavior.
+        load_strict = strict and not self._uses_sparse_checkpoint()
+        incompatible = super().load_state_dict(new_state_dict, strict=load_strict)
         self._load_special_token_rows(special_rows)
         if is_main_process():
             mode = 'LoRA' if is_lora_model else 'Full/Alignment'

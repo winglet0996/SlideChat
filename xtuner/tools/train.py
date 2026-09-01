@@ -346,8 +346,24 @@ def main():
                         level=logging.WARNING)
                 grad_clip = mm_max_norm
                 ds_cfg = auto_dtype_of_deepspeed_config(ds_cfg)
-                exclude_frozen_parameters = True if digit_version(
-                    deepspeed.__version__) >= digit_version('0.10.1') else None
+                save_frozen_parameters = bool(
+                    cfg.get('save_frozen_parameters', False))
+                model_cfg = cfg.get('model', {})
+                model_type = model_cfg.get('type', None)
+                model_type_name = getattr(model_type, '__name__',
+                                          str(model_type))
+                if ('LLaVAModel_qwen3_5' in model_type_name
+                        and not save_frozen_parameters):
+                    raise ValueError(
+                        'LLaVAModel_qwen3_5 requires '
+                        'save_frozen_parameters=True with DeepSpeed. '
+                        'Alignment and routed-LoRA checkpoints contain '
+                        'frozen task/base weights that must be preserved for '
+                        'resume and evaluation.')
+                exclude_frozen_parameters = (
+                    not save_frozen_parameters
+                    if digit_version(deepspeed.__version__) >= digit_version('0.10.1')
+                    else None)
                 strategy = dict(
                     type=LazyObject('xtuner.engine', 'DeepSpeedStrategy'),
                     config=ds_cfg,

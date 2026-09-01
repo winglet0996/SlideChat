@@ -34,7 +34,7 @@ route_families = (
     'immune_microenvironment',
     'outcome',
 )
-routed_lora_trainable = 'all'
+routed_lora_trainable = 'family_only'
 vision_lr_mult = 1.0 if setting == 'alignment' else 0.05
 family_lora_lr_mult = None if setting != 'lora' else 1.0
 
@@ -48,13 +48,13 @@ lora_shared_r = 64
 lora_shared_alpha = 64
 # Only outcome showed clear r64 validation overfitting; keep other families unchanged.
 lora_family_r = dict.fromkeys(route_families, 64)
-lora_family_r['outcome'] = 16
+# lora_family_r['outcome'] = 16
 lora_family_alpha = dict(lora_family_r)
-run_suffix = 'v1'
+run_suffix = 'v2'
 
 # Set ckpt_path manually; resume=False warm-starts weights, while True restores training state.
-ckpt_path = '/data/wg_workspace/projects/TCGA/9B_multimodal_alignment_v16_8token_4wsi_linear_hs_0_0_0_v1/iter_27468.pth'
-# ckpt_path = '/data/wg_workspace/projects/TCGA/9B_multimodal_lora_v16_8token_4wsi_linear_hs_0_0_0_lora_sr64_sa64_fr64-64-64-64-64-16_fa64-64-64-64-64-16_v1/iter_3000.pth'
+# ckpt_path = '/data/wg_workspace/projects/TCGA/9B_multimodal_alignment_v16_8token_4wsi_linear_hs_0_0_0_v1/iter_27468.pth'
+ckpt_path = '/data/wg_workspace/projects/TCGA/9B_multimodal_lora_wo_knowledge_v16_8token_4wsi_linear_hs_0_0_0_lora_sr64_sa64_fr64_fa64_route6_joint_from_v14_align/iter_22000.pth/mp_rank_00_model_states.pt'
 resume = False
 
 if setting == 'alignment':
@@ -73,9 +73,9 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    lr = 2e-5
+    lr = 1e-6
     freeze_llm = True
-    max_epochs = 3
+    max_epochs = 1
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False
@@ -142,12 +142,14 @@ test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1500
+interval = 500
 # interval = 1
 save_total_limit = 10
+# Keep frozen resampler/projector/task-head weights in each LoRA checkpoint.
+save_frozen_parameters = True
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1500  # More frequent evaluation for alignment debugging
+evaluation_freq = 500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -436,7 +438,10 @@ optim_wrapper = dict(
     paramwise_cfg=dict(
         vision_prefixes=('patch_resampler.', 'wsi_projector.'),
         vision_lr_mult=vision_lr_mult,
-        family_lora_lr_mult=family_lora_lr_mult),
+        family_lora_lr_mult=family_lora_lr_mult,
+        # family_only intentionally leaves the adapter/head and vision groups
+        # empty; the constructor still rejects empty groups in joint training.
+        allow_empty_groups=routed_lora_trainable != 'all'),
     optimizer=dict(
         # type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay, rho=rho),
         type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),

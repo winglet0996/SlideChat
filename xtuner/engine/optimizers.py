@@ -7,7 +7,7 @@ from mmengine.registry import OPTIM_WRAPPER_CONSTRUCTORS
 
 @OPTIM_WRAPPER_CONSTRUCTORS.register_module()
 class TwoGroupOptimWrapperConstructor(DefaultOptimWrapperConstructor):
-    """Build adapter/head and vision groups, with optional family-LoRA LR."""
+    """Build trainable parameter groups, with optional family-LoRA LR."""
 
     def add_params(self, params: List[dict], module, **kwargs) -> None:
         cfg = self.paramwise_cfg or {}
@@ -17,6 +17,7 @@ class TwoGroupOptimWrapperConstructor(DefaultOptimWrapperConstructor):
         family_lora_lr_mult = cfg.get('family_lora_lr_mult')
         if family_lora_lr_mult is not None:
             family_lora_lr_mult = float(family_lora_lr_mult)
+        allow_empty_groups = bool(cfg.get('allow_empty_groups', False))
 
         adapter_and_head = []
         vision_alignment = []
@@ -36,20 +37,30 @@ class TwoGroupOptimWrapperConstructor(DefaultOptimWrapperConstructor):
                 target = adapter_and_head
             target.append(parameter)
 
-        if not adapter_and_head or not vision_alignment:
+        if not allow_empty_groups and (
+                not adapter_and_head or not vision_alignment):
             raise RuntimeError(
                 'TwoGroupOptimWrapperConstructor requires non-empty adapter/head '
                 f'and vision groups, got {len(adapter_and_head)} and '
                 f'{len(vision_alignment)} parameters.')
-        params.extend([
-            dict(params=adapter_and_head, lr=self.base_lr),
-            dict(params=vision_alignment, lr=self.base_lr * vision_lr_mult),
-        ])
-        if family_lora_lr_mult is not None:
-            if not family_lora:
-                raise RuntimeError(
-                    'family_lora_lr_mult was configured but no family LoRA '
-                    'parameters were found.')
+        if (not allow_empty_groups and family_lora_lr_mult is not None
+                and not family_lora):
+            raise RuntimeError(
+                'family_lora_lr_mult was configured but no family LoRA '
+                'parameters were found.')
+        if not any((adapter_and_head, vision_alignment, family_lora)):
+            raise RuntimeError(
+                'TwoGroupOptimWrapperConstructor found no trainable '
+                'parameters.')
+
+        if adapter_and_head:
+            params.append(dict(params=adapter_and_head, lr=self.base_lr))
+        if vision_alignment:
+            params.append(dict(
+                params=vision_alignment,
+                lr=self.base_lr * vision_lr_mult,
+            ))
+        if family_lora_lr_mult is not None and family_lora:
             params.append(dict(
                 params=family_lora,
                 lr=self.base_lr * family_lora_lr_mult,

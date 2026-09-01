@@ -25,7 +25,7 @@ from xtuner.utils import PROMPT_TEMPLATE
 #                          PART 1  Settings                           #
 #######################################################################
 
-setting = 'alignment'
+setting = 'lora'
 route_families = (
     'morphology_clinicopathology',
     'molecular_biomarker',
@@ -41,7 +41,7 @@ family_lora_lr_mult = None if setting != 'lora' else 1.0
 
 # Ablation knobs. Update these together for patch/WSI/position-encoding runs.
 ablation_version = 'v16'
-patch_keep_tokens = 8
+patch_keep_tokens = 4
 wsi_feature_source = ('titan',)
 patch_position_encoding = 'linear'  # 'linear' or 'mrope'
 head_scaling = (0, 0, 0) # regression, survival, wsi_projector
@@ -54,7 +54,7 @@ lora_family_alpha = dict(lora_family_r)
 run_suffix = 'v1'
 
 # Set ckpt_path manually; resume=False warm-starts weights, while True restores training state.
-ckpt_path = None
+ckpt_path = '/data/wg_workspace/projects/TCGA/9B_multimodal_alignment_v16_4token_titan_linear_hs_0_0_0_v1/iter_24417.pth'
 resume = False
 
 if setting == 'alignment':
@@ -73,9 +73,9 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    lr = 1e-6
+    lr = 2e-5
     freeze_llm = True
-    max_epochs = 1
+    max_epochs = 2
 if setting == 'full_param':
     llm_lora = None
     freeze_llm = False

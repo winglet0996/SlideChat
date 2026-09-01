@@ -1,8 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Qwen3.5 multitask config with prompt-conditioned WSI patch resampling."""
-from os import listdir
-from os.path import basename, isdir, isfile, join
-
 from mmengine.dataset import DefaultSampler
 from mmengine.hooks import CheckpointHook, DistSamplerSeedHook, IterTimerHook, LoggerHook, ParamSchedulerHook
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
@@ -38,8 +35,8 @@ route_families = (
     'outcome',
 )
 routed_lora_trainable = 'all'
-vision_lr_mult = 0.05
-family_lora_lr_mult = 1.0
+vision_lr_mult = 1.0 if setting == 'alignment' else 0.05
+family_lora_lr_mult = None if setting != 'lora' else 1.0
 
 # Ablation knobs. Update these together for patch/WSI/position-encoding runs.
 ablation_version = 'v16'
@@ -49,16 +46,21 @@ patch_position_encoding = 'linear'  # 'linear' or 'mrope'
 head_scaling = (0, 0, 0) # regression, survival, wsi_projector
 lora_shared_r = 64
 lora_shared_alpha = 64
-lora_family_r = 64
-lora_family_alpha = 64
-run_suffix = 'route6_joint_from_v14_align'
+# Only outcome showed clear r64 validation overfitting; keep other families unchanged.
+lora_family_r = dict.fromkeys(route_families, 64)
+lora_family_r['outcome'] = 16
+lora_family_alpha = dict(lora_family_r)
+run_suffix = 'v1'
+
+# Set ckpt_path manually; resume=False warm-starts weights, while True restores training state.
+# ckpt_path = '/data/wg_workspace/projects/TCGA/9B_multimodal_alignment_v16_8token_4wsi_linear_hs_0_0_0_v1/iter_27468.pth'
+ckpt_path = None
+resume = False
 
 if setting == 'alignment':
     llm_lora = None
     freeze_llm = True
     lr = 1e-4  # Reduced from 1e-4 for better stability
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v15_8token_4wsi_linear_hs_0_0_0_route/iter_2000.pth'
     max_epochs = 3
     save_best_metrics = None
 if setting == 'lora':
@@ -71,8 +73,6 @@ if setting == 'lora':
         task_type='CAUSAL_LM')
     # save_best_metrics = ['eval/mcqa_overall_accuracy', 'eval/reg_overall_r2', 'eval/surv_overall_survival_os_c_index']
     save_best_metrics = None
-    ckpt_path = None
-    # ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/9B_multimodal_alignment_wo_knowledge_v14_8token_4wsi_linear_hs_0_0_0_regsampler/iter_19440.pth'
     lr = 2e-5
     freeze_llm = True
     max_epochs = 3
@@ -81,38 +81,19 @@ if setting == 'full_param':
     freeze_llm = False
     lr = 1e-5
     save_best_metrics = ['eval/reg_overall_rmse']
-    ckpt_path = '/mnt/petrelfs/zhaoweike/project/TCGA/train_s2_multitask_qwen3_4b_conv_alignment_rna_regression_multitask/iter_1000.pth'
     max_epochs = 25
-    
-resume = False
 
 model_type = 'multimodal'  # Options: 'text_only', 'text_patch', 'text_patch_no_deepstack', 'text_wsi', 'text_patch_pooling', 'multimodal'
 model_size = '9B'
-kg_status='wo_knowledge'
 
-llm_name_or_path = f'/mnt/petrelfs/zhaoweike/hwfile_share/model/model_zoo/Qwen3.5-{model_size}'
-# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/train.json'
-# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/survival_generated_qa_{exp}/test.json'
-dataset_cache_dir = '/mnt/petrelfs/zhaoweike/project/TCGA/.cache/'
-# train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/train.json'
-# val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
-# test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_{kg_status}_r2/test.json'
+llm_name_or_path = '/data/wg_workspace/model_zoo/Qwen3.5-9B'
+dataset_cache_dir = '/data/wg_workspace/projects/TCGA/.cache/'
 
-train_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/routed/train.json'
-val_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/pathoverse_wo_knowledge_r2/routed/test.json'
-test_data_path = f'/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline_v2/cptac_test/routed/test.json'
+train_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/pathoverse/train.json'
+val_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/pathoverse/test.json'
+# test_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/pathoverse/test.json'
+test_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/cptac_dataset/test.json'
 
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/mcqa_mutation_train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/mcqa_mutation_test.json'
-
-# train_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_train/supercategories/regression__train.json'
-# val_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
-# test_data_path = '/mnt/petrelfs/zhaoweike/project/TCGA/dataset_pp/data_pipeline/tcga_test/supercategories/regression__test.json'
-
-
-# ckpt_out_path = 's3://zhaoweike/ckpt'
 ckpt_out_path = None
 
 wsi_feature_specs = dict(
@@ -121,36 +102,25 @@ wsi_feature_specs = dict(
     chief=dict(field='slide_features_chief', dim=768),
     gigapath=dict(field='slide_features_gigapath', dim=768),
 )
-if isinstance(wsi_feature_source, str):
-    wsi_feature_source = (wsi_feature_source,)
-else:
-    wsi_feature_source = tuple(wsi_feature_source)
+
 valid_wsi_feature_sources = tuple(wsi_feature_specs)
-unknown_wsi_feature_sources = [src for src in wsi_feature_source if src not in wsi_feature_specs]
-if unknown_wsi_feature_sources:
-    raise ValueError(
-        f"Unknown wsi_feature_source: {unknown_wsi_feature_sources!r}. "
-        f"Expected subset of {valid_wsi_feature_sources!r}")
-if not wsi_feature_source:
-    raise ValueError('wsi_feature_source must include at least one source.')
-if patch_position_encoding not in ('linear', 'mrope'):
-    raise ValueError("patch_position_encoding must be 'linear' or 'mrope'.")
 
 wsi_source_tag = '4wsi' if len(wsi_feature_source) == 4 else '-'.join(wsi_feature_source)
 head_scaling_tag = 'hs_' + '_'.join(str(scale).replace('.', 'p') for scale in head_scaling)
 ablation_tag = f'{patch_keep_tokens}token_{wsi_source_tag}_{patch_position_encoding}_{head_scaling_tag}'
 if setting == 'lora':
+    family_r_tag = '-'.join(str(lora_family_r[family]) for family in route_families)
+    family_alpha_tag = '-'.join(
+        str(lora_family_alpha[family]) for family in route_families)
     ablation_tag = (
         f'{ablation_tag}_lora_sr{lora_shared_r}_sa{lora_shared_alpha}'
-        f'_fr{lora_family_r}_fa{lora_family_alpha}')
+        f'_fr{family_r_tag}_fa{family_alpha_tag}')
 exp_tag = f'{ablation_version}_{ablation_tag}'
 if run_suffix:
     exp_tag = f'{exp_tag}_{run_suffix}'
 
-# work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_vl_{model_type}_{setting}_{exp}/'
-# vis_name = f'{model_size}_vl_{model_type}_{setting}_{exp}'
-work_dir = f'/mnt/petrelfs/zhaoweike/project/TCGA/{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}/'
-# vis_name = f'{model_size}_{model_type}_{setting}_{kg_status}_{exp_tag}'
+work_dir = f'/data/wg_workspace/projects/TCGA/{model_size}_{model_type}_{setting}_{exp_tag}/'
+# vis_name = f'{model_size}_{model_type}_{setting}_{exp_tag}'
 vis_name = None
 
 
@@ -169,16 +139,16 @@ visualizer = None if vis_name is None else dict(
 )
 
 val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_results_cptac_iter20000'
+test_output_path = work_dir + 'test_results'
 
 # Save
 by_epoch = False
-interval = 1000
+interval = 1500
 # interval = 1
 save_total_limit = 10
 
 # Evaluate the generation performance during the training
-evaluation_freq = 1000  # More frequent evaluation for alignment debugging
+evaluation_freq = 1500  # More frequent evaluation for alignment debugging
 image_path_list = None
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
@@ -187,60 +157,19 @@ prompt_template = PROMPT_TEMPLATE.qwen_chat
 dataset_map_fn = llava_text_only_map_fn if model_type == 'text_only' else llava_map_fn
 
 
-def _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=8):
-    import glob
-    import re
-    if not isdir(work_dir):
-        return None
-    all_ckpt_dirs = [p for p in glob.glob(join(work_dir, 'iter_*.pth')) if isdir(p)]
-    
-    if not all_ckpt_dirs:
-        return None
-
-    try:
-        sorted_ckpts = sorted(
-            all_ckpt_dirs,
-            key=lambda p: int(re.search(r'iter_(\d+)\.pth', basename(p)).group(1)),
-            reverse=True
-        )
-    except (AttributeError, ValueError):
-        print("Warning: Found directories with malformed names, skipping them.")
-        return None
-
-    expected_file_count = num_gpus + 1
-    
-    for ckpt_dir in sorted_ckpts:
-        try:
-            if len(listdir(ckpt_dir)) == expected_file_count:
-                return ckpt_dir
-            else:
-                print(f"Warning: Checkpoint '{basename(ckpt_dir)}' is incomplete. Skipping.")
-        except OSError as e:
-            print(f"Warning: Could not access checkpoint '{basename(ckpt_dir)}'. Error: {e}. Skipping.")
-            continue
-    return None
-
-if resume:
-    latest_valid_ckpt = _get_latest_valid_deepspeed_checkpoint(work_dir, num_gpus=24)
-    
-    if latest_valid_ckpt:
-        ckpt_path = latest_valid_ckpt
-        print(f"Resuming from latest valid checkpoint: {ckpt_path}")
-    else:
-        print(f"Resume is True, but no complete checkpoints were found in {work_dir}. Starting from scratch.")
-        
-del _get_latest_valid_deepspeed_checkpoint
-
 pretrained_pth = None
 if not resume and ckpt_path is not None:
-    if isdir(ckpt_path):
-        pretrained_pth = join(ckpt_path, 'mp_rank_00_model_states.pt')
+    path_module = __import__('os').path
+    if path_module.isdir(ckpt_path):
+        pretrained_pth = path_module.join(
+            ckpt_path, 'mp_rank_00_model_states.pt')
     else:
         pretrained_pth = ckpt_path
 
-    if not isfile(pretrained_pth):
+    if not path_module.isfile(pretrained_pth):
         raise FileNotFoundError(
             f'Warm-start checkpoint file not found: {pretrained_pth}')
+    del path_module
 
 max_length = 256000
 max_patch_num = None
@@ -267,10 +196,9 @@ sampler_original_mix_by_family = dict(
 )
 sampler_subfamily_weights_by_family = dict(
     regression=dict(
-        RNA=0.24,
+        RNA=0.25,
         protein=0.40,
-        immune_infil=0.32,
-        openTME=0.04,
+        immune_infil=0.35,
     ),
 )
 sampler_balance_mcqa_labels = True
@@ -284,14 +212,14 @@ sampler_default_unit = 'slide'
 sampler_mix_within_batch = True
 
 # Scheduler & Optimizer
-batch_size = 11
+batch_size = 16
 accumulative_counts = 1
 optim_type = AdamW
 betas = (0.9, 0.999)
 rho = 0.01
 weight_decay = 1e-1
 max_norm = 1  # grad clip
-warmup_ratio = 0.05
+warmup_ratio = 0.1
 patch_modality_dropout_start = 0
 wsi_modality_dropout_start = 0.8
 modality_dropout_begin_ratio = 0.2
