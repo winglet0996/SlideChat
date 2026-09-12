@@ -343,7 +343,8 @@ class CenterFixedSizeCrop:
     """
     Performs a center crop with a fixed output size.
     If the image is smaller than the crop size, it is padded first.
-    If the center crop contains no features, returns the full grid instead.
+    If the center crop contains no features, the nearest non-empty region is
+    used instead. The output is always ``(C, crop_h, crop_w)``.
     """
     def __init__(self, crop_size):
         if isinstance(crop_size, int):
@@ -356,32 +357,39 @@ class CenterFixedSizeCrop:
         Args:
             sample (torch.Tensor): Feature grid of shape (C, H, W).
         Returns:
-            torch.Tensor: Cropped feature grid.
+            torch.Tensor: Fixed-size cropped feature grid.
         """
-        full_grid = sample
         grid = sample
-        
         _, h, w = grid.shape
         th, tw = self.crop_size
-        
+
         # Pad if needed
         if h < th or w < tw:
             pad_h = max(0, th - h)
             pad_w = max(0, tw - w)
-            # Pad right and bottom
             grid = torch.nn.functional.pad(grid, (0, pad_w, 0, pad_h), value=0)
-            
-        # Update h, w after padding
+
         _, h, w = grid.shape
-            
-        # Center Crop
         i = (h - th) // 2
         j = (w - tw) // 2
-        
-        cropped_grid = grid[:, i:i+th, j:j+tw]
-        if torch.count_nonzero(cropped_grid).item() == 0:
-            return full_grid
-        return cropped_grid
+        crop = grid[:, i:i + th, j:j + tw]
+
+        # A sparse WSI may have an empty geometric center. Anchor the crop at
+        # the non-empty patch nearest the grid center, while keeping its size
+        # bounded by (th, tw).
+        occupied = grid.abs().sum(dim=0).ne(0)
+        if not occupied[i:i + th, j:j + tw].any() and occupied.any():
+            coords = occupied.nonzero(as_tuple=False)
+            center_y = (h - 1) / 2
+            center_x = (w - 1) / 2
+            distance = (coords[:, 0].float() - center_y).square()
+            distance += (coords[:, 1].float() - center_x).square()
+            anchor_y, anchor_x = coords[distance.argmin()].tolist()
+            i = min(max(anchor_y - th // 2, 0), h - th)
+            j = min(max(anchor_x - tw // 2, 0), w - tw)
+            crop = grid[:, i:i + th, j:j + tw]
+
+        return crop
 
 
 class RandomVariableCrop:

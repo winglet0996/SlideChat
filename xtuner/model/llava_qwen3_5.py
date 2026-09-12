@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import uuid
 from contextlib import contextmanager
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -14,7 +15,6 @@ import h5py
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image
 from mmengine import print_log
 from mmengine.config import Config, ConfigDict
 from mmengine.dist import is_main_process
@@ -138,6 +138,26 @@ def _sample_keep_mask(
     return value
 
 
+def _pad_token_spans(
+    spans_by_sample: List[List[Tuple[int, int]]],
+    sequence_lengths: List[int],
+    max_len: int,
+    padding_side: str,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    max_spans = max((len(spans) for spans in spans_by_sample), default=0)
+    if max_spans == 0:
+        return None
+    spans = torch.full(
+        (len(spans_by_sample), max_spans, 2), -1, dtype=torch.long, device=device)
+    for b_idx, sample_spans in enumerate(spans_by_sample):
+        offset = max_len - sequence_lengths[b_idx] if padding_side == 'left' else 0
+        for span_idx, (start, end) in enumerate(sample_spans):
+            spans[b_idx, span_idx] = torch.tensor(
+                [start + offset, end + offset], dtype=torch.long, device=device)
+    return spans
+
+
 def _prepare_text_or_wsi_inputs(
     llm,
     input_ids: torch.Tensor,
@@ -175,13 +195,16 @@ def _prepare_text_or_wsi_inputs(
     wsi_sample_keep = _sample_keep_mask(wsi_sample_keep, batch_size, input_ids.device)
 
     embeds_list, labels_list, attention_list, pos_list = [], [], [], []
+    wsi_spans_by_sample = []
     for b_idx in range(batch_size):
         valid = attention_mask[b_idx]
         text = text_embeds[b_idx, valid]
         lbl = labels[b_idx, valid]
+        wsi_spans = []
         if bool(wsi_sample_keep[b_idx].item()):
             wsi = wsi_embeddings[b_idx].to(device=text.device, dtype=text.dtype)
             cur_emb = torch.cat([wsi, text], dim=0)
+            wsi_spans.append((0, int(wsi.size(0))))
             cur_lbl = torch.cat([
                 torch.full((wsi.size(0),), IGNORE_INDEX, dtype=labels.dtype, device=labels.device),
                 lbl,
@@ -195,8 +218,18 @@ def _prepare_text_or_wsi_inputs(
         labels_list.append(cur_lbl)
         attention_list.append(cur_attn)
         pos_list.append(seq.unsqueeze(0).expand(4, -1))
+        wsi_spans_by_sample.append(wsi_spans)
 
     composed = InputComposer()(embeds_list, labels_list, attention_list, pos_list, padding_side, IGNORE_INDEX)
+    wsi_spans = _pad_token_spans(
+        wsi_spans_by_sample,
+        [embeds.size(0) for embeds in embeds_list],
+        composed['attention_mask'].size(1),
+        padding_side,
+        input_ids.device,
+    )
+    if wsi_spans is not None:
+        composed['wsi_token_spans'] = wsi_spans
     return {'input_ids': None, **composed}
 
 
@@ -267,6 +300,7 @@ def prepare_inputs_labels_for_qwen3_5(
 
     embeds_list, labels_list, attention_list, positions_list = [], [], [], []
     patch_spans_by_sample = []
+    wsi_spans_by_sample = []
     for b_idx in range(batch_size):
         cur_ids = input_ids[b_idx, attention_mask[b_idx]]
         cur_labels = labels[b_idx, attention_mask[b_idx]]
@@ -277,6 +311,7 @@ def prepare_inputs_labels_for_qwen3_5(
         keep_wsi = has_wsi and bool(wsi_sample_keep[b_idx].item())
         wsi_inserted = False
         pieces_embeds, pieces_labels, pieces_attn, patch_blocks = [], [], [], []
+        wsi_span = None
 
         for seg_idx in range(len(boundaries) - 1):
             text_start = boundaries[seg_idx] + 1
@@ -294,10 +329,12 @@ def prepare_inputs_labels_for_qwen3_5(
             if is_image_slot:
                 if keep_wsi and not wsi_inserted:
                     cur_wsi = wsi_embeddings[b_idx].to(device=device, dtype=dtype)
+                    wsi_start = sum(x.size(0) for x in pieces_embeds)
                     pieces_embeds.append(cur_wsi)
                     pieces_labels.append(torch.full((cur_wsi.size(0),), IGNORE_INDEX,
                                                     dtype=labels.dtype, device=device))
                     pieces_attn.append(torch.ones(cur_wsi.size(0), dtype=torch.bool, device=device))
+                    wsi_span = (wsi_start, wsi_start + cur_wsi.size(0))
                     wsi_inserted = True
 
                 if not keep_patch:
@@ -335,6 +372,7 @@ def prepare_inputs_labels_for_qwen3_5(
             pieces_embeds = [cur_wsi] + pieces_embeds
             pieces_labels = [torch.full((cur_wsi.size(0),), IGNORE_INDEX, dtype=labels.dtype, device=device)] + pieces_labels
             pieces_attn = [torch.ones(cur_wsi.size(0), dtype=torch.bool, device=device)] + pieces_attn
+            wsi_span = (0, cur_wsi.size(0))
             patch_blocks = [
                 (start + cur_wsi.size(0), pos, valid, end + cur_wsi.size(0))
                 for start, pos, valid, end in patch_blocks
@@ -365,18 +403,28 @@ def prepare_inputs_labels_for_qwen3_5(
         attention_list.append(cur_attn)
         positions_list.append(cur_pos)
         patch_spans_by_sample.append([(int(start), int(end)) for start, _, _, end in patch_blocks])
+        wsi_spans_by_sample.append([wsi_span] if wsi_span is not None else [])
 
     composed = composer(embeds_list, labels_list, attention_list, positions_list, padding_side, IGNORE_INDEX)
-    max_spans = max((len(spans) for spans in patch_spans_by_sample), default=0)
-    if max_spans > 0:
-        span_tensor = torch.full((batch_size, max_spans, 2), -1, dtype=torch.long, device=device)
-        max_len = composed['attention_mask'].size(1)
-        for b_idx, spans in enumerate(patch_spans_by_sample):
-            pad_offset = max_len - embeds_list[b_idx].size(0) if padding_side == 'left' else 0
-            for span_idx, (start, end) in enumerate(spans):
-                span_tensor[b_idx, span_idx, 0] = start + pad_offset
-                span_tensor[b_idx, span_idx, 1] = end + pad_offset
-        composed['vision_token_spans'] = span_tensor
+    max_len = composed['attention_mask'].size(1)
+    vision_spans = _pad_token_spans(
+        patch_spans_by_sample,
+        [embeds.size(0) for embeds in embeds_list],
+        max_len,
+        padding_side,
+        device,
+    )
+    if vision_spans is not None:
+        composed['vision_token_spans'] = vision_spans
+    wsi_spans = _pad_token_spans(
+        wsi_spans_by_sample,
+        [embeds.size(0) for embeds in embeds_list],
+        max_len,
+        padding_side,
+        device,
+    )
+    if wsi_spans is not None:
+        composed['wsi_token_spans'] = wsi_spans
     return {'input_ids': None, **composed}
 
 
@@ -439,8 +487,6 @@ class LLaVAModel_qwen3_5(BaseModel):
         force_drop_patch: bool = False,
         force_drop_wsi: bool = False,
         trainable_module_prefixes: Optional[List[str]] = None,
-        save_attention_heatmap: bool = False,
-        attention_heatmap_dir: Optional[str] = None,
         save_patch_attention_h5: bool = False,
         patch_attention_h5_dir: Optional[str] = None,
         patch_attention_h5_dtype: str = 'float16',
@@ -493,8 +539,6 @@ class LLaVAModel_qwen3_5(BaseModel):
         self.force_drop_patch = bool(force_drop_patch)
         self.force_drop_wsi = bool(force_drop_wsi)
         self.trainable_module_prefixes = trainable_module_prefixes
-        self.save_attention_heatmap = bool(save_attention_heatmap)
-        self.attention_heatmap_dir = attention_heatmap_dir
         self.save_patch_attention_h5 = bool(save_patch_attention_h5)
         self.patch_attention_h5_dir = patch_attention_h5_dir
         self.patch_attention_h5_dtype = str(patch_attention_h5_dtype)
@@ -1283,34 +1327,6 @@ class LLaVAModel_qwen3_5(BaseModel):
         return value or default
 
     @staticmethod
-    def _normalize_heatmap_image(heatmap: np.ndarray, valid_mask: np.ndarray) -> Image.Image:
-        heatmap = np.asarray(heatmap, dtype=np.float32)
-        valid_mask = np.asarray(valid_mask, dtype=bool)
-        values = heatmap[valid_mask]
-        if values.size == 0:
-            values = heatmap.reshape(-1)
-        lo = float(np.nanmin(values)) if values.size else 0.0
-        hi = float(np.nanmax(values)) if values.size else 0.0
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            arr = np.zeros_like(heatmap, dtype=np.uint8)
-        else:
-            arr = np.clip((heatmap - lo) / (hi - lo), 0.0, 1.0)
-            arr = (arr * 255).astype(np.uint8)
-        arr = np.where(valid_mask, arr, 0).astype(np.uint8)
-        return Image.fromarray(arr, mode='L')
-
-    @staticmethod
-    def _cosine_similarity_matrix(x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float32)
-        if x.size == 0:
-            return np.empty((0, 0), dtype=np.float32)
-        flat = x.reshape(x.shape[0], -1).astype(np.float64, copy=False)
-        norms = np.linalg.norm(flat, axis=1, keepdims=True)
-        norms = np.clip(norms, 1e-12, None)
-        sim = (flat @ flat.T) / (norms * norms.T)
-        return sim.astype(np.float32, copy=False)
-
-    @staticmethod
     def _write_h5_string(group, name: str, value: Any) -> None:
         dtype = h5py.string_dtype(encoding='utf-8')
         group.create_dataset(name, data='' if value is None else str(value), dtype=dtype)
@@ -1358,6 +1374,19 @@ class LLaVAModel_qwen3_5(BaseModel):
         padded_w = max(orig_w, w_final)
         top = (padded_h - h_final) // 2
         left = (padded_w - w_final) // 2
+        inside_center = (
+            (shifted[:, 1] >= top) & (shifted[:, 1] < top + h_final)
+            & (shifted[:, 0] >= left) & (shifted[:, 0] < left + w_final)
+        )
+        if not inside_center.any():
+            center_y = (padded_h - 1) / 2
+            center_x = (padded_w - 1) / 2
+            distance = (shifted[:, 1] - center_y) ** 2
+            distance += (shifted[:, 0] - center_x) ** 2
+            anchor_x, anchor_y = shifted[np.argmin(distance)]
+            top = min(max(int(anchor_y) - h_final // 2, 0), padded_h - h_final)
+            left = min(max(int(anchor_x) - w_final // 2, 0), padded_w - w_final)
+
         rows = shifted[:, 1] - top
         cols = shifted[:, 0] - left
         keep = (rows >= 0) & (rows < h_final) & (cols >= 0) & (cols < w_final)
@@ -1398,20 +1427,127 @@ class LLaVAModel_qwen3_5(BaseModel):
             'wsi_feature_paths': list(data.get('wsi_feature_paths') or []),
         }
 
-    def _collect_next_token_visual_attention(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
+    @staticmethod
+    def _last_valid_positions(attention_mask: torch.Tensor) -> torch.Tensor:
+        valid = attention_mask.bool()
+        positions = torch.arange(
+            valid.size(1), device=valid.device, dtype=torch.long).unsqueeze(0)
+        last = (positions * valid.long()).max(dim=1).values
+        return torch.where(valid.any(dim=1), last, torch.full_like(last, -1))
+
+    @staticmethod
+    def _compact_visual_token_spans(
+        vision_token_spans: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Map spans from a padded prefix to its per-sample compact sequence."""
+        if vision_token_spans is None or not torch.is_tensor(vision_token_spans):
+            return None
+        spans = vision_token_spans.detach().cpu()
+        if spans.ndim != 3 or spans.size(-1) != 2:
+            raise ValueError(
+                'vision_token_spans must have shape (batch, spans, 2), '
+                f'got {tuple(spans.shape)}')
+        masks = attention_mask.detach().cpu().bool()
+        if masks.ndim != 2 or masks.size(0) != spans.size(0):
+            raise ValueError(
+                'attention_mask and vision_token_spans must have matching batch '
+                f'dimensions, got {tuple(masks.shape)} and {tuple(spans.shape)}')
+
+        compact = torch.full_like(spans, -1)
+        for b_idx in range(spans.size(0)):
+            valid_positions = torch.nonzero(masks[b_idx], as_tuple=False).flatten().tolist()
+            position_map = {position: offset for offset, position in enumerate(valid_positions)}
+            for span_idx in range(spans.size(1)):
+                start, end = (int(value) for value in spans[b_idx, span_idx].tolist())
+                if start < 0 or end <= start:
+                    continue
+                mapped = [position_map.get(position) for position in range(start, end)]
+                if any(value is None for value in mapped):
+                    continue
+                first = mapped[0]
+                if mapped != list(range(first, first + len(mapped))):
+                    continue
+                compact[b_idx, span_idx] = torch.tensor(
+                    [first, first + len(mapped)], dtype=compact.dtype)
+        return compact
+
+    def _pack_visual_attention(
+        self,
+        attentions: Optional[Tuple[torch.Tensor, ...]],
+        source_token_spans: Optional[torch.Tensor],
+        target_positions: torch.Tensor,
+    ) -> Optional[np.ndarray]:
+        """Extract selected decision rows from contiguous source-token spans."""
+        if not attentions or source_token_spans is None:
+            return None
+        spans = source_token_spans.detach().cpu()
+        if spans.ndim != 3 or spans.size(-1) != 2:
+            raise ValueError(
+                'source_token_spans must have shape (batch, spans, 2), '
+                f'got {tuple(spans.shape)}')
+        targets = torch.as_tensor(target_positions, dtype=torch.long).view(-1).cpu()
+        batch_size, max_spans = spans.shape[:2]
+        if targets.numel() != batch_size:
+            raise ValueError(
+                f'target_positions must have {batch_size} values, got {targets.numel()}')
+
+        valid_attentions = tuple(attn for attn in attentions if attn is not None)
+        if not valid_attentions:
+            return None
+        first_attention = valid_attentions[0]
+        if first_attention.ndim != 4 or first_attention.size(0) != batch_size:
+            raise ValueError(
+                'LLM attention must have shape (batch, heads, query, source), '
+                f'got {tuple(first_attention.shape)}')
+        max_query = int((spans[..., 1] - spans[..., 0]).clamp_min(0).max().item())
+        if max_query <= 0:
+            return None
+
+        dtype = self._patch_attention_np_dtype()
+        output = np.zeros(
+            (batch_size, len(valid_attentions), int(first_attention.size(1)),
+             max_spans, max_query),
+            dtype=dtype,
+        )
+        for layer_idx, layer_attention in enumerate(valid_attentions):
+            if layer_attention.ndim != 4 or layer_attention.size(0) != batch_size:
+                raise ValueError(
+                    'All LLM attention tensors must have shape '
+                    f'(batch, heads, query, source), got {tuple(layer_attention.shape)}')
+            for b_idx in range(batch_size):
+                target = int(targets[b_idx].item())
+                if target < 0 or target >= layer_attention.size(-2):
+                    continue
+                for span_idx in range(max_spans):
+                    start, end = (int(value) for value in spans[b_idx, span_idx].tolist())
+                    start = max(start, 0)
+                    end = min(end, layer_attention.size(-1))
+                    if end <= start:
+                        continue
+                    row = layer_attention[b_idx, :, target, start:end]
+                    row = row.detach().float().cpu().numpy().astype(dtype, copy=False)
+                    output[b_idx, layer_idx, :, span_idx, :row.shape[-1]] = row
+        return output
+
+    def _collect_decision_attentions(
+        self,
+        data: Dict[str, Any],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Collect one decision row for patch queries and WSI source tokens."""
         if not self.save_patch_attention_h5 or not self.patch_attention_h5_dir:
-            return None
-        spans = data.get('vision_token_spans')
-        if spans is None or not torch.is_tensor(spans) or spans.numel() == 0:
-            return None
-        spans_cpu = spans.detach().cpu()
+            return None, None
+        visual_spans = data.get('vision_token_spans')
+        wsi_spans = data.get('wsi_token_spans')
         attention_mask = data.get('attention_mask')
-        if attention_mask is None:
-            return None
-        last_valid = attention_mask.bool().long()
-        seq_idx = torch.arange(attention_mask.size(1), device=attention_mask.device).unsqueeze(0)
-        last_valid = (seq_idx * last_valid).max(dim=1).values
-        llm_kwargs = {k: data[k] for k in ['inputs_embeds', 'attention_mask', 'position_ids'] if k in data}
+        if attention_mask is None or (visual_spans is None and wsi_spans is None):
+            return None, None
+        target_positions = self._last_valid_positions(attention_mask)
+        llm_kwargs = {
+            key: data[key]
+            for key in ('inputs_embeds', 'attention_mask', 'position_ids')
+            if key in data
+        }
         with torch.no_grad(), self._temporary_attn_implementation('eager'):
             outputs = self.llm(
                 **llm_kwargs,
@@ -1420,26 +1556,15 @@ class LLaVAModel_qwen3_5(BaseModel):
                 return_dict=True,
             )
         attentions = getattr(outputs, 'attentions', None)
-        if not attentions:
-            return None
-        batch_size, max_spans = spans_cpu.shape[:2]
-        max_query = int((spans_cpu[..., 1] - spans_cpu[..., 0]).clamp_min(0).max().item())
-        if max_query <= 0:
-            return None
-        num_layers = len(attentions)
-        num_heads = int(attentions[0].size(1))
-        out = np.zeros((batch_size, num_layers, num_heads, max_spans, max_query), dtype=self._patch_attention_np_dtype())
-        for layer_idx, layer_attn in enumerate(attentions):
-            for b_idx in range(batch_size):
-                target = int(last_valid[b_idx].item())
-                for span_idx in range(max_spans):
-                    start = int(spans_cpu[b_idx, span_idx, 0].item())
-                    end = int(spans_cpu[b_idx, span_idx, 1].item())
-                    if start < 0 or end <= start:
-                        continue
-                    row = layer_attn[b_idx, :, target, start:end].detach().float().cpu().numpy()
-                    out[b_idx, layer_idx, :, span_idx, :row.shape[-1]] = row.astype(out.dtype, copy=False)
-        return out
+        return (
+            self._pack_visual_attention(attentions, visual_spans, target_positions),
+            self._pack_visual_attention(attentions, wsi_spans, target_positions),
+        )
+
+    def _collect_decision_visual_attention(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Backward-compatible patch-only view of the decision attention."""
+        visual_attention, _ = self._collect_decision_attentions(data)
+        return visual_attention
 
     def _patch_attention_h5_path(self, sample_id: Any, category: Any, feature_path: Any, image_idx: int) -> str:
         slide_stem = os.path.basename(str(feature_path or f'image_{image_idx}'))
@@ -1458,6 +1583,7 @@ class LLaVAModel_qwen3_5(BaseModel):
         payload: Optional[Dict[str, Any]],
         llm_visual_attention: Optional[np.ndarray],
         data_samples: Optional[List[Dict[str, Any]]] = None,
+        llm_wsi_attention: Optional[np.ndarray] = None,
     ) -> None:
         if not payload or not self.save_patch_attention_h5 or not self.patch_attention_h5_dir:
             return
@@ -1495,14 +1621,21 @@ class LLaVAModel_qwen3_5(BaseModel):
             b_attn = np.empty((0, 0, 0), dtype=dtype)
             if llm_visual_attention is not None and sample_idx < llm_visual_attention.shape[0] and span_idx < llm_visual_attention.shape[3]:
                 b_attn = llm_visual_attention[sample_idx, :, :, span_idx, :sparse_attn.shape[1]].astype(dtype, copy=False)
+            wsi_attn = np.empty((0, 0, 0), dtype=dtype)
+            if (
+                llm_wsi_attention is not None
+                and sample_idx < llm_wsi_attention.shape[0]
+                and llm_wsi_attention.shape[3] > 0
+            ):
+                wsi_attn = llm_wsi_attention[sample_idx, :, :, 0, :].astype(dtype, copy=False)
 
             out_path = self._patch_attention_h5_path(sample_id, category, feature_path, image_idx)
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            tmp_path = f'{out_path}.tmp'
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            # Each writer needs its own temporary H5 file. The final
+            # destination remains shared and is replaced atomically below.
+            tmp_path = f'{out_path}.{uuid.uuid4().hex}.tmp'
             with h5py.File(tmp_path, 'w') as h5:
-                h5.attrs['schema_version'] = 'patch_resampler_attention.v1'
+                h5.attrs['schema_version'] = 'patch_resampler_attention.v2'
                 h5.attrs['qa_id'] = '' if sample_id is None else str(sample_id)
                 h5.attrs['category'] = '' if category is None else str(category)
                 h5.attrs['project'] = '' if project is None else str(project)
@@ -1530,184 +1663,16 @@ class LLaVAModel_qwen3_5(BaseModel):
 
                 attn = h5.create_group('attention')
                 attn.create_dataset('resampler_cross_attn', data=sparse_attn, compression='lzf', shuffle=True)
+                # Keep the established dataset name; its row is the selected
+                # output-decision state for MCQA, REG, or SURV.
                 attn.create_dataset('next_token_source_attn', data=b_attn, compression='lzf', shuffle=True)
+                # WSI source order is the same as patch_ref/wsi_feature_paths_json.
+                attn.create_dataset('wsi_source_attn', data=wsi_attn, compression='lzf', shuffle=True)
                 if token_positions is not None:
                     attn.create_dataset('token_positions', data=token_positions[image_idx].astype(np.int16, copy=False))
                 if token_valid is not None:
                     attn.create_dataset('token_valid', data=token_valid[image_idx])
             os.replace(tmp_path, out_path)
-
-    def _save_attention_heatmaps(self, data: Dict[str, Any], projected: Dict[str, torch.Tensor]) -> None:
-        if not self.save_attention_heatmap or not self.attention_heatmap_dir:
-            return
-        patch_attention = projected.get('patch_attention')
-        valid_mask = projected.get('patch_valid_mask')
-        region_attention = projected.get('region_attention')
-        region_attention_heads = projected.get('region_attention_heads')
-        visual_to_region_attention = projected.get('visual_to_region_attention')
-        visual_to_region_attention_heads = projected.get('visual_to_region_attention_heads')
-        visual_tokens = projected.get('visual_tokens')
-        token_positions = projected.get('token_positions')
-        if patch_attention is None or valid_mask is None:
-            return
-
-        patch_attention = patch_attention.detach().float().cpu().numpy()
-        valid_mask = valid_mask.detach().cpu().numpy().astype(bool)
-        if region_attention is not None:
-            region_attention = region_attention.detach().float().cpu().numpy()
-        if region_attention_heads is not None:
-            region_attention_heads = region_attention_heads.detach().float().cpu().numpy()
-        if visual_to_region_attention is not None:
-            visual_to_region_attention = visual_to_region_attention.detach().float().cpu().numpy()
-        if visual_to_region_attention_heads is not None:
-            visual_to_region_attention_heads = visual_to_region_attention_heads.detach().float().cpu().numpy()
-        if visual_tokens is not None:
-            visual_tokens = visual_tokens.detach().float().cpu().numpy()
-        token_positions = token_positions.detach().cpu().numpy() if token_positions is not None else None
-        feature_shapes = data.get('feature_shapes')
-        if torch.is_tensor(feature_shapes):
-            feature_shapes = feature_shapes.detach().cpu().tolist()
-        image_batch_indices = data.get('image_batch_indices')
-        if torch.is_tensor(image_batch_indices):
-            image_batch_indices = image_batch_indices.detach().cpu().tolist()
-        else:
-            image_batch_indices = list(range(patch_attention.shape[0]))
-        feature_paths = data.get('feature_paths') or [None] * patch_attention.shape[0]
-        sample_ids = data.get('id') or []
-        categories = data.get('category') or []
-        projects = data.get('project') or []
-
-        os.makedirs(self.attention_heatmap_dir, exist_ok=True)
-        counts_by_sample = {}
-        for image_idx in range(patch_attention.shape[0]):
-            if image_idx < len(image_batch_indices):
-                sample_idx = int(image_batch_indices[image_idx])
-            else:
-                sample_idx = image_idx
-            raw_id = sample_ids[sample_idx] if sample_idx < len(sample_ids) else None
-            fallback = feature_paths[image_idx] if image_idx < len(feature_paths) else None
-            fallback = os.path.basename(str(fallback)) if fallback else None
-            fallback_id = self._safe_path_name(fallback, f'sample_{sample_idx}')
-            case_id = self._safe_path_name(raw_id, fallback_id)
-            case_dir = os.path.join(self.attention_heatmap_dir, case_id)
-            os.makedirs(case_dir, exist_ok=True)
-
-            per_sample_count = counts_by_sample.get(sample_idx, 0)
-            counts_by_sample[sample_idx] = per_sample_count + 1
-            suffix = '' if counts_by_sample[sample_idx] == 1 else f'_image{per_sample_count}'
-
-            attn = patch_attention[image_idx]
-            mask = valid_mask[image_idx]
-            mean_heatmap = attn.mean(axis=0)
-            max_heatmap = attn.max(axis=0)
-            region_attn = None
-            region_mean_heatmap = None
-            region_max_heatmap = None
-            if region_attention is not None:
-                region_attn = region_attention[image_idx].reshape(region_attention.shape[1], *mask.shape)
-                region_attn = np.where(mask[None, :, :], region_attn, 0.0)
-                region_mean_heatmap = region_attn.mean(axis=0)
-                region_max_heatmap = region_attn.max(axis=0)
-            visual_to_region = (
-                visual_to_region_attention[image_idx]
-                if visual_to_region_attention is not None
-                else np.empty((0, 0), dtype=np.float32)
-            )
-            region_attn_heads = (
-                region_attention_heads[image_idx]
-                if region_attention_heads is not None
-                else np.empty((0, 0, 0), dtype=np.float32)
-            )
-            visual_to_region_heads = (
-                visual_to_region_attention_heads[image_idx]
-                if visual_to_region_attention_heads is not None
-                else np.empty((0, 0, 0), dtype=np.float32)
-            )
-            visual_token_embeds = (
-                visual_tokens[image_idx]
-                if visual_tokens is not None
-                else np.empty((0, 0), dtype=np.float32)
-            )
-            visual_token_cosine = self._cosine_similarity_matrix(visual_token_embeds)
-            if visual_to_region_heads.size and region_attn_heads.size:
-                composed_patch_attention_same_head = np.einsum(
-                    'hvr,hrp->hvp',
-                    visual_to_region_heads.astype(np.float32, copy=False),
-                    region_attn_heads.astype(np.float32, copy=False),
-                )
-                composed_patch_attention_same_head = np.where(
-                    mask.reshape(1, 1, -1),
-                    composed_patch_attention_same_head,
-                    0.0,
-                )
-                composed_patch_attention_same_head = composed_patch_attention_same_head / np.clip(
-                    composed_patch_attention_same_head.sum(axis=-1, keepdims=True),
-                    1e-6,
-                    None,
-                )
-                composed_patch_attention_same_head = composed_patch_attention_same_head.reshape(
-                    composed_patch_attention_same_head.shape[0],
-                    composed_patch_attention_same_head.shape[1],
-                    *mask.shape,
-                )
-            else:
-                composed_patch_attention_same_head = np.empty((0, 0, *mask.shape), dtype=np.float32)
-            token_pos = (
-                token_positions[image_idx]
-                if token_positions is not None
-                else np.empty((0, 2), dtype=np.int64)
-            )
-            np.savez_compressed(
-                os.path.join(case_dir, f'attention{suffix}.npz'),
-                patch_attention=attn,
-                mean_heatmap=mean_heatmap,
-                max_heatmap=max_heatmap,
-                valid_mask=mask,
-                token_positions=token_pos,
-                region_attention=(
-                    region_attn if region_attn is not None
-                    else np.empty((0, *mask.shape), dtype=np.float32)
-                ),
-                region_mean_heatmap=(
-                    region_mean_heatmap if region_mean_heatmap is not None
-                    else np.empty(mask.shape, dtype=np.float32)
-                ),
-                region_max_heatmap=(
-                    region_max_heatmap if region_max_heatmap is not None
-                    else np.empty(mask.shape, dtype=np.float32)
-                ),
-                visual_tokens=visual_token_embeds,
-                visual_token_cosine=visual_token_cosine,
-                visual_to_region_attention=visual_to_region,
-                region_attention_heads=region_attn_heads,
-                visual_to_region_attention_heads=visual_to_region_heads,
-                composed_patch_attention_same_head=composed_patch_attention_same_head,
-            )
-            self._normalize_heatmap_image(mean_heatmap, mask).save(
-                os.path.join(case_dir, f'heatmap_mean{suffix}.png'))
-            self._normalize_heatmap_image(max_heatmap, mask).save(
-                os.path.join(case_dir, f'heatmap_max{suffix}.png'))
-            if region_mean_heatmap is not None and region_max_heatmap is not None:
-                self._normalize_heatmap_image(region_mean_heatmap, mask).save(
-                    os.path.join(case_dir, f'region_heatmap_mean{suffix}.png'))
-                self._normalize_heatmap_image(region_max_heatmap, mask).save(
-                    os.path.join(case_dir, f'region_heatmap_max{suffix}.png'))
-
-            feature_shape = list(mask.shape)
-            if feature_shapes is not None and image_idx < len(feature_shapes):
-                feature_shape = feature_shapes[image_idx]
-            metadata = {
-                'id': raw_id,
-                'sample_index': sample_idx,
-                'image_index': image_idx,
-                'image_file': feature_paths[image_idx] if image_idx < len(feature_paths) else None,
-                'feature_shape': feature_shape,
-                'category': categories[sample_idx] if sample_idx < len(categories) else None,
-                'project': projects[sample_idx] if sample_idx < len(projects) else None,
-            }
-            metadata_path = os.path.join(case_dir, f'metadata{suffix}.json')
-            with open(metadata_path, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     def _project_wsi_features(self, wsi_features: List[List[torch.Tensor]]) -> Optional[torch.Tensor]:
         if not self.enable_wsi_injection or not hasattr(self, 'wsi_projector'):
@@ -1769,7 +1734,6 @@ class LLaVAModel_qwen3_5(BaseModel):
             if mode == 'loss':
                 modality_grad_anchor = zero_grad_anchor(projected['pixel_values'])
             if mode == 'predict':
-                self._save_attention_heatmaps(data, projected)
                 attention_save_payload = self._build_patch_attention_payload(data, projected)
             data['pixel_values'] = projected['pixel_values']
             data['vision_token_positions'] = projected['vision_token_positions']
@@ -1981,7 +1945,8 @@ class LLaVAModel_qwen3_5(BaseModel):
             prefix_position_ids = data.get('position_ids', None)
             B, Lp, _ = prefix_inputs_embeds.shape
             attention_save_payload = data.get('_patch_attention_save_payload')
-            llm_visual_attention = self._collect_next_token_visual_attention(data) if attention_save_payload is not None else None
+            llm_visual_attention = None
+            llm_wsi_attention = None
 
             # 1) Text generation with logits capture for MCQA
             with torch.no_grad(), self._temporary_attn_implementation('sdpa'):
@@ -2086,12 +2051,19 @@ class LLaVAModel_qwen3_5(BaseModel):
 
             # If no sample generated any special tokens, return text-only predictions
             if not (any(has_regression) or any(has_survival)):
-                self._save_patch_attention_h5_files(attention_save_payload, llm_visual_attention, data_samples)
+                if attention_save_payload is not None:
+                    llm_visual_attention, llm_wsi_attention = self._collect_decision_attentions(data)
+                self._save_patch_attention_h5_files(
+                    attention_save_payload,
+                    llm_visual_attention,
+                    data_samples,
+                    llm_wsi_attention,
+                )
                 return data_samples
 
             # 2) Task predictions from generated special tokens
             with self._temporary_attn_implementation('sdpa'):
-                data_samples = self._predict_tasks_from_generation(
+                task_result = self._predict_tasks_from_generation(
                     generate_ids=generate_ids,
                     data_samples=data_samples,
                     has_regression=has_regression,
@@ -2099,8 +2071,20 @@ class LLaVAModel_qwen3_5(BaseModel):
                     prefix_inputs_embeds=prefix_inputs_embeds,
                     prefix_attention_mask=prefix_attention_mask,
                     prefix_position_ids=prefix_position_ids,
+                    vision_token_spans=data.get('vision_token_spans'),
+                    wsi_token_spans=data.get('wsi_token_spans'),
+                    collect_visual_attention=attention_save_payload is not None,
                 )
-            self._save_patch_attention_h5_files(attention_save_payload, llm_visual_attention, data_samples)
+            if attention_save_payload is not None:
+                data_samples, llm_visual_attention, llm_wsi_attention = task_result
+            else:
+                data_samples = task_result
+            self._save_patch_attention_h5_files(
+                attention_save_payload,
+                llm_visual_attention,
+                data_samples,
+                llm_wsi_attention,
+            )
             return data_samples
 
         finally:
@@ -2115,7 +2099,13 @@ class LLaVAModel_qwen3_5(BaseModel):
         prefix_inputs_embeds: torch.Tensor,
         prefix_attention_mask: torch.Tensor,
         prefix_position_ids: Optional[torch.Tensor] = None,
-    ) -> List[Dict[str, Any]]:
+        vision_token_spans: Optional[torch.Tensor] = None,
+        wsi_token_spans: Optional[torch.Tensor] = None,
+        collect_visual_attention: bool = False,
+    ) -> Union[
+        List[Dict[str, Any]],
+        Tuple[List[Dict[str, Any]], Optional[np.ndarray], Optional[np.ndarray]],
+    ]:
         """Compute task predictions at generated special-token positions."""
         device = prefix_inputs_embeds.device
         dtype = prefix_inputs_embeds.dtype
@@ -2131,6 +2121,9 @@ class LLaVAModel_qwen3_5(BaseModel):
                 prefix_inputs_embeds=prefix_inputs_embeds,
                 prefix_attention_mask=prefix_attention_mask,
                 prefix_position_ids=prefix_position_ids,
+                vision_token_spans=vision_token_spans,
+                wsi_token_spans=wsi_token_spans,
+                collect_visual_attention=collect_visual_attention,
             )
 
         # Build embeddings for generated tokens
@@ -2176,14 +2169,42 @@ class LLaVAModel_qwen3_5(BaseModel):
                 'attention_mask': full_attention_mask,
                 'position_ids': full_position_ids,
                 'output_hidden_states': True,
+                'output_attentions': False,
                 'return_dict': True,
             }
+            # Keep task heads on the normal inference backend. Qwen3.5 only
+            # exposes maps from eager attention, so collect those separately.
             outputs = self.llm(**llm_kwargs)
+            attention_outputs = None
+            if collect_visual_attention:
+                attention_kwargs = dict(llm_kwargs)
+                attention_kwargs['output_hidden_states'] = False
+                attention_kwargs['output_attentions'] = True
+                with self._temporary_attn_implementation('eager'):
+                    attention_outputs = self.llm(**attention_kwargs)
             hidden = outputs.hidden_states[-1]  # (B, Lp+Lg, H)
 
-            # Find last valid position per sample (left-padding aware)
-            _seq_indices = torch.arange(full_attention_mask.size(1), device=device).unsqueeze(0)
-            last_valid_pos = (_seq_indices * full_attention_mask.bool().long()).max(dim=1).values  # (B,)
+            target_positions = None
+            if collect_visual_attention:
+                target_positions = self._last_valid_positions(prefix_attention_mask).to(device=device)
+                for b_idx in range(B):
+                    task_token_positions = torch.empty(0, dtype=torch.long, device=device)
+                    if has_regression[b_idx] and self.reg_token_id is not None:
+                        task_token_positions = torch.nonzero(
+                            generate_ids[b_idx] == self.reg_token_id,
+                            as_tuple=False,
+                        ).flatten()
+                    if (
+                        task_token_positions.numel() == 0
+                        and has_survival[b_idx]
+                        and self.srv_token_id is not None
+                    ):
+                        task_token_positions = torch.nonzero(
+                            generate_ids[b_idx] == self.srv_token_id,
+                            as_tuple=False,
+                        ).flatten()
+                    if task_token_positions.numel() > 0:
+                        target_positions[b_idx] = Lp + int(task_token_positions[-1].item())
 
             # For each batch, locate generated special-token positions and predict
             for b in range(B):
@@ -2256,6 +2277,18 @@ class LLaVAModel_qwen3_5(BaseModel):
                     prev = data_samples[b].get("prediction_text", "")
                     data_samples[b]["prediction_text"] = f"{prev} {text_suffix}".strip()
 
+        if collect_visual_attention:
+            llm_visual_attention = self._pack_visual_attention(
+                getattr(attention_outputs, 'attentions', None),
+                vision_token_spans,
+                target_positions,
+            )
+            llm_wsi_attention = self._pack_visual_attention(
+                getattr(attention_outputs, 'attentions', None),
+                wsi_token_spans,
+                target_positions,
+            )
+            return data_samples, llm_visual_attention, llm_wsi_attention
         return data_samples
 
     def _predict_tasks_from_prefix_tokens(
@@ -2266,7 +2299,13 @@ class LLaVAModel_qwen3_5(BaseModel):
         prefix_inputs_embeds: torch.Tensor,
         prefix_attention_mask: torch.Tensor,
         prefix_position_ids: Optional[torch.Tensor] = None,
-    ) -> List[Dict[str, Any]]:
+        vision_token_spans: Optional[torch.Tensor] = None,
+        wsi_token_spans: Optional[torch.Tensor] = None,
+        collect_visual_attention: bool = False,
+    ) -> Union[
+        List[Dict[str, Any]],
+        Tuple[List[Dict[str, Any]], Optional[np.ndarray], Optional[np.ndarray]],
+    ]:
         """Append task tokens to the prefix and predict from those hidden states.
 
         When gen_forcing=False, instead of using the last generated token's hidden
@@ -2282,6 +2321,15 @@ class LLaVAModel_qwen3_5(BaseModel):
         pos_list = []
         reg_positions = []
         srv_positions = []
+        decision_positions = []
+        compact_spans = (
+            self._compact_visual_token_spans(vision_token_spans, prefix_attention_mask)
+            if collect_visual_attention else None
+        )
+        compact_wsi_spans = (
+            self._compact_visual_token_spans(wsi_token_spans, prefix_attention_mask)
+            if collect_visual_attention else None
+        )
 
         if prefix_position_ids is not None:
             prefix_position_ids = prefix_position_ids.to(device)
@@ -2295,6 +2343,7 @@ class LLaVAModel_qwen3_5(BaseModel):
                 pos_list.append(None)
                 reg_positions.append(None)
                 srv_positions.append(None)
+                decision_positions.append(-1)
                 continue
 
             # Gather attended prefix tokens by mask
@@ -2353,6 +2402,11 @@ class LLaVAModel_qwen3_5(BaseModel):
             pos_list.append(cur_pos)
             reg_positions.append(reg_pos)
             srv_positions.append(srv_pos)
+            decision_positions.append(
+                reg_pos if reg_pos is not None
+                else srv_pos if srv_pos is not None
+                else valid_len - 1
+            )
 
         # Pad sequences
         max_len = max(x.size(0) for x in embed_list)
@@ -2386,9 +2440,19 @@ class LLaVAModel_qwen3_5(BaseModel):
                 'attention_mask': attention_mask,
                 'position_ids': position_ids,
                 'output_hidden_states': True,
+                'output_attentions': False,
                 'return_dict': True,
             }
+            # Keep task heads on the normal inference backend. Qwen3.5 only
+            # exposes maps from eager attention, so collect those separately.
             outputs = self.llm(**llm_kwargs)
+            attention_outputs = None
+            if collect_visual_attention:
+                attention_kwargs = dict(llm_kwargs)
+                attention_kwargs['output_hidden_states'] = False
+                attention_kwargs['output_attentions'] = True
+                with self._temporary_attn_implementation('eager'):
+                    attention_outputs = self.llm(**attention_kwargs)
             hidden = outputs.hidden_states[-1]
 
         for b_idx in range(batch_size):
@@ -2424,6 +2488,18 @@ class LLaVAModel_qwen3_5(BaseModel):
                 data_samples[b_idx]['survival_prediction'] = pred_dict
                 data_samples[b_idx]['risk_score'] = pred_dict['risk_score']
 
+        if collect_visual_attention:
+            llm_visual_attention = self._pack_visual_attention(
+                getattr(attention_outputs, 'attentions', None),
+                compact_spans,
+                torch.as_tensor(decision_positions, device=hidden.device),
+            )
+            llm_wsi_attention = self._pack_visual_attention(
+                getattr(attention_outputs, 'attentions', None),
+                compact_wsi_spans,
+                torch.as_tensor(decision_positions, device=hidden.device),
+            )
+            return data_samples, llm_visual_attention, llm_wsi_attention
         return data_samples
 
     @staticmethod

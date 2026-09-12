@@ -89,10 +89,12 @@ model_size = '9B'
 llm_name_or_path = '/data/wg_workspace/model_zoo/Qwen3.5-9B'
 dataset_cache_dir = '/data/wg_workspace/projects/TCGA/.cache/'
 
-train_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/pathoverse/train.json'
-val_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/pathoverse/test.json'
+train_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/cptac_dataset/test.json'
+val_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/cptac_dataset/test.json'
+# test_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/pathoverse/smoke.json'
 # test_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/pathoverse/test.json'
-test_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/cptac_dataset/test.json'
+# test_data_path = '/data/wg_workspace/projects/TCGA/data_pipeline_v2/cptac_dataset/test.json'
+test_data_path = '/data/wg_workspace/projects/TCGA/baseline/down_stream_datasets/run_benchmark/outputs/all_pathoverse_with_cptac_test.json'
 
 ckpt_out_path = None
 
@@ -119,7 +121,8 @@ exp_tag = f'{ablation_version}_{ablation_tag}'
 if run_suffix:
     exp_tag = f'{exp_tag}_{run_suffix}'
 
-work_dir = f'/data/wg_workspace/projects/TCGA/{model_size}_{model_type}_{setting}_{exp_tag}/'
+# work_dir = f'/data/wg_workspace/projects/TCGA/{model_size}_{model_type}_{setting}_{exp_tag}/'
+work_dir = f'/data/wg_workspace/projects/TCGA/test_results/'
 # vis_name = f'{model_size}_{model_type}_{setting}_{exp_tag}'
 vis_name = None
 
@@ -139,7 +142,12 @@ visualizer = None if vis_name is None else dict(
 )
 
 val_output_path = work_dir + 'val_results'
-test_output_path = work_dir + 'test_results'
+test_output_path = work_dir + 'v1_iter_16500_ood'
+
+# Patch attention HDF5 export. Only used in validation/test predict mode.
+save_patch_attention_h5 = True
+patch_attention_h5_dir = test_output_path + '/patch_attention_h5'
+patch_attention_h5_dtype = 'float16'
 
 # Save
 by_epoch = False
@@ -309,6 +317,9 @@ model = dict(
     patch_modality_dropout=0.2,
     wsi_modality_dropout=0.2,
     modality_dropout_allow_text_only=False,
+    save_patch_attention_h5=save_patch_attention_h5,
+    patch_attention_h5_dir=patch_attention_h5_dir,
+    patch_attention_h5_dtype=patch_attention_h5_dtype,
 )
 
 #######################################################################
